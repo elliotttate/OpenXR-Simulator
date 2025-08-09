@@ -6,7 +6,7 @@
 
 A lightweight OpenXR runtime that enables VR applications to run in a desktop window for development and testing without requiring a physical VR headset.
 
-![OpenXR Simulator Preview](docs/preview.png)
+![KAJUqBgmzewBPq9YkMDsm5AwsucqBaUY6gw2eMLX](https://github.com/user-attachments/assets/4dd804e1-13f4-46eb-a540-7c5cb77bf09c)
 
 ## 🎯 Features
 
