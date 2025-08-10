@@ -207,6 +207,23 @@ XrQuaternionf QuatFromYawPitch(float yaw, float pitch) {
     return q;
 }
 
+// Rotate a vector by a quaternion (q * v * q^-1)
+static inline XrVector3f RotateVectorByQuaternion(const XrQuaternionf& q, const XrVector3f& v) {
+    XrQuaternionf qv{ v.x, v.y, v.z, 0.0f };
+    XrQuaternionf qinv{ -q.x, -q.y, -q.z, q.w };
+    auto mul = [](const XrQuaternionf& a, const XrQuaternionf& b) -> XrQuaternionf {
+        return XrQuaternionf{
+            a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+            a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+            a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+            a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+        };
+    };
+    XrQuaternionf t = mul(q, qv);
+    XrQuaternionf r = mul(t, qinv);
+    return XrVector3f{ r.x, r.y, r.z };
+}
+
 // Initialize shader resources for blitting
 bool InitBlitResources(Session& s) {
     if (s.blitVS && s.blitPS && s.samplerState && s.noCullRS) return true;
@@ -356,7 +373,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 
                 // Update yaw and pitch (with sensitivity)
                 const float sensitivity = 0.002f;
-                rt::g_headYaw += deltaX * sensitivity;
+                rt::g_headYaw -= deltaX * sensitivity;
                 rt::g_headPitch -= deltaY * sensitivity;  // Inverted for natural feel
                 
                 // Clamp pitch to avoid gimbal lock
@@ -1156,33 +1173,34 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
     static long long periodNs = (long long)(periodSec * 1e9);
     static double nextTick = [](){ LARGE_INTEGER t; QueryPerformanceCounter(&t); return (double)t.QuadPart; }();
     
-    // Handle WASD keyboard input for movement
+    // Handle WASD keyboard input for movement (relative to head orientation)
     if (rt::g_session.isFocused) {
         const float moveSpeed = 3.0f;  // meters per second
         float deltaTime = (float)periodSec;
-        
-        // Calculate forward/right vectors from yaw
-        float forwardX = sinf(rt::g_headYaw);
-        float forwardZ = -cosf(rt::g_headYaw);
-        float rightX = cosf(rt::g_headYaw);
-        float rightZ = sinf(rt::g_headYaw);
-        
-        // Check key states
+
+        XrQuaternionf headQ = rt::QuatFromYawPitch(rt::g_headYaw, rt::g_headPitch);
+        XrVector3f fwd = rt::RotateVectorByQuaternion(headQ, XrVector3f{0.0f, 0.0f, -1.0f});
+        XrVector3f right = rt::RotateVectorByQuaternion(headQ, XrVector3f{1.0f, 0.0f, 0.0f});
+
         if (GetAsyncKeyState('W') & 0x8000) {
-            rt::g_headPos.x += forwardX * moveSpeed * deltaTime;
-            rt::g_headPos.z += forwardZ * moveSpeed * deltaTime;
+            rt::g_headPos.x += fwd.x * moveSpeed * deltaTime;
+            rt::g_headPos.y += fwd.y * moveSpeed * deltaTime;
+            rt::g_headPos.z += fwd.z * moveSpeed * deltaTime;
         }
         if (GetAsyncKeyState('S') & 0x8000) {
-            rt::g_headPos.x -= forwardX * moveSpeed * deltaTime;
-            rt::g_headPos.z -= forwardZ * moveSpeed * deltaTime;
+            rt::g_headPos.x -= fwd.x * moveSpeed * deltaTime;
+            rt::g_headPos.y -= fwd.y * moveSpeed * deltaTime;
+            rt::g_headPos.z -= fwd.z * moveSpeed * deltaTime;
         }
         if (GetAsyncKeyState('A') & 0x8000) {
-            rt::g_headPos.x -= rightX * moveSpeed * deltaTime;
-            rt::g_headPos.z -= rightZ * moveSpeed * deltaTime;
+            rt::g_headPos.x -= right.x * moveSpeed * deltaTime;
+            rt::g_headPos.y -= right.y * moveSpeed * deltaTime;
+            rt::g_headPos.z -= right.z * moveSpeed * deltaTime;
         }
         if (GetAsyncKeyState('D') & 0x8000) {
-            rt::g_headPos.x += rightX * moveSpeed * deltaTime;
-            rt::g_headPos.z += rightZ * moveSpeed * deltaTime;
+            rt::g_headPos.x += right.x * moveSpeed * deltaTime;
+            rt::g_headPos.y += right.y * moveSpeed * deltaTime;
+            rt::g_headPos.z += right.z * moveSpeed * deltaTime;
         }
         if (GetAsyncKeyState('Q') & 0x8000) {
             rt::g_headPos.y -= moveSpeed * deltaTime;
