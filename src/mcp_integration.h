@@ -3,7 +3,8 @@
 
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <d3d12.h>
+#include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <string>
 #include <vector>
@@ -219,6 +220,14 @@ inline void CaptureScreenshot(ID3D11Device* device, ID3D11DeviceContext* ctx,
     g_screenshotRequested = false;
 }
 
+// Forward declaration - CaptureScreenshotD3D12 is defined after SavePixelsToBMP
+inline void CaptureScreenshotD3D12(ID3D12Device* device, ID3D12CommandQueue* queue,
+                                     ID3D12Resource* renderTarget,
+                                     ID3D12CommandAllocator* cmdAlloc,
+                                     ID3D12GraphicsCommandList* cmdList,
+                                     ID3D12Fence* fence, HANDLE fenceEvent,
+                                     UINT64& fenceValue);
+
 // Save raw RGBA pixel data to BMP (for OpenGL path)
 inline bool SavePixelsToBMP(const uint8_t* pixels, uint32_t width, uint32_t height,
                              const char* filename) {
@@ -295,6 +304,142 @@ inline void CaptureQuadScreenshot() {
     g_screenshotRequested = false;
 }
 
+// Capture screenshot from D3D12 offscreen render target (implementation)
+inline void CaptureScreenshotD3D12(ID3D12Device* device, ID3D12CommandQueue* queue,
+                                     ID3D12Resource* renderTarget,
+                                     ID3D12CommandAllocator* cmdAlloc,
+                                     ID3D12GraphicsCommandList* cmdList,
+                                     ID3D12Fence* fence, HANDLE fenceEvent,
+                                     UINT64& fenceValue) {
+    if (!device || !queue || !renderTarget || !cmdAlloc || !cmdList) {
+        McpLog("D3D12 screenshot: missing resources");
+        g_screenshotRequested = false;
+        return;
+    }
+
+    D3D12_RESOURCE_DESC desc = renderTarget->GetDesc();
+    uint32_t w = (uint32_t)desc.Width;
+    uint32_t h = (uint32_t)desc.Height;
+
+    // Calculate row pitch aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256 bytes)
+    UINT64 rowPitch = (w * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    UINT64 totalSize = rowPitch * h;
+
+    // Create readback buffer
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bufDesc = {};
+    bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufDesc.Width = totalSize;
+    bufDesc.Height = 1;
+    bufDesc.DepthOrArraySize = 1;
+    bufDesc.MipLevels = 1;
+    bufDesc.SampleDesc.Count = 1;
+    bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ComPtr<ID3D12Resource> readback;
+    if (FAILED(device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(readback.GetAddressOf())))) {
+        McpLog("D3D12 screenshot: CreateCommittedResource (readback) failed");
+        g_screenshotRequested = false;
+        return;
+    }
+
+    // Wait for previous commands to finish before reusing the command allocator
+    if (fence && fenceValue > 1) {
+        if (fence->GetCompletedValue() < fenceValue - 1) {
+            fence->SetEventOnCompletion(fenceValue - 1, fenceEvent);
+            WaitForSingleObject(fenceEvent, 1000);
+        }
+    }
+
+    // Record copy commands
+    cmdAlloc->Reset();
+    cmdList->Reset(cmdAlloc, nullptr);
+
+    // Transition render target from COMMON to COPY_SOURCE
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = renderTarget;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmdList->ResourceBarrier(1, &barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = renderTarget;
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    srcLoc.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = readback.Get();
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dstLoc.PlacedFootprint.Offset = 0;
+    dstLoc.PlacedFootprint.Footprint.Format = desc.Format;
+    dstLoc.PlacedFootprint.Footprint.Width = w;
+    dstLoc.PlacedFootprint.Footprint.Height = h;
+    dstLoc.PlacedFootprint.Footprint.Depth = 1;
+    dstLoc.PlacedFootprint.Footprint.RowPitch = (UINT)rowPitch;
+
+    cmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    // Transition render target back to COMMON
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    cmdList->ResourceBarrier(1, &barrier);
+
+    cmdList->Close();
+    ID3D12CommandList* cmdLists[] = { cmdList };
+    queue->ExecuteCommandLists(1, cmdLists);
+
+    // Wait for copy to complete
+    queue->Signal(fence, fenceValue);
+    if (fence->GetCompletedValue() < fenceValue) {
+        fence->SetEventOnCompletion(fenceValue, fenceEvent);
+        WaitForSingleObject(fenceEvent, 2000);
+    }
+    fenceValue++;
+
+    // Map and read pixels
+    void* mappedData = nullptr;
+    D3D12_RANGE readRange = { 0, (SIZE_T)totalSize };
+    if (FAILED(readback->Map(0, &readRange, &mappedData))) {
+        McpLog("D3D12 screenshot: Map failed");
+        g_screenshotRequested = false;
+        return;
+    }
+
+    // Convert to tightly-packed RGBA for SavePixelsToBMP
+    std::vector<uint8_t> pixels(w * h * 4);
+    bool isBGRA = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                   desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t* srcRow = (const uint8_t*)mappedData + y * rowPitch;
+        uint8_t* dstRow = pixels.data() + y * w * 4;
+        if (isBGRA) {
+            for (uint32_t x = 0; x < w; x++) {
+                dstRow[x * 4 + 0] = srcRow[x * 4 + 2]; // R
+                dstRow[x * 4 + 1] = srcRow[x * 4 + 1]; // G
+                dstRow[x * 4 + 2] = srcRow[x * 4 + 0]; // B
+                dstRow[x * 4 + 3] = srcRow[x * 4 + 3]; // A
+            }
+        } else {
+            memcpy(dstRow, srcRow, w * 4);
+        }
+    }
+
+    D3D12_RANGE writeRange = { 0, 0 };
+    readback->Unmap(0, &writeRange);
+
+    std::string outPath = GetSimulatorDataPath() + "\\screenshot.bmp";
+    SavePixelsToBMP(pixels.data(), w, h, outPath.c_str());
+    McpLogf("D3D12 screenshot captured: %ux%u format=%d", w, h, (int)desc.Format);
+
+    g_screenshotRequested = false;
+}
+
 // Capture screenshot from OpenGL pixel data (side-by-side left+right eyes)
 inline void CaptureScreenshotGL(const uint8_t* leftPixels, const uint8_t* rightPixels,
                                  uint32_t width, uint32_t height) {
@@ -337,9 +482,9 @@ inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t heigh
                               const char* format, const char* sessionState,
                               float headYaw = 0, float headPitch = 0,
                               float headX = 0, float headY = 1.7f, float headZ = 0) {
-    static uint32_t lastWrite = 0;
-    // Only write every 30 frames to reduce I/O
-    if (frameCount - lastWrite < 30) return;
+    static uint32_t lastWrite = UINT32_MAX;
+    // Only write every 30 frames to reduce I/O (but always write the first frame)
+    if (lastWrite != UINT32_MAX && frameCount - lastWrite < 30) return;
     lastWrite = frameCount;
 
     std::string path = GetSimulatorDataPath() + "\\runtime_status.json";

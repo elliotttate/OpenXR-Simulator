@@ -269,12 +269,13 @@ struct Session {
     HGLRC glRC{nullptr};
     bool usesOpenGL{false};
 
-    // DX12 preview resources
-    ComPtr<IDXGISwapChain3> previewSwapchain12;
-    ComPtr<ID3D12DescriptorHeap> previewRTVHeap;
-    std::vector<ComPtr<ID3D12Resource>> previewBackbuffers;
-    UINT previewRTVDescriptorSize{0};
-    UINT previewBackbufferCount{0};
+    // DX12 preview resources (GDI-based to avoid DXGI Present hook conflicts with Steam overlay / UEVR)
+    ComPtr<ID3D12CommandQueue> previewQueue12;
+    ComPtr<ID3D12Fence> crossQueueFence;
+    UINT64 crossQueueFenceValue{0};
+    ComPtr<ID3D12Resource> previewRT12;         // offscreen render target (replaces swapchain backbuffer)
+    ComPtr<ID3D12Resource> previewReadback12;   // CPU-readable buffer for GDI blit
+    UINT previewReadbackPitch{0};               // row pitch aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
     ComPtr<ID3D12CommandAllocator> previewCmdAlloc;
     ComPtr<ID3D12GraphicsCommandList> previewCmdList;
     ComPtr<ID3D12Fence> previewFence;
@@ -544,15 +545,16 @@ bool InitBlitResources(Session& s) {
 }
 
 static void ResetD3D12PreviewResources(rt::Session& s) {
-    s.previewSwapchain12.Reset();
-    s.previewRTVHeap.Reset();
-    s.previewBackbuffers.clear();
-    s.previewBackbufferCount = 0;
-    s.previewRTVDescriptorSize = 0;
+    s.previewRT12.Reset();
+    s.previewReadback12.Reset();
+    s.previewReadbackPitch = 0;
     s.previewCmdAlloc.Reset();
     s.previewCmdList.Reset();
     s.previewFence.Reset();
     s.previewFenceValue = 0;
+    s.previewQueue12.Reset();
+    s.crossQueueFence.Reset();
+    s.crossQueueFenceValue = 0;
     if (s.previewFenceEvent) {
         CloseHandle(s.previewFenceEvent);
         s.previewFenceEvent = nullptr;
@@ -1325,19 +1327,56 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
             rd.SampleDesc.Quality = 0;
             rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
             rd.Flags = D3D12_RESOURCE_FLAG_NONE;
-            if (!(chain.format == DXGI_FORMAT_D32_FLOAT || chain.format == DXGI_FORMAT_D24_UNORM_S8_UINT || chain.format == DXGI_FORMAT_D16_UNORM)) {
+            bool isDepth = (chain.format == DXGI_FORMAT_D32_FLOAT ||
+                            chain.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
+                            chain.format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                            chain.format == DXGI_FORMAT_D16_UNORM);
+            if (isDepth) {
+                // Depth textures need ALLOW_DEPTH_STENCIL to be usable as DSV
+                rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+                // Use typeless format so UEVR can create typed views
+                switch (chain.format) {
+                    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: rd.Format = DXGI_FORMAT_R32G8X24_TYPELESS; break;
+                    case DXGI_FORMAT_D32_FLOAT:            rd.Format = DXGI_FORMAT_R32_TYPELESS; break;
+                    case DXGI_FORMAT_D24_UNORM_S8_UINT:    rd.Format = DXGI_FORMAT_R24G8_TYPELESS; break;
+                    case DXGI_FORMAT_D16_UNORM:            rd.Format = DXGI_FORMAT_R16_TYPELESS; break;
+                    default: break;
+                }
+            } else {
                 if (ci->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)
                     rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
                 if (ci->usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT)
                     rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                // Use typeless format for mutable format swapchains so UEVR can create
+                // both sRGB and non-sRGB views of the same texture
+                if (ci->usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) {
+                    rd.Format = ToTypeless(chain.format);
+                }
             }
             D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_STATES init =
-                (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
-                    ? D3D12_RESOURCE_STATE_RENDER_TARGET
-                    : D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES init = D3D12_RESOURCE_STATE_COMMON;
+            if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+                init = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            else if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+                init = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+
+            // Provide optimized clear value for render targets and depth buffers
+            D3D12_CLEAR_VALUE clearValue = {};
+            D3D12_CLEAR_VALUE* pClearValue = nullptr;
+            if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+                clearValue.Format = chain.format;
+                clearValue.Color[0] = 0.0f; clearValue.Color[1] = 0.0f;
+                clearValue.Color[2] = 0.0f; clearValue.Color[3] = 1.0f;
+                pClearValue = &clearValue;
+            } else if (rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) {
+                clearValue.Format = chain.format;
+                clearValue.DepthStencil.Depth = 1.0f;
+                clearValue.DepthStencil.Stencil = 0;
+                pClearValue = &clearValue;
+            }
+
             ComPtr<ID3D12Resource> res;
-            HRESULT hr = rt::g_session.d3d12Device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, init, nullptr, IID_PPV_ARGS(res.GetAddressOf()));
+            HRESULT hr = rt::g_session.d3d12Device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, init, pClearValue, IID_PPV_ARGS(res.GetAddressOf()));
             if (FAILED(hr)) {
                 Logf("[SimXR] CreateCommittedResource(D3D12)[%u] FAILED: 0x%08X", i, (unsigned)hr);
                 return XR_ERROR_RUNTIME_FAILURE;
@@ -1677,6 +1716,12 @@ static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const 
     auto& ch = it->second;
     // The app just released the image it acquired earlier
     ch.lastReleased = ch.lastAcquired;
+
+    // For D3D12: the app has finished using this image, reset our tracked state to COMMON.
+    // D3D12 implicit state promotion/decay means COMMON is always safe after a GPU sync point.
+    if (ch.backend == rt::Swapchain::Backend::D3D12 && ch.lastReleased < ch.imageStates12.size()) {
+        ch.imageStates12[ch.lastReleased] = D3D12_RESOURCE_STATE_COMMON;
+    }
 
     static int releaseCount = 0;
     bool shouldLog = (++releaseCount <= 10);
@@ -2213,7 +2258,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
     if (!s.usesD3D12) {
         if (s.previewSwapchain && s.previewWidth == width && s.previewHeight == height && s.previewFormat == format) return;
     } else {
-        if (s.previewSwapchain12 && s.previewWidth == width && s.previewHeight == height && s.previewFormat == format) return;
+        if (s.previewRT12 && s.previewWidth == width && s.previewHeight == height && s.previewFormat == format) return;
     }
     
     // IMPORTANT: Release ALL swapchain references before creating a new one
@@ -2338,45 +2383,66 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         }
         return;
     } else {
-        // DX12 preview swapchain
-        ComPtr<IDXGIFactory4> factory;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf())))) {
-            Log("[SimXR] DX12 preview: CreateDXGIFactory1 failed");
-            return;
-        }
-        DXGI_SWAP_CHAIN_DESC1 desc{};
-        desc.Width = width;
-        desc.Height = height;
-        desc.Format = format;
-        desc.SampleDesc.Count = 1;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = 2;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-        ComPtr<IDXGISwapChain1> sc1;
-        HRESULT hr = factory->CreateSwapChainForHwnd(s.d3d12Queue.Get(), s.hwnd, &desc, nullptr, nullptr, sc1.GetAddressOf());
-        if (FAILED(hr)) {
-            Logf("[SimXR] DX12 preview: CreateSwapChainForHwnd failed 0x%08X", (unsigned)hr);
-            return;
-        }
-        sc1.As(&s.previewSwapchain12);
-        s.previewBackbufferCount = desc.BufferCount;
-        s.previewBackbuffers.clear();
-        s.previewBackbuffers.resize(desc.BufferCount);
-
-        // Create RTV heap
-        D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{}; rtvDesc.NumDescriptors = desc.BufferCount; rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; rtvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-        if (FAILED(s.d3d12Device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(s.previewRTVHeap.GetAddressOf())))) {
-            Log("[SimXR] DX12 preview: CreateDescriptorHeap RTV failed"); return;
-        }
-        s.previewRTVDescriptorSize = s.d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = s.previewRTVHeap->GetCPUDescriptorHandleForHeapStart();
-        for (UINT i = 0; i < desc.BufferCount; ++i) {
-            if (FAILED(s.previewSwapchain12->GetBuffer(i, IID_PPV_ARGS(s.previewBackbuffers[i].GetAddressOf())))) {
-                Logf("[SimXR] DX12 preview: GetBuffer %u failed", i); return;
+        // DX12 preview: GDI-based rendering to avoid DXGI Present hook conflicts.
+        // Steam overlay (gameoverlayrenderer64) and UEVR both hook IDXGISwapChain::Present,
+        // creating infinite recursion → EXCEPTION_STACK_OVERFLOW. Instead, we render to an
+        // offscreen RT, readback to CPU, and paint via GDI StretchDIBits.
+        if (!s.previewQueue12) {
+            D3D12_COMMAND_QUEUE_DESC qd = {};
+            qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+            if (FAILED(s.d3d12Device->CreateCommandQueue(&qd, IID_PPV_ARGS(s.previewQueue12.GetAddressOf())))) {
+                Log("[SimXR] DX12 preview: CreateCommandQueue failed");
+                return;
             }
-            s.d3d12Device->CreateRenderTargetView(s.previewBackbuffers[i].Get(), nullptr, rtvHandle);
-            rtvHandle.ptr += s.previewRTVDescriptorSize;
+            s.d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(s.crossQueueFence.GetAddressOf()));
+            s.crossQueueFenceValue = 0;
+            Log("[SimXR] DX12 preview: Created command queue + cross-queue fence");
         }
+
+        // Create offscreen render target
+        D3D12_RESOURCE_DESC rtDesc = {};
+        rtDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rtDesc.Width = width;
+        rtDesc.Height = height;
+        rtDesc.DepthOrArraySize = 1;
+        rtDesc.MipLevels = 1;
+        rtDesc.Format = format;
+        rtDesc.SampleDesc.Count = 1;
+        rtDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        rtDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES defaultHeap = {};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        HRESULT hr = s.d3d12Device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+            &rtDesc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(s.previewRT12.GetAddressOf()));
+        if (FAILED(hr)) {
+            Logf("[SimXR] DX12 preview: CreateCommittedResource (RT) failed 0x%08X", (unsigned)hr);
+            return;
+        }
+
+        // Create readback buffer (aligned row pitch)
+        UINT rowPitch = ((width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+                        / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+        s.previewReadbackPitch = rowPitch;
+        D3D12_RESOURCE_DESC readbackDesc = {};
+        readbackDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        readbackDesc.Width = (UINT64)rowPitch * height;
+        readbackDesc.Height = 1;
+        readbackDesc.DepthOrArraySize = 1;
+        readbackDesc.MipLevels = 1;
+        readbackDesc.Format = DXGI_FORMAT_UNKNOWN;
+        readbackDesc.SampleDesc.Count = 1;
+        readbackDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES readbackHeap = {};
+        readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+        hr = s.d3d12Device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE,
+            &readbackDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(s.previewReadback12.GetAddressOf()));
+        if (FAILED(hr)) {
+            Logf("[SimXR] DX12 preview: CreateCommittedResource (readback) failed 0x%08X", (unsigned)hr);
+            s.previewRT12.Reset();
+            return;
+        }
+
         // Command allocator/list
         s.d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(s.previewCmdAlloc.GetAddressOf()));
         s.d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.previewCmdAlloc.Get(), nullptr, IID_PPV_ARGS(s.previewCmdList.GetAddressOf()));
@@ -2385,7 +2451,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         s.d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(s.previewFence.GetAddressOf()));
         s.previewFenceValue = 1;
         s.previewFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-        Log("[SimXR] DX12 preview swapchain initialized");
+        Logf("[SimXR] DX12 preview: GDI-based rendering initialized (%ux%u, pitch=%u)", width, height, rowPitch);
         return;
     }
 }
@@ -2612,18 +2678,20 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
     }
 }
 
-// D3D12 blit function - copies swapchain textures to preview backbuffer
+// D3D12 blit function - copies swapchain textures to offscreen RT, reads back to CPU, paints via GDI.
+// Uses GDI instead of DXGI Present to avoid hook conflicts with Steam overlay / UEVR.
 static void blitD3D12ToPreview(rt::Session& s,
                                 rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice,
                                 rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice,
                                 ui::DisplayLayout layout, ui::ViewMode viewMode) {
-    if (!s.previewSwapchain12 || !s.previewCmdList || !s.previewCmdAlloc) {
+    if (!s.previewRT12 || !s.previewReadback12 || !s.previewCmdList || !s.previewCmdAlloc) {
         Log("[SimXR] blitD3D12ToPreview: Missing D3D12 preview resources");
         return;
     }
 
     // Skip depth-only swapchains
     bool isDepthFormat = (chainL.format == DXGI_FORMAT_D32_FLOAT ||
+                          chainL.format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
                           chainL.format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
                           chainL.format == DXGI_FORMAT_D16_UNORM);
     if (isDepthFormat) {
@@ -2636,13 +2704,7 @@ static void blitD3D12ToPreview(rt::Session& s,
         WaitForSingleObject(s.previewFenceEvent, 1000);
     }
 
-    // Get current backbuffer index
-    UINT bbIndex = s.previewSwapchain12->GetCurrentBackBufferIndex();
-    ID3D12Resource* backbuffer = s.previewBackbuffers[bbIndex].Get();
-    if (!backbuffer) {
-        Log("[SimXR] blitD3D12ToPreview: No backbuffer");
-        return;
-    }
+    ID3D12Resource* renderTarget = s.previewRT12.Get();
 
     // Reset command allocator and list
     HRESULT hr = s.previewCmdAlloc->Reset();
@@ -2656,11 +2718,11 @@ static void blitD3D12ToPreview(rt::Session& s,
         return;
     }
 
-    // Transition backbuffer to copy dest
+    // Transition offscreen RT to copy dest (COMMON → COPY_DEST via implicit promotion)
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = backbuffer;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.pResource = renderTarget;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     s.previewCmdList->ResourceBarrier(1, &barrier);
@@ -2687,6 +2749,11 @@ static void blitD3D12ToPreview(rt::Session& s,
         return D3D12CalcSubresource(0, slice, 0, mipLevels, arraySize);
     };
 
+    // Get render target dimensions for clipping (CopyTextureRegion doesn't scale)
+    D3D12_RESOURCE_DESC rtDesc = renderTarget->GetDesc();
+    UINT rtWidth = (UINT)rtDesc.Width;
+    UINT rtHeight = rtDesc.Height;
+
     auto copyEye = [&](rt::Swapchain& chain, uint32_t idx, uint32_t slice,
                        UINT dstX, UINT dstY, const char* label) -> bool {
         if (idx >= chain.images12.size() || !chain.images12[idx]) return false;
@@ -2698,11 +2765,12 @@ static void blitD3D12ToPreview(rt::Session& s,
         if (subresource == UINT_MAX) return false;
 
         ID3D12Resource* srcTex = chain.images12[idx].Get();
-        D3D12_RESOURCE_STATES prevState = chain.imageStates12[idx];
+        // Transition from COMMON (reset on release) to COPY_SOURCE
+        // D3D12 supports implicit promotion from COMMON, but explicit barrier is safer
         transition(srcTex, chain.imageStates12[idx], D3D12_RESOURCE_STATE_COPY_SOURCE);
 
         D3D12_TEXTURE_COPY_LOCATION dst = {};
-        dst.pResource = backbuffer;
+        dst.pResource = renderTarget;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.SubresourceIndex = 0;
 
@@ -2711,16 +2779,24 @@ static void blitD3D12ToPreview(rt::Session& s,
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         src.SubresourceIndex = subresource;
 
+        // Clip source box to fit within render target (CopyTextureRegion is 1:1 pixel copy, no scaling)
+        UINT copyW = chain.width;
+        UINT copyH = chain.height;
+        if (dstX + copyW > rtWidth)  copyW = (dstX < rtWidth)  ? rtWidth  - dstX : 0;
+        if (dstY + copyH > rtHeight) copyH = (dstY < rtHeight) ? rtHeight - dstY : 0;
+        if (copyW == 0 || copyH == 0) return false;
+
         D3D12_BOX srcBox = {};
         srcBox.left = 0;
         srcBox.top = 0;
         srcBox.front = 0;
-        srcBox.right = chain.width;
-        srcBox.bottom = chain.height;
+        srcBox.right = copyW;
+        srcBox.bottom = copyH;
         srcBox.back = 1;
 
         s.previewCmdList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, &srcBox);
-        transition(srcTex, chain.imageStates12[idx], prevState);
+        // Transition back to COMMON so the app can use implicit promotion next frame
+        transition(srcTex, chain.imageStates12[idx], D3D12_RESOURCE_STATE_COMMON);
         return true;
     };
 
@@ -2765,22 +2841,90 @@ static void blitD3D12ToPreview(rt::Session& s,
         }
     }
 
-    // Transition backbuffer back to present
+    // Transition RT: COPY_DEST → COPY_SOURCE for readback
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     s.previewCmdList->ResourceBarrier(1, &barrier);
 
-    // Close and execute
+    // Copy render target to readback buffer
+    D3D12_TEXTURE_COPY_LOCATION readbackDst = {};
+    readbackDst.pResource = s.previewReadback12.Get();
+    readbackDst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    readbackDst.PlacedFootprint.Offset = 0;
+    readbackDst.PlacedFootprint.Footprint.Format = rtDesc.Format;
+    readbackDst.PlacedFootprint.Footprint.Width = rtWidth;
+    readbackDst.PlacedFootprint.Footprint.Height = rtHeight;
+    readbackDst.PlacedFootprint.Footprint.Depth = 1;
+    readbackDst.PlacedFootprint.Footprint.RowPitch = s.previewReadbackPitch;
+
+    D3D12_TEXTURE_COPY_LOCATION readbackSrc = {};
+    readbackSrc.pResource = renderTarget;
+    readbackSrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    readbackSrc.SubresourceIndex = 0;
+
+    s.previewCmdList->CopyTextureRegion(&readbackDst, 0, 0, 0, &readbackSrc, nullptr);
+
+    // Transition RT back to COMMON for next frame
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    s.previewCmdList->ResourceBarrier(1, &barrier);
+
+    // Execute and wait for completion (we need the readback data immediately)
     s.previewCmdList->Close();
     ID3D12CommandList* cmdLists[] = { s.previewCmdList.Get() };
-    s.d3d12Queue->ExecuteCommandLists(1, cmdLists);
+    s.previewQueue12->ExecuteCommandLists(1, cmdLists);
+    s.previewQueue12->Signal(s.previewFence.Get(), s.previewFenceValue);
+    if (s.previewFence->GetCompletedValue() < s.previewFenceValue) {
+        s.previewFence->SetEventOnCompletion(s.previewFenceValue, s.previewFenceEvent);
+        WaitForSingleObject(s.previewFenceEvent, 1000);
+    }
+    s.previewFenceValue++;
 
-    // Signal fence
-    s.d3d12Queue->Signal(s.previewFence.Get(), s.previewFenceValue++);
+    // Map readback buffer and paint to window via GDI (bypasses all DXGI Present hooks)
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * rtHeight };
+    hr = s.previewReadback12->Map(0, &readRange, &mapped);
+    if (SUCCEEDED(hr) && mapped && s.hwnd) {
+        HDC hdc = GetDC(s.hwnd);
+        if (hdc) {
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = (LONG)rtWidth;
+            bmi.bmiHeader.biHeight = -(LONG)rtHeight;  // top-down
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            // Handle aligned row pitch: if pitch matches width*4, blit directly; otherwise copy rows
+            UINT expectedPitch = rtWidth * 4;
+            if (s.previewReadbackPitch == expectedPitch) {
+                StretchDIBits(hdc, 0, 0, rtWidth, rtHeight,
+                              0, 0, rtWidth, rtHeight,
+                              mapped, &bmi, DIB_RGB_COLORS, SRCCOPY);
+            } else {
+                // Copy rows with correct pitch to a contiguous buffer
+                std::vector<uint8_t> pixels(expectedPitch * rtHeight);
+                const uint8_t* src = (const uint8_t*)mapped;
+                for (UINT row = 0; row < rtHeight; ++row) {
+                    memcpy(pixels.data() + row * expectedPitch, src + row * s.previewReadbackPitch, expectedPitch);
+                }
+                StretchDIBits(hdc, 0, 0, rtWidth, rtHeight,
+                              0, 0, rtWidth, rtHeight,
+                              pixels.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+            }
+            ReleaseDC(s.hwnd, hdc);
+        }
+        D3D12_RANGE writeRange = { 0, 0 };
+        s.previewReadback12->Unmap(0, &writeRange);
+    }
+
+    // Process window messages
+    MSG msg;
+    while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 
     static int blitCount = 0;
     if (++blitCount % 60 == 1) {
-        Logf("[SimXR] blitD3D12ToPreview: Copied L[%u] R[%u] to backbuffer %u", leftIdx, rightIdx, bbIndex);
+        Logf("[SimXR] blitD3D12ToPreview: GDI blit L[%u] R[%u] (%ux%u)", leftIdx, rightIdx, rtWidth, rtHeight);
     }
 }
 
@@ -3199,6 +3343,30 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
         // Use UNORM format for swapchain (SRGB not valid for FLIP_DISCARD)
         // We create SRGB RTVs for proper gamma when rendering
         DXGI_FORMAT displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        // For D3D12: CopyTextureRegion requires format compatibility, so the preview
+        // swapchain must use the same channel layout as the source XR swapchain.
+        // Strip sRGB (not valid for FLIP_DISCARD) but keep the channel order.
+        if (s.usesD3D12) {
+            switch (chL.format) {
+                case DXGI_FORMAT_B8G8R8A8_UNORM:
+                case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+                case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+                    displayFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    break;
+                case DXGI_FORMAT_R16G16B16A16_FLOAT:
+                case DXGI_FORMAT_R16G16B16A16_UNORM:
+                    displayFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    break;
+                case DXGI_FORMAT_R10G10B10A2_UNORM:
+                    displayFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
+                    break;
+                default:
+                    displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    break;
+            }
+        }
+
         const auto viewMode = ui::g_uiState.viewMode;
         const auto layout = ui::g_uiState.displayLayout;
         int targetWidth = (int)width;
@@ -3348,10 +3516,18 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             }
 
         } else {
-            // ===== D3D12 PATH =====
-            if (!s.previewSwapchain12) return;
+            // ===== D3D12 PATH (GDI-based presentation) =====
+            if (!s.previewRT12) return;
 
-            // Blit using D3D12 copy commands
+            // Cross-queue sync: make preview queue wait for game queue to finish
+            // rendering to the source textures before we copy from them
+            if (s.crossQueueFence && s.previewQueue12) {
+                s.crossQueueFenceValue++;
+                s.d3d12Queue->Signal(s.crossQueueFence.Get(), s.crossQueueFenceValue);
+                s.previewQueue12->Wait(s.crossQueueFence.Get(), s.crossQueueFenceValue);
+            }
+
+            // Blit using D3D12 copy commands → readback → GDI (no DXGI Present, no hook conflicts)
             if (proj.viewCount > 1) {
                 const auto& vR = proj.views[1];
                 auto& chR = const_cast<rt::Swapchain&>(*chRPtr);
@@ -3369,13 +3545,31 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                                    nullptr, 0, 0, layout, viewMode);
             }
 
-            // Present D3D12 (may be deferred if overlays are pending)
-            if (!skipPresent) {
-                MSG msg;
-                while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-                s.previewSwapchain12->Present(1, 0);
-            } else {
-                g_presentPending = true;
+            // No Present call needed - blitD3D12ToPreview handles GDI painting directly
+
+            // Update window title with FPS stats
+            static int d3d12TitleFrameCount = 0;
+            static auto d3d12LastTitleUpdate = std::chrono::high_resolution_clock::now();
+            static int d3d12LastFPS = 0;
+            d3d12TitleFrameCount++;
+            auto now12 = std::chrono::high_resolution_clock::now();
+            auto elapsed12 = std::chrono::duration_cast<std::chrono::milliseconds>(now12 - d3d12LastTitleUpdate).count();
+            if (elapsed12 >= 500) {
+                d3d12LastFPS = (int)(d3d12TitleFrameCount * 1000 / elapsed12);
+                d3d12TitleFrameCount = 0;
+                d3d12LastTitleUpdate = now12;
+                ui::UpdateWindowTitle(s.hwnd, d3d12LastFPS, 0);
+            }
+
+            // MCP Integration - check for screenshot requests and capture (D3D12)
+            // Screenshots use the readback buffer that was just filled by blitD3D12ToPreview
+            mcp::CheckScreenshotRequest();
+            if (mcp::g_screenshotRequested && s.previewRT12 && s.previewCmdAlloc && s.previewCmdList) {
+                mcp::CaptureScreenshotD3D12(s.d3d12Device.Get(), s.previewQueue12.Get(),
+                                             s.previewRT12.Get(),
+                                             s.previewCmdAlloc.Get(), s.previewCmdList.Get(),
+                                             s.previewFence.Get(), s.previewFenceEvent,
+                                             s.previewFenceValue);
             }
         }
     }
@@ -3383,7 +3577,9 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
 // Render a quad layer as 2D overlay (supports both D3D11 and OpenGL)
 static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) {
-    if (!quad || !s.previewSwapchain) return;
+    if (!quad) return;
+    // D3D12 sessions use previewRT12, not previewSwapchain
+    if (!s.previewSwapchain && !s.previewRT12) return;
 
     if (s.usesD3D12) {
         static bool warnedD3D12 = false;
@@ -3666,6 +3862,20 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
 }
 
 static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* info) {
+    // Reentrance guard: when our preview swapchain calls Present(), Steam's overlay
+    // (gameoverlayrenderer64) hooks it, which can trigger UEVR to re-submit frames
+    // through the OpenXR API layer chain, re-entering this function and causing
+    // infinite recursion → EXCEPTION_STACK_OVERFLOW.
+    static thread_local bool inEndFrame = false;
+    if (inEndFrame) {
+        static int reentrantCount = 0;
+        if (++reentrantCount <= 5) {
+            Logf("[SimXR] xrEndFrame: BLOCKED reentrant call #%d", reentrantCount);
+        }
+        return XR_SUCCESS;
+    }
+    inEndFrame = true;
+
     static int frameCount = 0;
     frameCount++;
 
@@ -3676,8 +3886,17 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         Logf("[SimXR] xrEndFrame called (frame #%d)", frameCount);
     }
 
+    // Check D3D12 device status
+    if (rt::g_session.usesD3D12 && rt::g_session.d3d12Device && shouldLog) {
+        HRESULT reason = rt::g_session.d3d12Device->GetDeviceRemovedReason();
+        if (reason != S_OK) {
+            Logf("[SimXR] xrEndFrame: D3D12 DEVICE REMOVED! reason=0x%08X", (unsigned)reason);
+        }
+    }
+
     if (!info) {
         Log("[SimXR] xrEndFrame: ERROR - info is null");
+        inEndFrame = false;
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
@@ -3734,14 +3953,21 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         }
     }
 
-    // Now Present after all layers are rendered
+    // MCP Integration - write frame status BEFORE Present (Present may block on D3D12)
+    mcp::WriteFrameStatus(frameCount, rt::g_session.previewWidth, rt::g_session.previewHeight,
+                          "RGBA8", mcp::GetSessionStateName((int)rt::g_session.state),
+                          rt::g_headYaw, rt::g_headPitch,
+                          rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z);
+
+    // Now Present after all layers are rendered (D3D11/GL only; D3D12 uses GDI in blit function)
     if (g_presentPending) {
         auto& s = rt::g_session;
         MSG msg;
         while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 
-        if (s.usesD3D12 && s.previewSwapchain12) {
-            s.previewSwapchain12->Present(1, 0);
+        if (s.usesD3D12) {
+            // D3D12 GDI-based path: blitD3D12ToPreview already painted via GDI, nothing to do
+            Log("[SimXR] Deferred D3D12: GDI blit already done in blitD3D12ToPreview");
         } else if (s.previewSwapchain) {
             s.previewSwapchain->Present(1, 0);
         }
@@ -3757,12 +3983,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         Log("[SimXR] xrEndFrame: WARNING - No projection layers found!");
     }
 
-    // MCP Integration - write frame status for diagnostics
-    mcp::WriteFrameStatus(frameCount, rt::g_session.previewWidth, rt::g_session.previewHeight,
-                          "RGBA8", mcp::GetSessionStateName((int)rt::g_session.state),
-                          rt::g_headYaw, rt::g_headPitch,
-                          rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z);
-
+    inEndFrame = false;
     return XR_SUCCESS;
 }
 
