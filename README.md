@@ -4,17 +4,19 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue)](https://github.com)
 [![OpenXR](https://img.shields.io/badge/OpenXR-1.0-green)](https://www.khronos.org/openxr/)
 
-A lightweight OpenXR runtime that enables VR applications to run in a desktop window for development and testing without requiring a physical VR headset.
+A lightweight OpenXR runtime that enables VR applications to run in a desktop window for development and testing without requiring a physical VR headset. Supports D3D11, D3D12, and OpenGL graphics backends.
 
 ![KAJUqBgmzewBPq9YkMDsm5AwsucqBaUY6gw2eMLX](https://github.com/user-attachments/assets/4dd804e1-13f4-46eb-a540-7c5cb77bf09c)
 
 ## 🎯 Features
 
+- **Multi-API Support** - Supports D3D11, D3D12, and OpenGL graphics backends
 - **Desktop VR Preview** - Run VR applications in a resizable desktop window with side-by-side stereo view
 - **Mouse & Keyboard Controls** - Navigate the virtual space using standard input devices
 - **Proper sRGB Handling** - Automatic gamma correction for accurate color reproduction
-- **Unity Compatible** - Fully tested with Unity's OpenXR plugin
-- **Minimal Dependencies** - Only requires Windows and DirectX 11
+- **Unity & Unreal Compatible** - Tested with Unity's OpenXR plugin and Unreal Engine (via UEVR)
+- **Steam Overlay Compatible** - D3D12 uses GDI-based rendering to avoid hook conflicts with Steam overlay
+- **Minimal Dependencies** - Only requires Windows and a compatible GPU
 - **Easy Setup** - Simple PowerShell scripts for registration/unregistration
 
 ## 🚀 Quick Start
@@ -22,7 +24,7 @@ A lightweight OpenXR runtime that enables VR applications to run in a desktop wi
 ### Prerequisites
 
 - Windows 10/11 (64-bit)
-- DirectX 11 compatible GPU
+- DirectX 11/12 or OpenGL compatible GPU
 - Visual Studio 2022 (for building from source)
 - CMake 3.20 or later (for building from source)
 
@@ -88,27 +90,31 @@ The built runtime will be in `build/bin/Release/openxr_simulator.dll`
 The simulator implements the OpenXR runtime interface, intercepting all OpenXR calls from applications:
 
 - **Instance & Session Management** - Handles OpenXR instance creation and session lifecycle
-- **Swapchain Rendering** - Creates D3D11 swapchains that applications render into
-- **View Composition** - Blits stereo views to a desktop window using optimized shaders
+- **Swapchain Rendering** - Creates swapchains for D3D11, D3D12, and OpenGL that applications render into
+- **View Composition** - Blits stereo views to a desktop window (D3D11: DXGI swapchain, D3D12: GDI-based readback, OpenGL: pixel buffer readback)
 - **Input Simulation** - Converts mouse/keyboard input to head pose and controller data
 
 ### Supported Features
 
 - ✅ Core OpenXR 1.0 specification
 - ✅ D3D11 graphics binding (`XR_KHR_D3D11_enable`)
+- ✅ D3D12 graphics binding (`XR_KHR_D3D12_enable`)
+- ✅ OpenGL graphics binding (`XR_KHR_opengl_enable`)
 - ✅ Win32 time conversion (`XR_KHR_win32_convert_performance_counter_time`)
-- ✅ Multiple swapchain formats (sRGB, UNORM, HDR)
+- ✅ Multiple swapchain formats (sRGB, UNORM, HDR, typeless, depth)
+- ✅ Mutable format swapchains (typeless backing for sRGB/non-sRGB views)
 - ✅ Stereo rendering with configurable FOV
 - ✅ Reference space tracking (LOCAL, STAGE, VIEW)
 - ✅ Basic action system for input
+- ✅ Screenshot capture (D3D11, D3D12, and OpenGL)
 
 ### Limitations
 
+- ❌ No Vulkan support (D3D11, D3D12, and OpenGL only)
 - ❌ No hand tracking
 - ❌ No haptic feedback
 - ❌ No foveated rendering
 - ❌ Limited to seated/standing experiences
-- ❌ No OpenGL/Vulkan support (D3D11 only)
 
 ## 🎮 Configuration
 
@@ -163,8 +169,12 @@ reg query "HKLM\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"
 ### Preview window doesn't appear
 
 - Check the log file: `%LOCALAPPDATA%\OpenXR-Simulator\openxr_simulator.log`
-- Verify D3D11 support on your system
+- Verify D3D11/D3D12/OpenGL support on your system
 - Try running the application as administrator
+
+### D3D12 applications crash or show stack overflow
+
+- This is typically caused by DXGI Present hook conflicts with Steam overlay or UEVR. The simulator uses GDI-based rendering for D3D12 to avoid this, so make sure you're on the latest version.
 
 ### Performance issues
 
@@ -203,7 +213,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🗺️ Roadmap
 
-- [ ] Linux support via Vulkan
+- [ ] Vulkan graphics binding (`XR_KHR_vulkan_enable`)
+- [ ] Linux support
 - [ ] Configurable controller emulation
 - [ ] Multi-monitor support
 - [ ] Recording and playback functionality
