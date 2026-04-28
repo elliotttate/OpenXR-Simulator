@@ -2419,9 +2419,27 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
             mcp::WriteCommandAck("headset_profile", applied);
         }
 
-        // Anaglyph preview overlay toggle.
+        // Anaglyph preview overlay toggle. The simulator already renders
+        // a red/cyan anaglyph composite when ui::g_uiState.displayLayout
+        // == DisplayLayout::Anaglyph (using the anaglyphRedBS / anaglyphCyanBS
+        // blend states), so we just flip the enum. Remember the previous
+        // layout so we can restore it on disable.
         mcp::AnaglyphCommand ana = mcp::CheckAnaglyphCommand();
         if (ana.valid) {
+            static ui::DisplayLayout s_savedLayout = ui::DisplayLayout::SideBySide;
+            static bool s_haveSaved = false;
+            if (ana.enabled) {
+                if (!s_haveSaved) {
+                    s_savedLayout = ui::g_uiState.displayLayout;
+                    s_haveSaved = true;
+                }
+                ui::g_uiState.displayLayout = ui::DisplayLayout::Anaglyph;
+            } else {
+                if (s_haveSaved) {
+                    ui::g_uiState.displayLayout = s_savedLayout;
+                    s_haveSaved = false;
+                }
+            }
             rt::g_anaglyphPreview = ana.enabled;
             mcp::WriteCommandAck("anaglyph", true);
         }
