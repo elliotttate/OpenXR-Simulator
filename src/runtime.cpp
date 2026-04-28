@@ -188,6 +188,35 @@ static XrQuaternionf QuatFromYawPitch(float yaw, float pitch) {
     return q;
 }
 
+// Yaw / Pitch / Roll head orientation (Y-X-Z intrinsic Euler).
+// Roll is rotation about the head's forward axis, used by the diagnostic
+// pose-injection paths so app coordinate-system bugs that only manifest
+// off-axis (e.g. inverted-roll quaternion handedness) become visible.
+static XrQuaternionf QuatFromYawPitchRoll(float yaw, float pitch, float roll) {
+    // Build q_yaw, q_pitch, q_roll separately and compose: q = q_yaw * q_pitch * q_roll
+    // (apply roll first in head-local frame, then pitch, then yaw).
+    const float hy = yaw   * 0.5f, cy = cosf(hy), sy = sinf(hy);
+    const float hp = pitch * 0.5f, cp = cosf(hp), sp = sinf(hp);
+    const float hr = roll  * 0.5f, cr = cosf(hr), sr = sinf(hr);
+
+    // q_yaw  = (0, sy, 0, cy)   -- about +Y
+    // q_pitch= (sp, 0, 0, cp)   -- about +X
+    // q_roll = (0, 0, sr, cr)   -- about +Z (head forward = -Z, so roll feels intuitive)
+    // q = q_yaw * q_pitch * q_roll
+    XrQuaternionf qyp;  // q_yaw * q_pitch
+    qyp.x = cy * sp;
+    qyp.y = sy * cp;
+    qyp.z = -sy * sp;
+    qyp.w = cy * cp;
+
+    XrQuaternionf q;  // qyp * q_roll
+    q.x = qyp.x * cr + qyp.y * sr;
+    q.y = qyp.y * cr - qyp.x * sr;
+    q.z = qyp.z * cr + qyp.w * sr;
+    q.w = qyp.w * cr - qyp.z * sr;
+    return q;
+}
+
 
 // Helper function to convert a typed format to typeless
 static DXGI_FORMAT ToTypeless(DXGI_FORMAT format) {
@@ -289,6 +318,7 @@ struct Session {
     ComPtr<ID3D11RasterizerState> noCullRS;  // Rasterizer state with culling disabled
     ComPtr<ID3D11BlendState> anaglyphRedBS;
     ComPtr<ID3D11BlendState> anaglyphCyanBS;
+    ComPtr<ID3D11BlendState> alphaBlendBS;
 
     // Desktop preview window (no thread - handled on main thread)
     HWND hwnd{nullptr};
@@ -326,6 +356,37 @@ static std::unordered_map<XrSwapchain, Swapchain> g_swapchains;
 static XrVector3f g_headPos = {0.0f, 1.7f, 0.0f};  // Start at standing eye height
 static float g_headYaw = 0.0f;    // Rotation around Y axis (left/right)
 static float g_headPitch = 0.0f;  // Rotation around X axis (up/down)
+static float g_headRoll = 0.0f;   // Rotation around forward axis (head tilt). MCP-only — no keyboard binding.
+
+// ---------- Diagnostic state: settable IPD and asymmetric per-eye FOV ----------
+//
+// By default the simulator publishes a symmetric FOV derived from a single
+// degree value (ui::g_uiState.fovDegrees) and a hardcoded 64mm IPD. That
+// works for sanity checks but hides app bugs that only surface against a
+// real headset's asymmetric per-eye lens profile and runtime-reported IPD.
+//
+// When g_useCustomFov / g_useCustomIpd are set (via MCP set_fov / set_ipd
+// / set_headset_profile), xrLocateViews emits the configured values
+// instead. Headset profiles (quest3, index, etc.) preset both at once.
+//
+// FOV is stored in radians per OpenXR XrFovf convention:
+//   angleLeft  < 0,  angleRight > 0
+//   angleDown  < 0,  angleUp    > 0
+// Per eye: index 0 = left eye, 1 = right eye.
+static bool  g_useCustomFov = false;
+static float g_eyeFovL[2] = { 0, 0 };
+static float g_eyeFovR[2] = { 0, 0 };
+static float g_eyeFovU[2] = { 0, 0 };
+static float g_eyeFovD[2] = { 0, 0 };
+
+static bool  g_useCustomIpd = false;
+static float g_customIpd = 0.064f;  // meters
+
+// Anaglyph preview overlay: when enabled, the simulator's preview window
+// composites left+right eyes into a red/cyan stereo image instead of
+// side-by-side. Reveals IPD bugs (eyes don't converge -> red/cyan ghost)
+// at a glance.
+static bool g_anaglyphPreview = false;
 static bool g_mouseCapture = false;
 static POINT g_lastMousePos = {0, 0};
 
@@ -409,13 +470,34 @@ XrQuaternionf QuatFromYawPitch(float yaw, float pitch) {
     float sy = sinf(yaw * 0.5f);
     float cp = cosf(pitch * 0.5f);
     float sp = sinf(pitch * 0.5f);
-    
+
     // Combine rotations (yaw * pitch)
     XrQuaternionf q;
     q.w = cy * cp;
     q.x = cy * sp;
     q.y = sy * cp;
     q.z = -sy * sp;
+    return q;
+}
+
+// Yaw / Pitch / Roll: q = q_yaw * q_pitch * q_roll. Roll is rotation
+// about the head's local forward axis (head tilt), used by the
+// MCP-injected diagnostic poses so off-axis quaternion-handedness
+// bugs surface in the simulator.
+XrQuaternionf QuatFromYawPitchRoll(float yaw, float pitch, float roll) {
+    const float hy = yaw   * 0.5f, cy = cosf(hy), sy = sinf(hy);
+    const float hp = pitch * 0.5f, cp = cosf(hp), sp = sinf(hp);
+    const float hr = roll  * 0.5f, cr = cosf(hr), sr = sinf(hr);
+    XrQuaternionf qyp;  // q_yaw * q_pitch (matches QuatFromYawPitch above)
+    qyp.x = cy * sp;
+    qyp.y = sy * cp;
+    qyp.z = -sy * sp;
+    qyp.w = cy * cp;
+    XrQuaternionf q;  // qyp * q_roll where q_roll = (0, 0, sr, cr)
+    q.x = qyp.x * cr + qyp.y * sr;
+    q.y = qyp.y * cr - qyp.x * sr;
+    q.z = qyp.z * cr + qyp.w * sr;
+    q.w = qyp.w * cr - qyp.z * sr;
     return q;
 }
 
@@ -439,7 +521,7 @@ static inline XrVector3f RotateVectorByQuaternion(const XrQuaternionf& q, const 
 // Initialize shader resources for blitting
 bool InitBlitResources(Session& s) {
     if (s.blitVS && s.blitPS && s.samplerState && s.noCullRS &&
-        s.anaglyphRedBS && s.anaglyphCyanBS) {
+        s.anaglyphRedBS && s.anaglyphCyanBS && s.alphaBlendBS) {
         return true;
     }
 
@@ -539,6 +621,21 @@ bool InitBlitResources(Session& s) {
         D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
     hr = s.d3d11Device->CreateBlendState(&blendDesc, s.anaglyphCyanBS.GetAddressOf());
     if (FAILED(hr)) { Logf("[SimXR] Failed to create anaglyph cyan blend state: 0x%08X", hr); return false; }
+
+    // Create alpha blend state for quad layer overlay
+    D3D11_BLEND_DESC alphaBlendDesc{};
+    alphaBlendDesc.AlphaToCoverageEnable = FALSE;
+    alphaBlendDesc.IndependentBlendEnable = FALSE;
+    alphaBlendDesc.RenderTarget[0].BlendEnable = TRUE;
+    alphaBlendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    alphaBlendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    alphaBlendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    alphaBlendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    alphaBlendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    alphaBlendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    alphaBlendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    hr = s.d3d11Device->CreateBlendState(&alphaBlendDesc, s.alphaBlendBS.GetAddressOf());
+    if (FAILED(hr)) { Logf("[SimXR] Failed to create alpha blend state: 0x%08X", hr); return false; }
 
     Log("[SimXR] Blit resources initialized successfully.");
     return true;
@@ -644,7 +741,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (ui::HandleMenuCommand(hWnd, wParam,
                 []() { /* Resize handled by presentProjection based on zoom */ },
                 []() { mcp::g_screenshotRequested = true; },
-                []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; }
+                []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; }
             )) {
                 return 0;
             }
@@ -654,7 +751,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (ui::HandleKeyboardShortcut(hWnd, wParam,
                     []() { /* Resize handled by presentProjection based on zoom */ },
                     []() { mcp::g_screenshotRequested = true; },
-                    []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; }
+                    []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; }
                 )) {
                     return 0;
                 }
@@ -2224,7 +2321,10 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
             rt::g_leftController.prevPitch = totalLeftPitch;
         }
 
-        // Check for MCP head pose commands (for automated testing)
+    }
+
+    // MCP commands work regardless of window focus (file-based IPC)
+    {
         mcp::HeadPoseCommand cmd = mcp::CheckHeadPoseCommand();
         if (cmd.valid) {
             rt::g_headPos.x = cmd.x;
@@ -2232,7 +2332,104 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
             rt::g_headPos.z = cmd.z;
             rt::g_headYaw = cmd.yaw;
             rt::g_headPitch = cmd.pitch;
+            if (cmd.hasRoll) rt::g_headRoll = cmd.roll;
             mcp::WriteCommandAck("head_pose", true);
+        }
+
+        // Per-eye FOV override (asymmetric headset profile testing).
+        mcp::FovCommand fov = mcp::CheckFovCommand();
+        if (fov.valid) {
+            if (fov.clear) {
+                rt::g_useCustomFov = false;
+            } else {
+                rt::g_useCustomFov = true;
+                for (int i = 0; i < 2; ++i) {
+                    rt::g_eyeFovL[i] = fov.angleLeft[i];
+                    rt::g_eyeFovR[i] = fov.angleRight[i];
+                    rt::g_eyeFovU[i] = fov.angleUp[i];
+                    rt::g_eyeFovD[i] = fov.angleDown[i];
+                }
+            }
+            mcp::WriteCommandAck("fov", true);
+        }
+
+        // Settable IPD (test app's response to IPD ranges; 0mm = no parallax).
+        mcp::IpdCommand ipdCmd = mcp::CheckIpdCommand();
+        if (ipdCmd.valid) {
+            if (ipdCmd.clear) {
+                rt::g_useCustomIpd = false;
+            } else {
+                rt::g_useCustomIpd = true;
+                rt::g_customIpd = ipdCmd.ipdMeters;
+            }
+            mcp::WriteCommandAck("ipd", true);
+        }
+
+        // Headset profile preset: applies both FOV and IPD at once.
+        // Approximate per-eye FOV taken from public lens specs; treat as
+        // close-enough fixtures for catching projection bugs, not exact
+        // calibration data.
+        mcp::HeadsetProfileCommand prof = mcp::CheckHeadsetProfileCommand();
+        if (prof.valid) {
+            const float DEG2RAD = 3.14159265f / 180.0f;
+            bool applied = true;
+            // Each row: { aL, aR, aU, aD } in degrees, per eye [left, right]
+            if (strcmp(prof.name, "default") == 0 || strcmp(prof.name, "clear") == 0) {
+                rt::g_useCustomFov = false;
+                rt::g_useCustomIpd = false;
+            } else if (strcmp(prof.name, "quest2") == 0) {
+                rt::g_useCustomFov = true;
+                rt::g_eyeFovL[0] = -50.f * DEG2RAD; rt::g_eyeFovR[0] =  44.f * DEG2RAD;
+                rt::g_eyeFovU[0] =  48.f * DEG2RAD; rt::g_eyeFovD[0] = -52.f * DEG2RAD;
+                rt::g_eyeFovL[1] = -44.f * DEG2RAD; rt::g_eyeFovR[1] =  50.f * DEG2RAD;
+                rt::g_eyeFovU[1] =  48.f * DEG2RAD; rt::g_eyeFovD[1] = -52.f * DEG2RAD;
+                rt::g_useCustomIpd = true;
+                rt::g_customIpd = 0.064f;
+            } else if (strcmp(prof.name, "quest3") == 0) {
+                rt::g_useCustomFov = true;
+                rt::g_eyeFovL[0] = -52.f * DEG2RAD; rt::g_eyeFovR[0] =  48.f * DEG2RAD;
+                rt::g_eyeFovU[0] =  53.f * DEG2RAD; rt::g_eyeFovD[0] = -52.f * DEG2RAD;
+                rt::g_eyeFovL[1] = -48.f * DEG2RAD; rt::g_eyeFovR[1] =  52.f * DEG2RAD;
+                rt::g_eyeFovU[1] =  53.f * DEG2RAD; rt::g_eyeFovD[1] = -52.f * DEG2RAD;
+                rt::g_useCustomIpd = true;
+                rt::g_customIpd = 0.064f;
+            } else if (strcmp(prof.name, "index") == 0) {
+                rt::g_useCustomFov = true;
+                rt::g_eyeFovL[0] = -58.f * DEG2RAD; rt::g_eyeFovR[0] =  50.f * DEG2RAD;
+                rt::g_eyeFovU[0] =  52.f * DEG2RAD; rt::g_eyeFovD[0] = -58.f * DEG2RAD;
+                rt::g_eyeFovL[1] = -50.f * DEG2RAD; rt::g_eyeFovR[1] =  58.f * DEG2RAD;
+                rt::g_eyeFovU[1] =  52.f * DEG2RAD; rt::g_eyeFovD[1] = -58.f * DEG2RAD;
+                rt::g_useCustomIpd = true;
+                rt::g_customIpd = 0.063f;
+            } else {
+                applied = false;
+            }
+            mcp::WriteCommandAck("headset_profile", applied);
+        }
+
+        // Anaglyph preview overlay toggle.
+        mcp::AnaglyphCommand ana = mcp::CheckAnaglyphCommand();
+        if (ana.valid) {
+            rt::g_anaglyphPreview = ana.enabled;
+            mcp::WriteCommandAck("anaglyph", true);
+        }
+
+        mcp::ControllerPoseCommand ctrlCmd = mcp::CheckControllerPoseCommand();
+        if (ctrlCmd.valid) {
+            rt::ControllerState& ctrl = (ctrlCmd.hand == 0) ? rt::g_leftController : rt::g_rightController;
+            ctrl.posOffset.x = ctrlCmd.posX;
+            ctrl.posOffset.y = ctrlCmd.posY;
+            ctrl.posOffset.z = ctrlCmd.posZ;
+            ctrl.yawOffset = ctrlCmd.yaw;
+            ctrl.pitchOffset = ctrlCmd.pitch;
+            if (ctrlCmd.triggerSet) {
+                ctrl.triggerValue = ctrlCmd.trigger;
+                ctrl.triggerPressed = (ctrlCmd.trigger >= 0.5f);
+            }
+            if (ctrlCmd.buttonA >= 0) {
+                ctrl.primaryPressed = (ctrlCmd.buttonA != 0);
+            }
+            mcp::WriteCommandAck("controller_pose", true);
         }
     }
 
@@ -3130,6 +3327,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 s.noCullRS.Reset();
                 s.anaglyphRedBS.Reset();
                 s.anaglyphCyanBS.Reset();
+                s.alphaBlendBS.Reset();
                 Log("[SimXR] Reset blit resources for fresh shader compilation");
             }
 
@@ -3813,28 +4011,48 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     ComPtr<ID3D11ShaderResourceView> srv;
     if (FAILED(s.d3d11Device->CreateShaderResourceView(quadTex.Get(), nullptr, srv.GetAddressOf()))) return;
 
-    // Calculate viewport for quad
-    // For menus, show fullscreen (or nearly fullscreen)
-    float quadAspect = quad->size.width / quad->size.height;
+    // Calculate viewports matching the projection layer layout
+    const auto layout = ui::g_uiState.displayLayout;
+    const auto viewMode = ui::g_uiState.viewMode;
     float screenW = (float)s.previewWidth;
     float screenH = (float)s.previewHeight;
 
-    // Use most of the screen for menu display
-    float displayW = screenW * 0.9f;
-    float displayH = displayW / quadAspect;
-    if (displayH > screenH * 0.9f) {
-        displayH = screenH * 0.9f;
-        displayW = displayH * quadAspect;
+    bool showLeft = (viewMode == ui::ViewMode::BothEyes || viewMode == ui::ViewMode::LeftEyeOnly);
+    bool showRight = (viewMode == ui::ViewMode::BothEyes || viewMode == ui::ViewMode::RightEyeOnly);
+    bool singleEye = (viewMode != ui::ViewMode::BothEyes);
+
+    // Build left/right viewports to match projection layer layout
+    D3D11_VIEWPORT leftVp = { 0, 0, screenW, screenH, 0.0f, 1.0f };
+    D3D11_VIEWPORT rightVp = { 0, 0, screenW, screenH, 0.0f, 1.0f };
+    if (!singleEye) {
+        if (layout == ui::DisplayLayout::SideBySide) {
+            leftVp.Width = screenW / 2.0f;
+            rightVp.Width = screenW / 2.0f;
+            rightVp.TopLeftX = screenW / 2.0f;
+        } else if (layout == ui::DisplayLayout::OverUnder) {
+            leftVp.Height = screenH / 2.0f;
+            rightVp.Height = screenH / 2.0f;
+            rightVp.TopLeftY = screenH / 2.0f;
+        }
     }
 
-    // Center on screen
-    float displayX = (screenW - displayW) / 2.0f;
-    float displayY = (screenH - displayH) / 2.0f;
+    // Calculate quad display rect within a given viewport
+    float quadAspect = quad->size.width / quad->size.height;
+    auto calcQuadVp = [&](const D3D11_VIEWPORT& eyeVp) -> D3D11_VIEWPORT {
+        float vpW = eyeVp.Width;
+        float vpH = eyeVp.Height;
+        float displayW = vpW * 0.9f;
+        float displayH = displayW / quadAspect;
+        if (displayH > vpH * 0.9f) {
+            displayH = vpH * 0.9f;
+            displayW = displayH * quadAspect;
+        }
+        float displayX = eyeVp.TopLeftX + (vpW - displayW) / 2.0f;
+        float displayY = eyeVp.TopLeftY + (vpH - displayH) / 2.0f;
+        return { displayX, displayY, displayW, displayH, 0.0f, 1.0f };
+    };
 
-    D3D11_VIEWPORT vp = { displayX, displayY, displayW, displayH, 0.0f, 1.0f };
-
-    // Render the quad
-    s.d3d11Context->RSSetViewports(1, &vp);
+    // Set up shared render state
     s.d3d11Context->VSSetShader(s.blitVS.Get(), nullptr, 0);
     s.d3d11Context->PSSetShader(s.blitPS.Get(), nullptr, 0);
 
@@ -3846,15 +4064,27 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     s.d3d11Context->IASetInputLayout(nullptr);
     s.d3d11Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-    // Use alpha blending for overlay
-    s.d3d11Context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    // Use alpha blending for transparent overlay
+    s.d3d11Context->OMSetBlendState(s.alphaBlendBS.Get(), nullptr, 0xFFFFFFFF);
     s.d3d11Context->OMSetDepthStencilState(nullptr, 0);
     s.d3d11Context->RSSetState(s.noCullRS.Get());
 
     ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
     s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
 
-    s.d3d11Context->Draw(4, 0);
+    // Draw quad into left eye viewport
+    if (showLeft) {
+        D3D11_VIEWPORT quadVp = calcQuadVp(leftVp);
+        s.d3d11Context->RSSetViewports(1, &quadVp);
+        s.d3d11Context->Draw(4, 0);
+    }
+
+    // Draw quad into right eye viewport
+    if (showRight) {
+        D3D11_VIEWPORT quadVp = calcQuadVp(rightVp);
+        s.d3d11Context->RSSetViewports(1, &quadVp);
+        s.d3d11Context->Draw(4, 0);
+    }
 
     // Cleanup
     ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
@@ -3929,6 +4159,37 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
 
         if (base->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
             const auto* proj = reinterpret_cast<const XrCompositionLayerProjection*>(base);
+
+            // Capture the FOV+pose+rect the app is submitting into the
+            // projection log. MCP get_projection_log returns the recent
+            // window so the caller can diff "what app told the
+            // compositor" vs "what the simulator is configured to use."
+            if (proj->viewCount >= 1 && proj->views) {
+                mcp::ProjLogEntry e{};
+                e.frame   = frameCount;
+                e.poseQx  = proj->views[0].pose.orientation.x;
+                e.poseQy  = proj->views[0].pose.orientation.y;
+                e.poseQz  = proj->views[0].pose.orientation.z;
+                e.poseQw  = proj->views[0].pose.orientation.w;
+                e.posX    = proj->views[0].pose.position.x;
+                e.posY    = proj->views[0].pose.position.y;
+                e.posZ    = proj->views[0].pose.position.z;
+                uint32_t cap = (proj->viewCount >= 2) ? 2u : 1u;
+                for (uint32_t v = 0; v < cap; ++v) {
+                    e.aL[v] = proj->views[v].fov.angleLeft;
+                    e.aR[v] = proj->views[v].fov.angleRight;
+                    e.aU[v] = proj->views[v].fov.angleUp;
+                    e.aD[v] = proj->views[v].fov.angleDown;
+                    e.rectX[v] = proj->views[v].subImage.imageRect.offset.x;
+                    e.rectY[v] = proj->views[v].subImage.imageRect.offset.y;
+                    e.rectW[v] = proj->views[v].subImage.imageRect.extent.width;
+                    e.rectH[v] = proj->views[v].subImage.imageRect.extent.height;
+                }
+                mcp::g_projLog[mcp::g_projLogHead] = e;
+                mcp::g_projLogHead = (mcp::g_projLogHead + 1) % mcp::PROJ_LOG_CAPACITY;
+                if (mcp::g_projLogCount < mcp::PROJ_LOG_CAPACITY) ++mcp::g_projLogCount;
+            }
+
             presentProjection(rt::g_session, *proj, hasOverlays);  // skipPresent if overlays pending
         }
     }
@@ -3958,6 +4219,11 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
                           "RGBA8", mcp::GetSessionStateName((int)rt::g_session.state),
                           rt::g_headYaw, rt::g_headPitch,
                           rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z);
+
+    // Drain MCP projection-log dump request if pending.
+    if (mcp::CheckProjLogDumpRequest()) {
+        mcp::DumpProjectionLog();
+    }
 
     // Now Present after all layers are rendered (D3D11/GL only; D3D12 uses GDI in blit function)
     if (g_presentPending) {
@@ -3998,10 +4264,12 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
                             XR_VIEW_STATE_POSITION_TRACKED_BIT; 
     }
     if (cap < 2 || !views) return XR_SUCCESS;
-    const float ipd = 0.064f;
-    
-    // Use dynamic head pose from mouse look
-    XrQuaternionf orientation = rt::QuatFromYawPitch(rt::g_headYaw, rt::g_headPitch);
+    const float ipd = rt::g_useCustomIpd ? rt::g_customIpd : 0.064f;
+
+    // Use dynamic head pose from mouse look (yaw + pitch) plus optional
+    // MCP-injected roll so off-axis quaternion-handedness bugs (which
+    // identity pose hides) actually surface in the simulator.
+    XrQuaternionf orientation = rt::QuatFromYawPitchRoll(rt::g_headYaw, rt::g_headPitch, rt::g_headRoll);
     
     // Helper function to rotate a vector by a quaternion
     auto rotateVector = [](XrQuaternionf q, XrVector3f v) -> XrVector3f {
@@ -4044,14 +4312,20 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
             rt::g_headPos.z + rotatedOffset.z
         };
         
-        // Configurable FOV from UI settings
-        // Convert degrees to tangent: tan(fovDegrees/2 * PI/180)
-        // Safeguard: ensure fovDegrees is valid (default to 90 if not)
-        int fovDeg = ui::g_uiState.fovDegrees;
-        if (fovDeg <= 0 || fovDeg > 180) fovDeg = 90;
-        float fovRadians = fovDeg * 0.5f * 3.14159265f / 180.0f;
-        float fovTan = tanf(fovRadians);
-        views[i].fov = { -fovTan, fovTan, fovTan, -fovTan };
+        if (rt::g_useCustomFov) {
+            // Per-eye asymmetric FOV (XrFovf convention: aL<0, aR>0, aU>0, aD<0).
+            // Set via MCP set_fov / set_headset_profile. Real-headset bugs that
+            // hide under the simulator's symmetric default surface here.
+            views[i].fov = { rt::g_eyeFovL[i], rt::g_eyeFovR[i],
+                             rt::g_eyeFovU[i], rt::g_eyeFovD[i] };
+        } else {
+            // Symmetric default from UI slider.
+            int fovDeg = ui::g_uiState.fovDegrees;
+            if (fovDeg <= 0 || fovDeg > 180) fovDeg = 90;
+            float fovRadians = fovDeg * 0.5f * 3.14159265f / 180.0f;
+            float fovTan = tanf(fovRadians);
+            views[i].fov = { -fovTan, fovTan, fovTan, -fovTan };
+        }
     }
     static int locateCount = 0;
     if (++locateCount % 90 == 1) {  // Log every 90 frames (~1 second)

@@ -538,6 +538,8 @@ struct HeadPoseCommand {
     float z = 0.0f;
     float yaw = 0.0f;
     float pitch = 0.0f;
+    float roll = 0.0f;
+    bool  hasRoll = false;     // false = leave g_headRoll alone (back-compat)
 };
 
 // Simple JSON float parser
@@ -553,8 +555,17 @@ inline float ParseJsonFloat(const char* json, const char* key, float defaultVal)
     return (float)atof(pos);
 }
 
+// Returns true if `key` appears in the JSON (regardless of value).
+// Used to detect "field omitted" vs "field set to 0".
+inline bool JsonHasKey(const char* json, const char* key) {
+    char searchKey[64];
+    snprintf(searchKey, sizeof(searchKey), "\"%s\"", key);
+    return strstr(json, searchKey) != nullptr;
+}
+
 // Check for head pose command from MCP
-// File format: {"x": 0, "y": 1.7, "z": 0, "yaw": 0, "pitch": 0}
+// File format: {"x": 0, "y": 1.7, "z": 0, "yaw": 0, "pitch": 0, "roll": 0}
+// "roll" is optional — omit to keep the simulator's current roll value.
 inline HeadPoseCommand CheckHeadPoseCommand() {
     HeadPoseCommand cmd;
     std::string cmdPath = GetSimulatorDataPath() + "\\head_pose_command.json";
@@ -571,11 +582,267 @@ inline HeadPoseCommand CheckHeadPoseCommand() {
         cmd.z = ParseJsonFloat(buf, "z", 0.0f);
         cmd.yaw = ParseJsonFloat(buf, "yaw", 0.0f);
         cmd.pitch = ParseJsonFloat(buf, "pitch", 0.0f);
+        cmd.hasRoll = JsonHasKey(buf, "roll");
+        if (cmd.hasRoll) cmd.roll = ParseJsonFloat(buf, "roll", 0.0f);
 
         // Delete the file after reading (one-shot command)
         DeleteFileA(cmdPath.c_str());
-        McpLogf("Head pose command: pos(%.2f, %.2f, %.2f) yaw=%.1f pitch=%.1f",
-                cmd.x, cmd.y, cmd.z, cmd.yaw, cmd.pitch);
+        McpLogf("Head pose command: pos(%.2f, %.2f, %.2f) yaw=%.2f pitch=%.2f roll=%.2f",
+                cmd.x, cmd.y, cmd.z, cmd.yaw, cmd.pitch,
+                cmd.hasRoll ? cmd.roll : NAN);
+    }
+    return cmd;
+}
+
+// ---------- FOV / IPD / Headset-profile commands ----------
+//
+// These let MCP override the simulator's symmetric-FOV / hardcoded-IPD
+// defaults so projection-matrix bugs and per-eye-IPD bugs that only
+// show up against a real headset's profile are reproducible in the
+// simulator. Set values are sticky until cleared or a new profile is
+// applied.
+
+struct FovCommand {
+    bool valid = false;
+    bool clear = false;  // {"clear": true} reverts to the symmetric UI default
+    float angleLeft[2]  = { 0, 0 };  // radians, < 0
+    float angleRight[2] = { 0, 0 };  // radians, > 0
+    float angleUp[2]    = { 0, 0 };  // radians, > 0
+    float angleDown[2]  = { 0, 0 };  // radians, < 0
+};
+
+// File format (radians):
+//   {"left":  {"aL": -0.95, "aR": 0.78, "aU": 0.85, "aD": -0.95},
+//    "right": {"aL": -0.78, "aR": 0.95, "aU": 0.85, "aD": -0.95}}
+// Or for clear: {"clear": true}
+inline FovCommand CheckFovCommand() {
+    FovCommand cmd;
+    std::string p = GetSimulatorDataPath() + "\\fov_command.json";
+    FILE* f = nullptr;
+    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    DeleteFileA(p.c_str());
+    cmd.valid = true;
+    if (JsonHasKey(buf, "clear")) {
+        cmd.clear = true;
+        McpLog("FOV command: clear (revert to symmetric default)");
+        return cmd;
+    }
+    // Find "left": { ... } and "right": { ... } sub-objects and parse from there.
+    auto parseEye = [&](const char* eyeKey, int idx) {
+        char k[16];
+        snprintf(k, sizeof(k), "\"%s\"", eyeKey);
+        const char* eye = strstr(buf, k);
+        if (!eye) return;
+        const char* brace = strchr(eye, '{');
+        if (!brace) return;
+        cmd.angleLeft[idx]  = ParseJsonFloat(brace, "aL", -1.0f);
+        cmd.angleRight[idx] = ParseJsonFloat(brace, "aR",  1.0f);
+        cmd.angleUp[idx]    = ParseJsonFloat(brace, "aU",  1.0f);
+        cmd.angleDown[idx]  = ParseJsonFloat(brace, "aD", -1.0f);
+    };
+    parseEye("left",  0);
+    parseEye("right", 1);
+    McpLogf("FOV command: L=[%.2f,%.2f,%.2f,%.2f]rad  R=[%.2f,%.2f,%.2f,%.2f]rad",
+            cmd.angleLeft[0], cmd.angleRight[0], cmd.angleUp[0], cmd.angleDown[0],
+            cmd.angleLeft[1], cmd.angleRight[1], cmd.angleUp[1], cmd.angleDown[1]);
+    return cmd;
+}
+
+struct IpdCommand {
+    bool valid = false;
+    bool clear = false;
+    float ipdMeters = 0.064f;
+};
+
+// File format: {"ipd_mm": 64} or {"clear": true}
+inline IpdCommand CheckIpdCommand() {
+    IpdCommand cmd;
+    std::string p = GetSimulatorDataPath() + "\\ipd_command.json";
+    FILE* f = nullptr;
+    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
+    char buf[256];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    DeleteFileA(p.c_str());
+    cmd.valid = true;
+    if (JsonHasKey(buf, "clear")) {
+        cmd.clear = true;
+        McpLog("IPD command: clear (revert to 64mm default)");
+        return cmd;
+    }
+    float mm = ParseJsonFloat(buf, "ipd_mm", 64.0f);
+    cmd.ipdMeters = mm * 0.001f;
+    McpLogf("IPD command: %.1f mm", mm);
+    return cmd;
+}
+
+// Headset profile: a named preset that applies both FOV and IPD at once.
+// Profiles are decoded inside the runtime — this struct just carries the name.
+struct HeadsetProfileCommand {
+    bool valid = false;
+    char name[32] = {};
+};
+
+inline HeadsetProfileCommand CheckHeadsetProfileCommand() {
+    HeadsetProfileCommand cmd;
+    std::string p = GetSimulatorDataPath() + "\\headset_profile_command.json";
+    FILE* f = nullptr;
+    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
+    char buf[256];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    DeleteFileA(p.c_str());
+    // Find "name":"value"
+    const char* k = strstr(buf, "\"name\"");
+    if (!k) return cmd;
+    const char* col = strchr(k, ':');
+    if (!col) return cmd;
+    const char* q = strchr(col, '"');
+    if (!q) return cmd;
+    ++q;
+    const char* eq = strchr(q, '"');
+    if (!eq) return cmd;
+    size_t L = (size_t)(eq - q);
+    if (L >= sizeof(cmd.name)) L = sizeof(cmd.name) - 1;
+    memcpy(cmd.name, q, L);
+    cmd.name[L] = 0;
+    cmd.valid = true;
+    McpLogf("Headset profile command: %s", cmd.name);
+    return cmd;
+}
+
+struct AnaglyphCommand {
+    bool valid = false;
+    bool enabled = false;
+};
+
+// File format: {"enabled": true} or {"enabled": false}
+inline AnaglyphCommand CheckAnaglyphCommand() {
+    AnaglyphCommand cmd;
+    std::string p = GetSimulatorDataPath() + "\\anaglyph_command.json";
+    FILE* f = nullptr;
+    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
+    char buf[256];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    DeleteFileA(p.c_str());
+    cmd.valid = true;
+    // ParseJsonFloat returns 0.0f for false-ish, !=0 for true.
+    cmd.enabled = strstr(buf, "\"enabled\"") && strstr(buf, "true");
+    McpLogf("Anaglyph command: enabled=%d", cmd.enabled ? 1 : 0);
+    return cmd;
+}
+
+// ---------- Projection log ----------
+//
+// Captures the FOV and pose the app embedded in each xrEndFrame projection
+// layer. The MCP can fetch the recent N frames via get_projection_log to
+// diagnose: was the app's projection symmetric while the simulator was
+// configured asymmetric? Did the rendered pose drift relative to the
+// located pose?
+struct ProjLogEntry {
+    uint32_t frame = 0;
+    // Pose embedded in projection-layer view 0 (left eye).
+    float poseQx = 0, poseQy = 0, poseQz = 0, poseQw = 1;
+    float posX = 0, posY = 0, posZ = 0;
+    // FOV per eye (radians, OpenXR convention)
+    float aL[2] = {0,0}, aR[2] = {0,0}, aU[2] = {0,0}, aD[2] = {0,0};
+    // Image sub-rect per eye (left/right): offset_x, offset_y, extent_w, extent_h
+    int32_t rectX[2] = {0,0}, rectY[2] = {0,0}, rectW[2] = {0,0}, rectH[2] = {0,0};
+};
+constexpr size_t PROJ_LOG_CAPACITY = 64;
+inline ProjLogEntry  g_projLog[PROJ_LOG_CAPACITY];
+inline size_t        g_projLogHead = 0;     // index of next slot to write
+inline size_t        g_projLogCount = 0;    // number of valid entries (capped at capacity)
+
+// Writes the current ring buffer to a JSON file the MCP server reads.
+inline void DumpProjectionLog() {
+    std::string p = GetSimulatorDataPath() + "\\projection_log.json";
+    FILE* f = nullptr;
+    if (fopen_s(&f, p.c_str(), "w") != 0 || !f) return;
+    fprintf(f, "{\n  \"entries\": [\n");
+    size_t n = g_projLogCount;
+    // Walk oldest -> newest.
+    size_t start = (g_projLogHead + PROJ_LOG_CAPACITY - n) % PROJ_LOG_CAPACITY;
+    for (size_t i = 0; i < n; ++i) {
+        const ProjLogEntry& e = g_projLog[(start + i) % PROJ_LOG_CAPACITY];
+        fprintf(f, "    {\"frame\": %u, "
+                "\"pose\": {\"x\": %.6f, \"y\": %.6f, \"z\": %.6f, "
+                "\"qx\": %.6f, \"qy\": %.6f, \"qz\": %.6f, \"qw\": %.6f}, "
+                "\"left_fov\":  {\"aL\": %.6f, \"aR\": %.6f, \"aU\": %.6f, \"aD\": %.6f}, "
+                "\"right_fov\": {\"aL\": %.6f, \"aR\": %.6f, \"aU\": %.6f, \"aD\": %.6f}, "
+                "\"left_rect\":  [%d, %d, %d, %d], "
+                "\"right_rect\": [%d, %d, %d, %d]}%s\n",
+                e.frame, e.posX, e.posY, e.posZ,
+                e.poseQx, e.poseQy, e.poseQz, e.poseQw,
+                e.aL[0], e.aR[0], e.aU[0], e.aD[0],
+                e.aL[1], e.aR[1], e.aU[1], e.aD[1],
+                e.rectX[0], e.rectY[0], e.rectW[0], e.rectH[0],
+                e.rectX[1], e.rectY[1], e.rectW[1], e.rectH[1],
+                (i + 1 < n) ? "," : "");
+    }
+    fprintf(f, "  ]\n}\n");
+    fclose(f);
+}
+
+// MCP polls a ".dump_request" file to ask us to write the log.
+inline bool CheckProjLogDumpRequest() {
+    std::string p = GetSimulatorDataPath() + "\\projection_log_dump_request";
+    if (GetFileAttributesA(p.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    DeleteFileA(p.c_str());
+    return true;
+}
+
+// Controller pose control structure for MCP
+// Allows setting right or left controller position/orientation and trigger
+struct ControllerPoseCommand {
+    bool valid = false;
+    int hand = 1;           // 0=left, 1=right
+    float posX = 0.2f;     // Position offset from head (head-local space)
+    float posY = -0.3f;
+    float posZ = -0.4f;
+    float yaw = 0.0f;      // Yaw offset relative to head
+    float pitch = -0.3f;   // Pitch offset relative to head
+    float trigger = 0.0f;  // 0.0-1.0 trigger value
+    bool triggerSet = false;
+    int  buttonA = -1;     // -1=unchanged, 0=released, 1=pressed
+};
+
+// Check for controller pose command from MCP
+// File format: {"hand": 1, "posX": 0.2, "posY": -0.3, "posZ": -0.4, "yaw": 0, "pitch": -0.3, "trigger": 0.0}
+inline ControllerPoseCommand CheckControllerPoseCommand() {
+    ControllerPoseCommand cmd;
+    std::string cmdPath = GetSimulatorDataPath() + "\\controller_pose_command.json";
+    FILE* f = nullptr;
+    if (fopen_s(&f, cmdPath.c_str(), "r") == 0 && f) {
+        char buf[512];
+        size_t n = fread(buf, 1, sizeof(buf)-1, f);
+        buf[n] = 0;
+        fclose(f);
+
+        cmd.valid = true;
+        cmd.hand = (int)ParseJsonFloat(buf, "hand", 1.0f);
+        cmd.posX = ParseJsonFloat(buf, "posX", 0.2f);
+        cmd.posY = ParseJsonFloat(buf, "posY", -0.3f);
+        cmd.posZ = ParseJsonFloat(buf, "posZ", -0.4f);
+        cmd.yaw = ParseJsonFloat(buf, "yaw", 0.0f);
+        cmd.pitch = ParseJsonFloat(buf, "pitch", -0.3f);
+        cmd.trigger = ParseJsonFloat(buf, "trigger", -1.0f);
+        cmd.triggerSet = (cmd.trigger >= 0.0f);
+        if (!cmd.triggerSet) cmd.trigger = 0.0f;
+        cmd.buttonA = (int)ParseJsonFloat(buf, "buttonA", -1.0f);
+
+        // Delete the file after reading (one-shot command)
+        DeleteFileA(cmdPath.c_str());
+        McpLogf("Controller pose command: hand=%d pos(%.2f, %.2f, %.2f) yaw=%.2f pitch=%.2f trigger=%.1f",
+                cmd.hand, cmd.posX, cmd.posY, cmd.posZ, cmd.yaw, cmd.pitch, cmd.trigger);
     }
     return cmd;
 }
