@@ -717,6 +717,36 @@ inline HeadsetProfileCommand CheckHeadsetProfileCommand() {
     return cmd;
 }
 
+struct PoseSweepCommand {
+    bool  valid     = false;
+    bool  enabled   = false;
+    float yawAmpDeg   = 30.0f;
+    float pitchAmpDeg = 15.0f;
+    float rollAmpDeg  = 15.0f;
+    float freqHz      = 0.25f;
+};
+
+inline PoseSweepCommand CheckPoseSweepCommand() {
+    PoseSweepCommand cmd;
+    std::string p = GetSimulatorDataPath() + "\\pose_sweep_command.json";
+    FILE* f = nullptr;
+    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
+    char buf[256];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    DeleteFileA(p.c_str());
+    cmd.valid = true;
+    cmd.enabled       = strstr(buf, "\"enabled\"") && strstr(buf, "true");
+    cmd.yawAmpDeg     = ParseJsonFloat(buf, "yaw_amp_deg",   30.0f);
+    cmd.pitchAmpDeg   = ParseJsonFloat(buf, "pitch_amp_deg", 15.0f);
+    cmd.rollAmpDeg    = ParseJsonFloat(buf, "roll_amp_deg",  15.0f);
+    cmd.freqHz        = ParseJsonFloat(buf, "freq_hz",        0.25f);
+    McpLogf("Pose sweep command: enabled=%d yawAmp=%.1f pitchAmp=%.1f rollAmp=%.1f freq=%.2fHz",
+            cmd.enabled, cmd.yawAmpDeg, cmd.pitchAmpDeg, cmd.rollAmpDeg, cmd.freqHz);
+    return cmd;
+}
+
 struct AnaglyphCommand {
     bool valid = false;
     bool enabled = false;

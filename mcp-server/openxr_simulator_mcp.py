@@ -653,6 +653,25 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="enable_pose_sweep",
+            description=("Auto-oscillate the simulator's head yaw / pitch / roll "
+                         "on a sine wave. Forces the app through a continuous "
+                         "range of orientations — any quaternion-handedness or "
+                         "axis-flip bug produces a visible 'world wobbles wrong "
+                         "direction' symptom within seconds. Each axis runs at "
+                         "a different phase so the motion isn't degenerate."),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "enabled":         {"type": "boolean", "default": True},
+                    "yaw_amp_deg":     {"type": "number",  "default": 30.0},
+                    "pitch_amp_deg":   {"type": "number",  "default": 15.0},
+                    "roll_amp_deg":    {"type": "number",  "default": 15.0},
+                    "freq_hz":         {"type": "number",  "default": 0.25},
+                }
+            }
+        ),
+        Tool(
             name="validate_stereo",
             description=("Capture the current stereo preview and run a disparity "
                          "analysis. Returns: verdict (PASS / FAIL_NO_PARALLAX / "
@@ -932,6 +951,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 text=json.dumps({"count": len(tail), "entries": tail}, indent=2))]
         except Exception as e:
             return [TextContent(type="text", text=f"Failed to parse projection log: {e}")]
+
+    elif name == "enable_pose_sweep":
+        payload = {
+            "enabled":       bool(arguments.get("enabled", True)),
+            "yaw_amp_deg":   float(arguments.get("yaw_amp_deg",   30.0)),
+            "pitch_amp_deg": float(arguments.get("pitch_amp_deg", 15.0)),
+            "roll_amp_deg":  float(arguments.get("roll_amp_deg",  15.0)),
+            "freq_hz":       float(arguments.get("freq_hz",        0.25)),
+        }
+        _write_json_command(SIMULATOR_DIR / "pose_sweep_command.json", payload)
+        return [TextContent(type="text",
+            text=("Pose sweep " + ("enabled" if payload["enabled"] else "disabled") +
+                  f" — yaw=±{payload['yaw_amp_deg']}° pitch=±{payload['pitch_amp_deg']}°"
+                  f" roll=±{payload['roll_amp_deg']}° freq={payload['freq_hz']}Hz"))]
 
     elif name == "validate_stereo":
         timeout = float(arguments.get("timeout", 5.0))

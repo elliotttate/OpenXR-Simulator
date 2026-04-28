@@ -387,6 +387,18 @@ static float g_customIpd = 0.064f;  // meters
 // side-by-side. Reveals IPD bugs (eyes don't converge -> red/cyan ghost)
 // at a glance.
 static bool g_anaglyphPreview = false;
+
+// Pose sweep: auto-oscillate yaw / pitch / roll on a sine wave so the
+// app sees a continuous range of head orientations. Catches off-axis
+// quaternion bugs in seconds — anything mis-converted from OpenXR's
+// right-handed frame to a left-handed game frame becomes a "world
+// wobbles wrong direction" symptom that's hard to miss.
+static bool  g_poseSweepEnabled  = false;
+static float g_poseSweepStartT   = 0.0f;
+static float g_poseSweepYawAmp   = 0.5f;   // radians (~28 deg)
+static float g_poseSweepPitchAmp = 0.3f;   // radians (~17 deg)
+static float g_poseSweepRollAmp  = 0.3f;   // radians (~17 deg)
+static float g_poseSweepFreq     = 0.25f;  // Hz
 static bool g_mouseCapture = false;
 static POINT g_lastMousePos = {0, 0};
 
@@ -2414,6 +2426,19 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
             mcp::WriteCommandAck("anaglyph", true);
         }
 
+        // Pose sweep: oscillate yaw/pitch/roll on a sine wave each frame.
+        mcp::PoseSweepCommand sweep = mcp::CheckPoseSweepCommand();
+        if (sweep.valid) {
+            const float DEG2RAD = 3.14159265f / 180.0f;
+            rt::g_poseSweepEnabled  = sweep.enabled;
+            rt::g_poseSweepYawAmp   = sweep.yawAmpDeg   * DEG2RAD;
+            rt::g_poseSweepPitchAmp = sweep.pitchAmpDeg * DEG2RAD;
+            rt::g_poseSweepRollAmp  = sweep.rollAmpDeg  * DEG2RAD;
+            rt::g_poseSweepFreq     = sweep.freqHz;
+            rt::g_poseSweepStartT   = (float)GetTickCount64() * 0.001f;
+            mcp::WriteCommandAck("pose_sweep", true);
+        }
+
         mcp::ControllerPoseCommand ctrlCmd = mcp::CheckControllerPoseCommand();
         if (ctrlCmd.valid) {
             rt::ControllerState& ctrl = (ctrlCmd.hand == 0) ? rt::g_leftController : rt::g_rightController;
@@ -4266,10 +4291,26 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
     if (cap < 2 || !views) return XR_SUCCESS;
     const float ipd = rt::g_useCustomIpd ? rt::g_customIpd : 0.064f;
 
+    // Pose-sweep tick: drive yaw/pitch/roll from a sine wave so apps see
+    // a continuous range of orientations and any handedness/axis bug
+    // produces a visible "world rotates wrong way" symptom instantly.
+    // Each axis uses a different phase so the signal isn't degenerate.
+    float effYaw   = rt::g_headYaw;
+    float effPitch = rt::g_headPitch;
+    float effRoll  = rt::g_headRoll;
+    if (rt::g_poseSweepEnabled) {
+        float t = (float)GetTickCount64() * 0.001f - rt::g_poseSweepStartT;
+        const float TWO_PI = 6.2831853f;
+        float w = TWO_PI * rt::g_poseSweepFreq;
+        effYaw   = rt::g_poseSweepYawAmp   * sinf(w * t);
+        effPitch = rt::g_poseSweepPitchAmp * sinf(w * t + 1.0f);
+        effRoll  = rt::g_poseSweepRollAmp  * sinf(w * t + 2.0f);
+    }
+
     // Use dynamic head pose from mouse look (yaw + pitch) plus optional
     // MCP-injected roll so off-axis quaternion-handedness bugs (which
     // identity pose hides) actually surface in the simulator.
-    XrQuaternionf orientation = rt::QuatFromYawPitchRoll(rt::g_headYaw, rt::g_headPitch, rt::g_headRoll);
+    XrQuaternionf orientation = rt::QuatFromYawPitchRoll(effYaw, effPitch, effRoll);
     
     // Helper function to rotate a vector by a quaternion
     auto rotateVector = [](XrQuaternionf q, XrVector3f v) -> XrVector3f {
