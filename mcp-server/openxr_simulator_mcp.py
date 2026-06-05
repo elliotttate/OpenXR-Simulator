@@ -224,7 +224,7 @@ def wait_for_screenshot(timeout: float = 5.0, request_time: float = 0.0) -> Opti
 
 
 def to_jpeg(image_bytes: bytes, max_width: int = SCREENSHOT_MAX_WIDTH,
-            quality: int = SCREENSHOT_JPEG_QUALITY) -> bytes:
+            quality: int = SCREENSHOT_JPEG_QUALITY, eye: str = "both") -> bytes:
     """Decode an image (PNG/BMP/JPEG) and re-encode as a downscaled JPEG.
 
     Forces JPEG output because the Anthropic API rejects some PNG/BMP payloads
@@ -237,6 +237,16 @@ def to_jpeg(image_bytes: bytes, max_width: int = SCREENSHOT_MAX_WIDTH,
     # JPEG can't store alpha — convert RGBA/P/etc. to RGB
     if img.mode != "RGB":
         img = img.convert("RGB")
+    # The D3D12 simulator capture path currently returns the full preview render
+    # target regardless of the request's eye field. When the preview is SBS, crop
+    # here so MCP callers still get the requested eye directly.
+    eye = (eye or "both").lower()
+    if eye in ("left", "right") and img.width >= img.height * 2:
+        half = img.width // 2
+        if eye == "left":
+            img = img.crop((0, 0, half, img.height))
+        else:
+            img = img.crop((half, 0, img.width, img.height))
     if img.width > max_width:
         new_h = int(img.height * (max_width / img.width))
         img = img.resize((max_width, new_h), Image.LANCZOS)
@@ -711,7 +721,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
         if screenshot_data:
             try:
-                jpeg_data = to_jpeg(screenshot_data)
+                jpeg_data = to_jpeg(screenshot_data, eye=eye)
             except Exception as e:
                 return [TextContent(
                     type="text",
@@ -724,7 +734,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                     type="text",
                     text=(f"Screenshot captured ({len(screenshot_data)} bytes raw -> "
                           f"{len(jpeg_data)} bytes JPEG @ q{SCREENSHOT_JPEG_QUALITY}, "
-                          f"max width {SCREENSHOT_MAX_WIDTH}px)")
+                          f"max width {SCREENSHOT_MAX_WIDTH}px, eye={eye})")
                 ),
                 ImageContent(
                     type="image",

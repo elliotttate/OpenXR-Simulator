@@ -33,6 +33,19 @@ enum MenuCommand {
     ID_FOV_70 = 1201,
     ID_FOV_90 = 1202,
     ID_FOV_110 = 1203,
+    ID_FOV_SYMMETRIC = 1204,
+    ID_FOV_ASYMMETRIC = 1205,
+    ID_PROFILE_GENERIC = 1210,
+    ID_PROFILE_QUEST2 = 1211,
+    ID_PROFILE_QUEST3 = 1212,
+    ID_PROFILE_INDEX = 1213,
+    ID_IPD_0 = 1220,
+    ID_IPD_58 = 1221,
+    ID_IPD_64 = 1222,
+    ID_IPD_70 = 1223,
+    ID_IPD_80 = 1224,
+    ID_IPD_DECREASE = 1225,
+    ID_IPD_INCREASE = 1226,
 
     // Render options
     ID_VIEW_FULL_RENDER = 1250,
@@ -66,24 +79,106 @@ enum class DisplayLayout {
     Anaglyph
 };
 
+// Headset profile enum
+enum class HeadsetProfile {
+    GenericSymmetric,
+    Quest2,
+    Quest3,
+    ValveIndex
+};
+
 // UI State
 struct UIState {
     ViewMode viewMode = ViewMode::BothEyes;
     DisplayLayout displayLayout = DisplayLayout::SideBySide;
+    HeadsetProfile headsetProfile = HeadsetProfile::Quest3;
     bool showStats = false;
-    float zoomLevel = 0.5f;  // 0.25 = 25%, 0.5 = 50%, 1.0 = 100%, etc.
-    bool fitToWindow = true; // If true, auto-fit zoom to window size
+    float zoomLevel = 1.0f;  // 0.25 = 25%, 0.5 = 50%, 1.0 = 100%, etc.
+    bool fitToWindow = false; // If true, auto-fit zoom to window size
     int windowWidth = 1280;
     int windowHeight = 720;
 
     // FOV settings
-    int fovDegrees = 90;     // FOV in degrees (70, 90, or 110)
+    int fovDegrees = 90;     // FOV in degrees for generic symmetric mode
+    bool useAsymmetricFov = true;
+    float ipdMeters = 0.064f;
 
     // Render options
     bool showFullRender = false;  // If true, show full swapchain instead of imageRect crop
 };
 
 inline UIState g_uiState;
+
+inline int GetIpdMillimeters() {
+    return (int)(g_uiState.ipdMeters * 1000.0f + 0.5f);
+}
+
+inline void SetIpdMillimeters(int ipdMm) {
+    ipdMm = (std::max)(0, (std::min)(200, ipdMm));
+    g_uiState.ipdMeters = (float)ipdMm * 0.001f;
+}
+
+inline void AdjustIpdMillimeters(int deltaMm) {
+    SetIpdMillimeters(GetIpdMillimeters() + deltaMm);
+}
+
+inline void SetHeadsetProfile(HeadsetProfile profile) {
+    g_uiState.headsetProfile = profile;
+
+    switch (profile) {
+        case HeadsetProfile::GenericSymmetric:
+            g_uiState.useAsymmetricFov = false;
+            SetIpdMillimeters(64);
+            break;
+        case HeadsetProfile::Quest2:
+            g_uiState.useAsymmetricFov = true;
+            SetIpdMillimeters(64);
+            break;
+        case HeadsetProfile::Quest3:
+            g_uiState.useAsymmetricFov = true;
+            SetIpdMillimeters(64);
+            break;
+        case HeadsetProfile::ValveIndex:
+            g_uiState.useAsymmetricFov = true;
+            SetIpdMillimeters(63);
+            break;
+    }
+}
+
+inline void SetSymmetricViews() {
+    g_uiState.headsetProfile = HeadsetProfile::GenericSymmetric;
+    g_uiState.useAsymmetricFov = false;
+}
+
+inline void SetAsymmetricViews() {
+    if (g_uiState.headsetProfile == HeadsetProfile::GenericSymmetric) {
+        g_uiState.headsetProfile = HeadsetProfile::Quest3;
+    }
+    g_uiState.useAsymmetricFov = true;
+}
+
+inline const wchar_t* GetHeadsetProfileShortName() {
+    switch (g_uiState.headsetProfile) {
+        case HeadsetProfile::GenericSymmetric: return L"Generic";
+        case HeadsetProfile::Quest2: return L"Quest 2";
+        case HeadsetProfile::Quest3: return L"Quest 3";
+        case HeadsetProfile::ValveIndex: return L"Index";
+    }
+    return L"Generic";
+}
+
+inline bool IsFovSettingsCommand(int cmd) {
+    return cmd == ID_FOV_70 || cmd == ID_FOV_90 || cmd == ID_FOV_110 ||
+           cmd == ID_FOV_SYMMETRIC || cmd == ID_FOV_ASYMMETRIC ||
+           cmd == ID_PROFILE_GENERIC || cmd == ID_PROFILE_QUEST2 ||
+           cmd == ID_PROFILE_QUEST3 || cmd == ID_PROFILE_INDEX;
+}
+
+inline bool IsIpdSettingsCommand(int cmd) {
+    return cmd == ID_IPD_0 || cmd == ID_IPD_58 || cmd == ID_IPD_64 ||
+           cmd == ID_IPD_70 || cmd == ID_IPD_80 ||
+           cmd == ID_IPD_DECREASE || cmd == ID_IPD_INCREASE;
+}
 
 // Dark mode colors
 namespace Colors {
@@ -149,10 +244,33 @@ inline HMENU CreateAppMenu() {
 
     // FOV Menu
     HMENU fovMenu = CreatePopupMenu();
+    AppendMenuW(fovMenu, MF_STRING, ID_FOV_SYMMETRIC, L"&Symmetric Views\t8");
+    AppendMenuW(fovMenu, MF_STRING, ID_FOV_ASYMMETRIC, L"&Asymmetric Views\t9");
+    AppendMenuW(fovMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(fovMenu, MF_STRING, ID_FOV_70, L"70\x00B0 (Narrow)\t5");
     AppendMenuW(fovMenu, MF_STRING, ID_FOV_90, L"90\x00B0 (Normal)\t6");
     AppendMenuW(fovMenu, MF_STRING, ID_FOV_110, L"110\x00B0 (Wide)\t7");
     AppendMenuW(fovMenu, MF_SEPARATOR, 0, nullptr);
+
+    HMENU profileMenu = CreatePopupMenu();
+    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_GENERIC, L"&Generic Symmetric");
+    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_QUEST2, L"Quest &2");
+    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_QUEST3, L"Quest &3");
+    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_INDEX, L"Valve &Index");
+    AppendMenuW(fovMenu, MF_POPUP, (UINT_PTR)profileMenu, L"Headset &Profile");
+
+    HMENU ipdMenu = CreatePopupMenu();
+    AppendMenuW(ipdMenu, MF_STRING, ID_IPD_DECREASE, L"Decrease IPD\t[");
+    AppendMenuW(ipdMenu, MF_STRING, ID_IPD_INCREASE, L"Increase IPD\t]");
+    AppendMenuW(ipdMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(ipdMenu, MF_STRING, ID_IPD_0, L"0 mm (No Stereo)");
+    AppendMenuW(ipdMenu, MF_STRING, ID_IPD_58, L"58 mm");
+    AppendMenuW(ipdMenu, MF_STRING, ID_IPD_64, L"64 mm");
+    AppendMenuW(ipdMenu, MF_STRING, ID_IPD_70, L"70 mm");
+    AppendMenuW(ipdMenu, MF_STRING, ID_IPD_80, L"80 mm");
+    AppendMenuW(fovMenu, MF_POPUP, (UINT_PTR)ipdMenu, L"&IPD");
+    AppendMenuW(fovMenu, MF_SEPARATOR, 0, nullptr);
+
     AppendMenuW(fovMenu, MF_STRING, ID_VIEW_FULL_RENDER, L"Show &Full Render\tG");
     AppendMenuW(menuBar, MF_POPUP, (UINT_PTR)fovMenu, L"F&OV");
 
@@ -203,9 +321,29 @@ inline void UpdateMenuState(HMENU menu) {
         g_uiState.showStats ? MF_CHECKED : MF_UNCHECKED);
 
     // FOV checks
-    CheckMenuItem(menu, ID_FOV_70, g_uiState.fovDegrees == 70 ? MF_CHECKED : MF_UNCHECKED);
-    CheckMenuItem(menu, ID_FOV_90, g_uiState.fovDegrees == 90 ? MF_CHECKED : MF_UNCHECKED);
-    CheckMenuItem(menu, ID_FOV_110, g_uiState.fovDegrees == 110 ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_FOV_SYMMETRIC, !g_uiState.useAsymmetricFov ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_FOV_ASYMMETRIC, g_uiState.useAsymmetricFov ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_FOV_70, (!g_uiState.useAsymmetricFov && g_uiState.fovDegrees == 70) ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_FOV_90, (!g_uiState.useAsymmetricFov && g_uiState.fovDegrees == 90) ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_FOV_110, (!g_uiState.useAsymmetricFov && g_uiState.fovDegrees == 110) ? MF_CHECKED : MF_UNCHECKED);
+
+    // Headset profile checks
+    CheckMenuItem(menu, ID_PROFILE_GENERIC,
+        g_uiState.headsetProfile == HeadsetProfile::GenericSymmetric ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_PROFILE_QUEST2,
+        g_uiState.headsetProfile == HeadsetProfile::Quest2 ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_PROFILE_QUEST3,
+        g_uiState.headsetProfile == HeadsetProfile::Quest3 ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_PROFILE_INDEX,
+        g_uiState.headsetProfile == HeadsetProfile::ValveIndex ? MF_CHECKED : MF_UNCHECKED);
+
+    // IPD checks
+    int ipdMm = GetIpdMillimeters();
+    CheckMenuItem(menu, ID_IPD_0, ipdMm == 0 ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_IPD_58, ipdMm == 58 ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_IPD_64, ipdMm == 64 ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_IPD_70, ipdMm == 70 ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_IPD_80, ipdMm == 80 ? MF_CHECKED : MF_UNCHECKED);
 
     // Full render toggle
     CheckMenuItem(menu, ID_VIEW_FULL_RENDER,
@@ -237,6 +375,11 @@ inline void ShowControlsDialog(HWND parent) {
         L"  5 - 70\x00B0 (Narrow)\n"
         L"  6 - 90\x00B0 (Normal)\n"
         L"  7 - 110\x00B0 (Wide)\n"
+        L"  8 - Symmetric views\n"
+        L"  9 - Asymmetric views\n"
+        L"  [ / ] - Decrease/Increase IPD\n"
+        L"  Headset Profile menu - Asymmetric FOV presets\n"
+        L"  IPD menu - Eye separation presets\n"
         L"  G - Toggle full render\n\n"
         L"Other:\n"
         L"  F12 - Screenshot\n"
@@ -305,10 +448,12 @@ inline void AdjustZoom(float delta) {
 inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
     std::function<void()> resizeCallback = nullptr,
     std::function<void()> screenshotCallback = nullptr,
-    std::function<void()> resetViewCallback = nullptr) {
+    std::function<void()> resetViewCallback = nullptr,
+    std::function<void(int)> settingsChangedCallback = nullptr) {
 
     int cmd = LOWORD(wParam);
     bool needsResize = false;
+    bool settingsChanged = false;
 
     switch (cmd) {
         // View modes
@@ -385,15 +530,89 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
 
         // FOV options
         case ID_FOV_70:
+            g_uiState.headsetProfile = HeadsetProfile::GenericSymmetric;
+            g_uiState.useAsymmetricFov = false;
             g_uiState.fovDegrees = 70;
+            settingsChanged = true;
             break;
 
         case ID_FOV_90:
+            g_uiState.headsetProfile = HeadsetProfile::GenericSymmetric;
+            g_uiState.useAsymmetricFov = false;
             g_uiState.fovDegrees = 90;
+            settingsChanged = true;
             break;
 
         case ID_FOV_110:
+            g_uiState.headsetProfile = HeadsetProfile::GenericSymmetric;
+            g_uiState.useAsymmetricFov = false;
             g_uiState.fovDegrees = 110;
+            settingsChanged = true;
+            break;
+
+        case ID_FOV_SYMMETRIC:
+            SetSymmetricViews();
+            settingsChanged = true;
+            break;
+
+        case ID_FOV_ASYMMETRIC:
+            SetAsymmetricViews();
+            settingsChanged = true;
+            break;
+
+        case ID_PROFILE_GENERIC:
+            SetHeadsetProfile(HeadsetProfile::GenericSymmetric);
+            settingsChanged = true;
+            break;
+
+        case ID_PROFILE_QUEST2:
+            SetHeadsetProfile(HeadsetProfile::Quest2);
+            settingsChanged = true;
+            break;
+
+        case ID_PROFILE_QUEST3:
+            SetHeadsetProfile(HeadsetProfile::Quest3);
+            settingsChanged = true;
+            break;
+
+        case ID_PROFILE_INDEX:
+            SetHeadsetProfile(HeadsetProfile::ValveIndex);
+            settingsChanged = true;
+            break;
+
+        case ID_IPD_0:
+            SetIpdMillimeters(0);
+            settingsChanged = true;
+            break;
+
+        case ID_IPD_58:
+            SetIpdMillimeters(58);
+            settingsChanged = true;
+            break;
+
+        case ID_IPD_64:
+            SetIpdMillimeters(64);
+            settingsChanged = true;
+            break;
+
+        case ID_IPD_70:
+            SetIpdMillimeters(70);
+            settingsChanged = true;
+            break;
+
+        case ID_IPD_80:
+            SetIpdMillimeters(80);
+            settingsChanged = true;
+            break;
+
+        case ID_IPD_DECREASE:
+            AdjustIpdMillimeters(-1);
+            settingsChanged = true;
+            break;
+
+        case ID_IPD_INCREASE:
+            AdjustIpdMillimeters(1);
+            settingsChanged = true;
             break;
 
         // Render options
@@ -411,9 +630,14 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
             if (resetViewCallback) resetViewCallback();
             return true;
 
-        case ID_TOOLS_TOGGLE_STATS:
+        case ID_TOOLS_TOGGLE_STATS: {
             g_uiState.showStats = !g_uiState.showStats;
+            // Refresh the menu checkmark and force an immediate title-bar
+            // update so the user sees the stats appear/disappear right away.
+            HMENU menuT = GetMenu(hwnd);
+            if (menuT) UpdateMenuState(menuT);
             return true;
+        }
 
         // Help
         case ID_HELP_CONTROLS:
@@ -432,6 +656,10 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
         resizeCallback();
     }
 
+    if (settingsChanged && settingsChangedCallback) {
+        settingsChangedCallback(cmd);
+    }
+
     // Update menu checkmarks
     HMENU menu = GetMenu(hwnd);
     if (menu) UpdateMenuState(menu);
@@ -443,39 +671,48 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
 inline bool HandleKeyboardShortcut(HWND hwnd, WPARAM vk,
     std::function<void()> resizeCallback = nullptr,
     std::function<void()> screenshotCallback = nullptr,
-    std::function<void()> resetViewCallback = nullptr) {
+    std::function<void()> resetViewCallback = nullptr,
+    std::function<void(int)> settingsChangedCallback = nullptr) {
 
     switch (vk) {
         case 'B':
-            return HandleMenuCommand(hwnd, ID_VIEW_BOTH_EYES, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_VIEW_BOTH_EYES, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case 'L':
-            return HandleMenuCommand(hwnd, ID_VIEW_LEFT_EYE, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_VIEW_LEFT_EYE, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case 'R':
-            return HandleMenuCommand(hwnd, ID_VIEW_RIGHT_EYE, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_VIEW_RIGHT_EYE, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case 'F':
-            return HandleMenuCommand(hwnd, ID_ZOOM_FIT, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_ZOOM_FIT, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case '1':
-            return HandleMenuCommand(hwnd, ID_ZOOM_25, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_ZOOM_25, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case '2':
-            return HandleMenuCommand(hwnd, ID_ZOOM_50, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_ZOOM_50, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case '3':
-            return HandleMenuCommand(hwnd, ID_ZOOM_75, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_ZOOM_75, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case '4':
-            return HandleMenuCommand(hwnd, ID_ZOOM_100, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_ZOOM_100, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case '5':
-            return HandleMenuCommand(hwnd, ID_FOV_70, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_FOV_70, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case '6':
-            return HandleMenuCommand(hwnd, ID_FOV_90, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_FOV_90, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case '7':
-            return HandleMenuCommand(hwnd, ID_FOV_110, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_FOV_110, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
+        case '8':
+            return HandleMenuCommand(hwnd, ID_FOV_SYMMETRIC, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
+        case '9':
+            return HandleMenuCommand(hwnd, ID_FOV_ASYMMETRIC, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case 'G':
-            return HandleMenuCommand(hwnd, ID_VIEW_FULL_RENDER, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_VIEW_FULL_RENDER, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_OEM_PLUS:
         case VK_ADD:
-            return HandleMenuCommand(hwnd, ID_ZOOM_IN, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_ZOOM_IN, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_OEM_MINUS:
         case VK_SUBTRACT:
-            return HandleMenuCommand(hwnd, ID_ZOOM_OUT, resizeCallback, screenshotCallback, resetViewCallback);
+            return HandleMenuCommand(hwnd, ID_ZOOM_OUT, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
+        case VK_OEM_4:
+            return HandleMenuCommand(hwnd, ID_IPD_DECREASE, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
+        case VK_OEM_6:
+            return HandleMenuCommand(hwnd, ID_IPD_INCREASE, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_F1:
             ShowControlsDialog(hwnd);
             return true;
@@ -520,9 +757,31 @@ inline void ApplyDarkTheme(HWND hwnd) {
     RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
 }
 
-// Update window title with current state info
-inline void UpdateWindowTitle(HWND hwnd, int fps = 0, int frameCount = 0) {
-    wchar_t title[256];
+// Extra information for the title bar when "Show Statistics" is on.
+struct StatsInfo {
+    int  sourceW = 0, sourceH = 0;   // per-eye XR swapchain dims
+    int  clientW = 0, clientH = 0;   // preview window client dims
+    float headX = 0, headY = 0, headZ = 0;
+    float yawDeg = 0, pitchDeg = 0, rollDeg = 0;
+};
+
+// Briefly-shown "Screenshot saved" notice. Set by the capture path; the
+// title-bar updater displays it for a few seconds, then it expires.
+inline std::wstring g_lastScreenshotPath;
+inline DWORD        g_lastScreenshotTickMs = 0;
+constexpr DWORD     kScreenshotNoticeMs = 4000;
+
+inline void NotifyScreenshotSaved(const std::wstring& path) {
+    g_lastScreenshotPath = path;
+    g_lastScreenshotTickMs = GetTickCount();
+}
+
+// Update window title with current state info. When `stats` is non-null and
+// "Show Statistics" is on, the title gains a stats suffix. A recent screenshot
+// notice (within kScreenshotNoticeMs) is prepended.
+inline void UpdateWindowTitle(HWND hwnd, int fps = 0, int frameCount = 0,
+                              const StatsInfo* stats = nullptr) {
+    wchar_t title[768];
 
     const wchar_t* viewModeStr = L"Both Eyes";
     if (g_uiState.viewMode == ViewMode::LeftEyeOnly) viewModeStr = L"Left Eye";
@@ -535,10 +794,37 @@ inline void UpdateWindowTitle(HWND hwnd, int fps = 0, int frameCount = 0) {
         swprintf_s(zoomStr, L"%d%%", (int)(g_uiState.zoomLevel * 100));
     }
 
+    wchar_t base[512];
     if (fps > 0) {
-        swprintf_s(title, L"OpenXR Simulator - %s - %s - %d FPS", viewModeStr, zoomStr, fps);
+        swprintf_s(base, L"OpenXR Simulator - %s - %s - %s - %dmm - %d FPS",
+                   viewModeStr, zoomStr, GetHeadsetProfileShortName(), GetIpdMillimeters(), fps);
     } else {
-        swprintf_s(title, L"OpenXR Simulator - %s - %s", viewModeStr, zoomStr);
+        swprintf_s(base, L"OpenXR Simulator - %s - %s - %s - %dmm",
+                   viewModeStr, zoomStr, GetHeadsetProfileShortName(), GetIpdMillimeters());
+    }
+
+    wchar_t statsSuffix[256] = L"";
+    if (g_uiState.showStats && stats) {
+        swprintf_s(statsSuffix,
+            L"  |  Src %dx%d  Win %dx%d  Head (%.2f,%.2f,%.2f) Yaw %.0f° Pitch %.0f°",
+            stats->sourceW, stats->sourceH, stats->clientW, stats->clientH,
+            stats->headX, stats->headY, stats->headZ,
+            stats->yawDeg, stats->pitchDeg);
+    }
+
+    // Optional one-shot "Screenshot saved" notice
+    bool showNotice = (g_lastScreenshotTickMs != 0) &&
+                      ((GetTickCount() - g_lastScreenshotTickMs) < kScreenshotNoticeMs);
+    if (showNotice) {
+        swprintf_s(title, L"[Screenshot saved → %s]  %s%s",
+                   g_lastScreenshotPath.c_str(), base, statsSuffix);
+    } else {
+        swprintf_s(title, L"%s%s", base, statsSuffix);
+        if (g_lastScreenshotTickMs != 0) {
+            // Expired — clear so we don't keep re-evaluating.
+            g_lastScreenshotPath.clear();
+            g_lastScreenshotTickMs = 0;
+        }
     }
 
     SetWindowTextW(hwnd, title);

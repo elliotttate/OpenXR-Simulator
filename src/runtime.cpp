@@ -279,6 +279,11 @@ static UINT g_persistentWidth = 1920;
 static UINT g_persistentHeight = 540;
 static bool g_windowClassRegistered = false;
 
+// Latest XR swapchain (per-eye) source dimensions, populated by presentProjection.
+// Used by menu/keyboard resize callbacks to compute a target window size.
+static std::atomic<UINT> g_sourceWidth{0};
+static std::atomic<UINT> g_sourceHeight{0};
+
 struct Instance {
     XrInstance handle{(XrInstance)1};
     std::vector<std::string> enabledExtensions;
@@ -327,6 +332,10 @@ struct Session {
     UINT previewWidth{1920};
     UINT previewHeight{540};
     DXGI_FORMAT previewFormat{DXGI_FORMAT_UNKNOWN};  // Track format for matching
+    // Current client area of the preview window (updated on WM_SIZE).
+    // 0 means "not yet known" — use an initial sensible size for the first frame.
+    std::atomic<UINT> clientWidth{0};
+    std::atomic<UINT> clientHeight{0};
     std::mutex previewMutex;
 };
 
@@ -360,10 +369,9 @@ static float g_headRoll = 0.0f;   // Rotation around forward axis (head tilt). M
 
 // ---------- Diagnostic state: settable IPD and asymmetric per-eye FOV ----------
 //
-// By default the simulator publishes a symmetric FOV derived from a single
-// degree value (ui::g_uiState.fovDegrees) and a hardcoded 64mm IPD. That
-// works for sanity checks but hides app bugs that only surface against a
-// real headset's asymmetric per-eye lens profile and runtime-reported IPD.
+// By default the simulator publishes a UI-selected headset profile with
+// asymmetric per-eye FOV and nonzero IPD. Symmetric FOV is still available
+// from the FOV menu for sanity checks.
 //
 // When g_useCustomFov / g_useCustomIpd are set (via MCP set_fov / set_ipd
 // / set_headset_profile), xrLocateViews emits the configured values
@@ -381,6 +389,58 @@ static float g_eyeFovD[2] = { 0, 0 };
 
 static bool  g_useCustomIpd = false;
 static float g_customIpd = 0.064f;  // meters
+
+static XrFovf MakeFovDeg(float angleLeft, float angleRight, float angleUp, float angleDown) {
+    const float DEG2RAD = 3.14159265f / 180.0f;
+    return XrFovf{
+        angleLeft * DEG2RAD,
+        angleRight * DEG2RAD,
+        angleUp * DEG2RAD,
+        angleDown * DEG2RAD
+    };
+}
+
+static XrFovf GetUiFov(uint32_t eyeIndex) {
+    if (!ui::g_uiState.useAsymmetricFov) {
+        int fovDeg = ui::g_uiState.fovDegrees;
+        if (fovDeg <= 0 || fovDeg > 180) fovDeg = 90;
+        float fovRadians = fovDeg * 0.5f * 3.14159265f / 180.0f;
+        float fovTan = tanf(fovRadians);
+        return XrFovf{ -fovTan, fovTan, fovTan, -fovTan };
+    }
+
+    switch (ui::g_uiState.headsetProfile) {
+        case ui::HeadsetProfile::Quest2:
+            return eyeIndex == 0
+                ? MakeFovDeg(-50.f, 44.f, 48.f, -52.f)
+                : MakeFovDeg(-44.f, 50.f, 48.f, -52.f);
+
+        case ui::HeadsetProfile::ValveIndex:
+            return eyeIndex == 0
+                ? MakeFovDeg(-58.f, 50.f, 52.f, -58.f)
+                : MakeFovDeg(-50.f, 58.f, 52.f, -58.f);
+
+        case ui::HeadsetProfile::Quest3:
+        case ui::HeadsetProfile::GenericSymmetric:
+        default:
+            return eyeIndex == 0
+                ? MakeFovDeg(-52.f, 48.f, 53.f, -52.f)
+                : MakeFovDeg(-48.f, 52.f, 53.f, -52.f);
+    }
+}
+
+static float GetUiIpdMeters() {
+    return (std::max)(0.0f, (std::min)(0.2f, ui::g_uiState.ipdMeters));
+}
+
+static void HandleUiSettingsCommand(int cmd) {
+    if (ui::IsFovSettingsCommand(cmd)) {
+        g_useCustomFov = false;
+    }
+    if (ui::IsIpdSettingsCommand(cmd)) {
+        g_useCustomIpd = false;
+    }
+}
 
 // Anaglyph preview overlay: when enabled, the simulator's preview window
 // composites left+right eyes into a red/cyan stereo image instead of
@@ -653,6 +713,89 @@ bool InitBlitResources(Session& s) {
     return true;
 }
 
+// Compute the natural canvas size for the current stereo layout, expressed in
+// source pixels (i.e. independent of the window/client size). Used to derive
+// the content aspect ratio for letterboxing.
+static void ComputeContentDims(int srcW, int srcH,
+                                ui::ViewMode mode, ui::DisplayLayout layout,
+                                int& contentW, int& contentH) {
+    if (mode == ui::ViewMode::BothEyes) {
+        if (layout == ui::DisplayLayout::SideBySide) {
+            contentW = srcW * 2;
+            contentH = srcH;
+        } else if (layout == ui::DisplayLayout::OverUnder) {
+            contentW = srcW;
+            contentH = srcH * 2;
+        } else { // Anaglyph: both eyes overlap in same frame
+            contentW = srcW;
+            contentH = srcH;
+        }
+    } else {
+        contentW = srcW;
+        contentH = srcH;
+    }
+    if (contentW <= 0) contentW = 1;
+    if (contentH <= 0) contentH = 1;
+}
+
+// Largest rect with (contentW : contentH) aspect that fits inside (dstW × dstH),
+// centered. Used to letterbox/pillarbox the stereo image into the window.
+struct FitRect { float x, y, w, h; };
+static FitRect ComputeFitRect(int contentW, int contentH, int dstW, int dstH) {
+    FitRect r{0.0f, 0.0f, (float)dstW, (float)dstH};
+    if (contentW <= 0 || contentH <= 0 || dstW <= 0 || dstH <= 0) return r;
+    double ca = (double)contentW / (double)contentH;
+    double da = (double)dstW / (double)dstH;
+    if (ca > da) {
+        // Content wider than dest → pillar (full width, shorter height)
+        r.w = (float)dstW;
+        r.h = (float)((double)dstW / ca);
+        r.x = 0.0f;
+        r.y = ((float)dstH - r.h) * 0.5f;
+    } else {
+        // Content taller than dest → letterbox (full height, narrower width)
+        r.h = (float)dstH;
+        r.w = (float)((double)dstH * ca);
+        r.x = ((float)dstW - r.w) * 0.5f;
+        r.y = 0.0f;
+    }
+    return r;
+}
+
+// Build the stats payload for the title bar (used when "Show Statistics" is on).
+static ui::StatsInfo BuildStatsInfo(rt::Session& s) {
+    ui::StatsInfo si;
+    si.sourceW = (int)rt::g_sourceWidth.load();
+    si.sourceH = (int)rt::g_sourceHeight.load();
+    si.clientW = (int)s.clientWidth.load();
+    si.clientH = (int)s.clientHeight.load();
+    si.headX = rt::g_headPos.x;
+    si.headY = rt::g_headPos.y;
+    si.headZ = rt::g_headPos.z;
+    constexpr float RAD2DEG = 57.2957795f;
+    si.yawDeg   = rt::g_headYaw   * RAD2DEG;
+    si.pitchDeg = rt::g_headPitch * RAD2DEG;
+    si.rollDeg  = rt::g_headRoll  * RAD2DEG;
+    return si;
+}
+
+// Read the current preview-window client size (set on WM_SIZE). If the user
+// hasn't sized it yet, fall back to the menu-zoom-derived target.
+static void GetPreviewClientSize(rt::Session& s, int srcW, int srcH, int& outW, int& outH) {
+    UINT cw = s.clientWidth.load();
+    UINT ch = s.clientHeight.load();
+    if (cw > 0 && ch > 0) {
+        outW = (int)cw;
+        outH = (int)ch;
+        return;
+    }
+    // Initial fallback (first frame, before WM_SIZE has fired)
+    int tw = srcW, th = srcH;
+    ui::CalculateWindowSize(srcW, srcH, tw, th);
+    outW = tw;
+    outH = th;
+}
+
 static void ResetD3D12PreviewResources(rt::Session& s) {
     s.previewRT12.Reset();
     s.previewReadback12.Reset();
@@ -720,6 +863,197 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ShowCursor(TRUE);
             }
             return 0;
+        case WM_SIZING: {
+            // Constrain interactive resize to the current content aspect ratio
+            // so the window itself follows the stereo layout (no letterbox).
+            UINT srcW = rt::g_sourceWidth.load();
+            UINT srcH = rt::g_sourceHeight.load();
+            if (srcW == 0 || srcH == 0) break;
+
+            int contentW = 0, contentH = 0;
+            rt::ComputeContentDims((int)srcW, (int)srcH,
+                                   ui::g_uiState.viewMode,
+                                   ui::g_uiState.displayLayout,
+                                   contentW, contentH);
+            if (contentW <= 0 || contentH <= 0) break;
+            double aspect = (double)contentW / (double)contentH;
+
+            // Measure the non-client overhead (borders + title bar + menu)
+            DWORD style   = (DWORD)GetWindowLongW(hWnd, GWL_STYLE);
+            DWORD exStyle = (DWORD)GetWindowLongW(hWnd, GWL_EXSTYLE);
+            BOOL  hasMenu = GetMenu(hWnd) != nullptr;
+            RECT probe{0, 0, 100, 100};
+            AdjustWindowRectEx(&probe, style, hasMenu, exStyle);
+            int ncW = (probe.right - probe.left) - 100;
+            int ncH = (probe.bottom - probe.top) - 100;
+
+            RECT* r = (RECT*)lParam;
+            int clientW = (r->right - r->left) - ncW;
+            int clientH = (r->bottom - r->top) - ncH;
+            if (clientW < 1) clientW = 1;
+            if (clientH < 1) clientH = 1;
+
+            UINT edge = (UINT)wParam;
+            // Decide which axis drives the constraint:
+            //   left/right edge → width is canonical
+            //   top/bottom edge → height is canonical
+            //   corner → use whichever side the user pulled "further" so
+            //            dragging outward grows the window in both axes
+            bool widthCanonical;
+            switch (edge) {
+                case WMSZ_LEFT:
+                case WMSZ_RIGHT:
+                    widthCanonical = true;
+                    break;
+                case WMSZ_TOP:
+                case WMSZ_BOTTOM:
+                    widthCanonical = false;
+                    break;
+                default:
+                    widthCanonical = ((double)clientW / aspect) >= (double)clientH;
+                    break;
+            }
+
+            if (widthCanonical) {
+                clientH = (int)((double)clientW / aspect + 0.5);
+            } else {
+                clientW = (int)((double)clientH * aspect + 0.5);
+            }
+            if (clientW < 1) clientW = 1;
+            if (clientH < 1) clientH = 1;
+
+            int outerW = clientW + ncW;
+            int outerH = clientH + ncH;
+
+            // Anchor the rect to whichever corner the user is NOT dragging
+            switch (edge) {
+                case WMSZ_LEFT:
+                    r->left   = r->right  - outerW;
+                    r->bottom = r->top    + outerH;
+                    break;
+                case WMSZ_RIGHT:
+                    r->right  = r->left   + outerW;
+                    r->bottom = r->top    + outerH;
+                    break;
+                case WMSZ_TOP:
+                    r->top    = r->bottom - outerH;
+                    r->right  = r->left   + outerW;
+                    break;
+                case WMSZ_BOTTOM:
+                    r->bottom = r->top    + outerH;
+                    r->right  = r->left   + outerW;
+                    break;
+                case WMSZ_TOPLEFT:
+                    r->left   = r->right  - outerW;
+                    r->top    = r->bottom - outerH;
+                    break;
+                case WMSZ_TOPRIGHT:
+                    r->right  = r->left   + outerW;
+                    r->top    = r->bottom - outerH;
+                    break;
+                case WMSZ_BOTTOMLEFT:
+                    r->left   = r->right  - outerW;
+                    r->bottom = r->top    + outerH;
+                    break;
+                case WMSZ_BOTTOMRIGHT:
+                default:
+                    r->right  = r->left   + outerW;
+                    r->bottom = r->top    + outerH;
+                    break;
+            }
+            return TRUE;
+        }
+        case WM_SIZE: {
+            // Capture the new client area. The render path picks this up next
+            // frame and resizes the swapchain (D3D11/GL) or recomputes the
+            // letterbox destination (D3D12 GDI). Ignore minimize (0×0).
+            UINT cw = LOWORD(lParam);
+            UINT ch = HIWORD(lParam);
+            if (cw == 0 || ch == 0) return 0;
+            rt::g_session.clientWidth.store(cw);
+            rt::g_session.clientHeight.store(ch);
+
+            // WM_SIZING constrains interactive drags, but maximize, snap, and
+            // programmatic resizes bypass it. If the resulting client aspect
+            // doesn't match content aspect, snap the window so we never need
+            // to fall back to the letterbox bars at runtime.
+            static thread_local bool inFix = false;
+            if (inFix) return 0;
+
+            UINT srcW = rt::g_sourceWidth.load();
+            UINT srcH = rt::g_sourceHeight.load();
+            if (srcW == 0 || srcH == 0) return 0;
+
+            int contentW = 0, contentH = 0;
+            rt::ComputeContentDims((int)srcW, (int)srcH,
+                                   ui::g_uiState.viewMode,
+                                   ui::g_uiState.displayLayout,
+                                   contentW, contentH);
+            if (contentW <= 0 || contentH <= 0) return 0;
+            double contentAspect = (double)contentW / (double)contentH;
+            double clientAspect  = (double)cw / (double)ch;
+            // Tolerance: don't fight ourselves over sub-pixel rounding.
+            if (fabs(contentAspect - clientAspect) <
+                0.005 * (contentAspect + clientAspect)) {
+                return 0;
+            }
+
+            DWORD style   = (DWORD)GetWindowLongW(hWnd, GWL_STYLE);
+            DWORD exStyle = (DWORD)GetWindowLongW(hWnd, GWL_EXSTYLE);
+            BOOL  hasMenu = GetMenu(hWnd) != nullptr;
+
+            if (wParam == SIZE_MAXIMIZED) {
+                // Restore out of maximized state, then size to the largest
+                // aspect-correct rect that fits in the monitor's work area.
+                HMONITOR hmon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+                if (!GetMonitorInfoW(hmon, &mi)) return 0;
+                int availW = mi.rcWork.right - mi.rcWork.left;
+                int availH = mi.rcWork.bottom - mi.rcWork.top;
+
+                RECT probe{0, 0, 100, 100};
+                AdjustWindowRectEx(&probe, style & ~WS_MAXIMIZE, hasMenu, exStyle);
+                int ncW = (probe.right - probe.left) - 100;
+                int ncH = (probe.bottom - probe.top) - 100;
+                int maxCW = availW - ncW; if (maxCW < 1) maxCW = 1;
+                int maxCH = availH - ncH; if (maxCH < 1) maxCH = 1;
+
+                rt::FitRect fit = rt::ComputeFitRect(contentW, contentH, maxCW, maxCH);
+                int targetCW = (int)fit.w; if (targetCW < 1) targetCW = 1;
+                int targetCH = (int)fit.h; if (targetCH < 1) targetCH = 1;
+
+                RECT rc{0, 0, targetCW, targetCH};
+                AdjustWindowRectEx(&rc, style & ~WS_MAXIMIZE, hasMenu, exStyle);
+                int outerW = rc.right - rc.left;
+                int outerH = rc.bottom - rc.top;
+                int x = mi.rcWork.left + (availW - outerW) / 2;
+                int y = mi.rcWork.top  + (availH - outerH) / 2;
+
+                inFix = true;
+                ShowWindow(hWnd, SW_RESTORE);
+                SetWindowPos(hWnd, nullptr, x, y, outerW, outerH, SWP_NOZORDER);
+                inFix = false;
+            } else {
+                // Anything else (DPI change, programmatic, Aero snap, etc.):
+                // preserve the new width, recompute height to match aspect.
+                int targetCH = (int)((double)cw / contentAspect + 0.5);
+                if (targetCH < 1) targetCH = 1;
+
+                RECT rc{0, 0, (LONG)cw, targetCH};
+                AdjustWindowRectEx(&rc, style, hasMenu, exStyle);
+
+                inFix = true;
+                SetWindowPos(hWnd, nullptr, 0, 0,
+                             rc.right - rc.left, rc.bottom - rc.top,
+                             SWP_NOMOVE | SWP_NOZORDER);
+                inFix = false;
+            }
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            // We repaint the full client area every frame. Skipping the GDI
+            // erase prevents flicker behind the D3D12 GDI blit during resize.
+            return 1;
         case WM_MOUSEMOVE:
             if (rt::g_mouseCapture) {
                 POINT currentPos;
@@ -751,9 +1085,26 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
         case WM_COMMAND:
             if (ui::HandleMenuCommand(hWnd, wParam,
-                []() { /* Resize handled by presentProjection based on zoom */ },
+                []() {
+                    // Apply zoom/layout change to the window outer size. "Fit
+                    // to Window" leaves the user's chosen size alone and lets
+                    // the render path letterbox into it.
+                    if (ui::g_uiState.fitToWindow) return;
+                    UINT sw = rt::g_sourceWidth.load();
+                    UINT sh = rt::g_sourceHeight.load();
+                    if (sw == 0 || sh == 0 || !rt::g_session.hwnd) return;
+                    int targetW = (int)sw, targetH = (int)sh;
+                    ui::CalculateWindowSize((int)sw, (int)sh, targetW, targetH);
+                    RECT rc = { 0, 0, targetW, targetH };
+                    BOOL hasMenu = GetMenu(rt::g_session.hwnd) != nullptr;
+                    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, hasMenu);
+                    SetWindowPos(rt::g_session.hwnd, nullptr, 0, 0,
+                                 rc.right - rc.left, rc.bottom - rc.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                },
                 []() { mcp::g_screenshotRequested = true; },
-                []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; }
+                []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; },
+                [](int cmd) { rt::HandleUiSettingsCommand(cmd); }
             )) {
                 return 0;
             }
@@ -761,9 +1112,26 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_KEYDOWN:
             if (!rt::g_mouseCapture) {
                 if (ui::HandleKeyboardShortcut(hWnd, wParam,
-                    []() { /* Resize handled by presentProjection based on zoom */ },
+                    []() {
+                    // Apply zoom/layout change to the window outer size. "Fit
+                    // to Window" leaves the user's chosen size alone and lets
+                    // the render path letterbox into it.
+                    if (ui::g_uiState.fitToWindow) return;
+                    UINT sw = rt::g_sourceWidth.load();
+                    UINT sh = rt::g_sourceHeight.load();
+                    if (sw == 0 || sh == 0 || !rt::g_session.hwnd) return;
+                    int targetW = (int)sw, targetH = (int)sh;
+                    ui::CalculateWindowSize((int)sw, (int)sh, targetW, targetH);
+                    RECT rc = { 0, 0, targetW, targetH };
+                    BOOL hasMenu = GetMenu(rt::g_session.hwnd) != nullptr;
+                    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, hasMenu);
+                    SetWindowPos(rt::g_session.hwnd, nullptr, 0, 0,
+                                 rc.right - rc.left, rc.bottom - rc.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                },
                     []() { mcp::g_screenshotRequested = true; },
-                    []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; }
+                    []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; },
+                    [](int cmd) { rt::HandleUiSettingsCommand(cmd); }
                 )) {
                     return 0;
                 }
@@ -2494,30 +2862,18 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
 }
 static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession, const XrFrameBeginInfo*) { return XR_SUCCESS; }
 
-static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FORMAT format) {
-    if (!s.usesD3D12) {
-        if (s.previewSwapchain && s.previewWidth == width && s.previewHeight == height && s.previewFormat == format) return;
-    } else {
-        if (s.previewRT12 && s.previewWidth == width && s.previewHeight == height && s.previewFormat == format) return;
-    }
-    
-    // IMPORTANT: Release ALL swapchain references before creating a new one
-    // DXGI only allows one swapchain per window
-    s.previewSwapchain.Reset();
-    rt::ResetD3D12PreviewResources(s);
-    {
-        std::lock_guard<std::mutex> lock(rt::g_windowMutex);
-        rt::g_persistentSwapchain.Reset();
-    }
-    s.previewWidth = width;
-    s.previewHeight = height;
-    s.previewFormat = format;
+// Ensure the preview window exists (create or adopt the persistent one) and
+// pick a sensible initial outer size if it's brand new. The window size is
+// NOT touched on subsequent calls — once it exists, the user (or the menu
+// resize callback) owns its size.
+static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initialClientH) {
+    if (s.hwnd) return;
 
     // Register window class if not done (use global flag)
     if (!rt::g_windowClassRegistered) {
-        WNDCLASSW wc{}; 
-        wc.lpfnWndProc = rt::WndProc; 
-        wc.hInstance = GetModuleHandleW(nullptr); 
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = rt::WndProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = L"OpenXR Simulator";
         wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
@@ -2525,104 +2881,157 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         rt::g_windowClassRegistered = true;
     }
 
-    if (!s.hwnd) {
-        // Check if we have a persistent window from a previous session
-        {
-            std::lock_guard<std::mutex> lock(rt::g_windowMutex);
-            if (rt::g_persistentWindow && IsWindow(rt::g_persistentWindow)) {
-                s.hwnd = rt::g_persistentWindow;
-                // DON'T clear g_persistentWindow - keep it for reference
-
-                // CRITICAL: Update WndProc to point to this DLL's function
-                // After DLL reload, the old WndProc pointer is invalid!
-                SetWindowLongPtrW(s.hwnd, GWLP_WNDPROC, (LONG_PTR)rt::WndProc);
-                Log("[SimXR] Updated window WndProc to new DLL address");
-
-                // Reuse swapchain if compatible
-                if (rt::g_persistentSwapchain && rt::g_persistentWidth == width && 
-                    rt::g_persistentHeight == height && s.previewFormat == format) {
-                    s.previewSwapchain = rt::g_persistentSwapchain;
-                    s.previewWidth = rt::g_persistentWidth;
-                    s.previewHeight = rt::g_persistentHeight;
-                    s.previewFormat = format;
-                    Log("[SimXR] Reusing existing window AND swapchain from previous session");
-                    return;  // Everything is already set up
-                }
-                
-                Log("[SimXR] Reusing existing window from previous session (recreating swapchain)");
-
-                // IMPORTANT: Release the old persistent swapchain before creating a new one
-                // DXGI only allows one swapchain per window
-                rt::g_persistentSwapchain.Reset();
-
-                // Apply dark theme if not already applied
-                ui::ApplyDarkTheme(s.hwnd);
-                
-                // Just resize the existing window if needed
-                RECT rc = { 0, 0, (LONG)width, (LONG)height };
-                AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-                SetWindowPos(s.hwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
-                
-                // Make sure it's visible
-                ShowWindow(s.hwnd, SW_SHOW);
-                UpdateWindow(s.hwnd);
-            }
-        }
-        
-        // Create new window if we don't have one
-        if (!s.hwnd) {
-            RECT rc = { 0, 0, (LONG)width, (LONG)height };
-            AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-            s.hwnd = CreateWindowExW(0, L"OpenXR Simulator", L"OpenXR Simulator (Mouse Look + WASD)", WS_OVERLAPPEDWINDOW,
-                                     100, 100, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-            if (!s.hwnd) {
-                Log("[SimXR] Failed to create preview window!");
-                return;
-            }
+    // Try to adopt a persistent window from a previous DLL load
+    {
+        std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+        if (rt::g_persistentWindow && IsWindow(rt::g_persistentWindow)) {
+            s.hwnd = rt::g_persistentWindow;
+            // After DLL reload, the old WndProc pointer is invalid
+            SetWindowLongPtrW(s.hwnd, GWLP_WNDPROC, (LONG_PTR)rt::WndProc);
+            Log("[SimXR] Updated window WndProc to new DLL address");
+            ui::ApplyDarkTheme(s.hwnd);
             ShowWindow(s.hwnd, SW_SHOW);
             UpdateWindow(s.hwnd);
-            SetForegroundWindow(s.hwnd);
-            SetWindowPos(s.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-            Logf("[SimXR] Created new preview window: hwnd=%p size=%ux%u", s.hwnd, width, height);
-            
-            // Apply dark theme and menu
-            ui::ApplyDarkTheme(s.hwnd);
-            ui::g_uiState.windowWidth = width;
-            ui::g_uiState.windowHeight = height;
-            
-            // Also save to persistent storage right away
-            {
-                std::lock_guard<std::mutex> lock(rt::g_windowMutex);
-                rt::g_persistentWindow = s.hwnd;
-                Log("[SimXR] Saved new window to persistent storage");
+            // Seed clientWidth/Height from the actual current client area
+            RECT cr{};
+            if (GetClientRect(s.hwnd, &cr)) {
+                UINT cw = (UINT)(cr.right - cr.left);
+                UINT ch = (UINT)(cr.bottom - cr.top);
+                if (cw > 0 && ch > 0) {
+                    s.clientWidth.store(cw);
+                    s.clientHeight.store(ch);
+                }
+            }
+            return;
+        }
+    }
+
+    // No persistent window — create a fresh one at the requested initial size
+    RECT rc = { 0, 0, (LONG)initialClientW, (LONG)initialClientH };
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    s.hwnd = CreateWindowExW(0, L"OpenXR Simulator", L"OpenXR Simulator (Mouse Look + WASD)", WS_OVERLAPPEDWINDOW,
+                             100, 100, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!s.hwnd) {
+        Log("[SimXR] Failed to create preview window!");
+        return;
+    }
+    ShowWindow(s.hwnd, SW_SHOW);
+    UpdateWindow(s.hwnd);
+    SetForegroundWindow(s.hwnd);
+    SetWindowPos(s.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    Logf("[SimXR] Created new preview window: hwnd=%p clientSize=%ux%u",
+         s.hwnd, initialClientW, initialClientH);
+
+    ui::ApplyDarkTheme(s.hwnd);
+    ui::g_uiState.windowWidth = initialClientW;
+    ui::g_uiState.windowHeight = initialClientH;
+    s.clientWidth.store(initialClientW);
+    s.clientHeight.store(initialClientH);
+
+    {
+        std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+        rt::g_persistentWindow = s.hwnd;
+        Log("[SimXR] Saved new window to persistent storage");
+    }
+}
+
+// Make sure the preview backing store (D3D11 swapchain or D3D12 offscreen RT)
+// is sized to `width × height` and uses `format`. For D3D11 this means
+// ResizeBuffers (or recreate) so the backbuffer matches the window client area;
+// for D3D12 it means resizing the offscreen RT/readback to the natural canvas
+// size chosen by the caller. The window itself is NOT touched here.
+static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FORMAT format) {
+    if (width == 0) width = 1;
+    if (height == 0) height = 1;
+
+    // Make sure we have a window first
+    ensurePreviewWindow(s, width, height);
+    if (!s.hwnd) return;
+
+    // After a DLL reload the Session is fresh but a previous swapchain may
+    // still be cached against the persistent HWND — adopt it so we don't try
+    // to create a second swapchain for the same window (which DXGI forbids).
+    if (!s.usesD3D12 && !s.previewSwapchain) {
+        std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+        if (rt::g_persistentSwapchain) {
+            s.previewSwapchain = rt::g_persistentSwapchain;
+            DXGI_SWAP_CHAIN_DESC1 d{};
+            if (SUCCEEDED(s.previewSwapchain->GetDesc1(&d))) {
+                s.previewWidth = d.Width;
+                s.previewHeight = d.Height;
+                s.previewFormat = d.Format;
+            } else {
+                s.previewWidth = rt::g_persistentWidth;
+                s.previewHeight = rt::g_persistentHeight;
             }
         }
-    } else {
-        // Resize existing window
-        RECT rc = { 0, 0, (LONG)width, (LONG)height };
-        AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-        SetWindowPos(s.hwnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
-        Logf("[SimXR] Resized preview window: hwnd=%p size=%ux%u", s.hwnd, width, height);
     }
+
     if (!s.usesD3D12) {
+        if (s.previewSwapchain && s.previewWidth == width && s.previewHeight == height && s.previewFormat == format) return;
+    } else {
+        if (s.previewRT12 && s.previewWidth == width && s.previewHeight == height && s.previewFormat == format) return;
+    }
+
+    if (!s.usesD3D12) {
+        // D3D11/GL path: try ResizeBuffers if the format hasn't changed and we
+        // already have a swapchain. Otherwise recreate.
+        if (s.previewSwapchain && s.previewFormat == format) {
+            HRESULT hr = s.previewSwapchain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+            if (SUCCEEDED(hr)) {
+                s.previewWidth = width;
+                s.previewHeight = height;
+                {
+                    std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+                    rt::g_persistentSwapchain = s.previewSwapchain;
+                    rt::g_persistentWidth = width;
+                    rt::g_persistentHeight = height;
+                }
+                return;
+            }
+            Logf("[SimXR] ensurePreviewSized: ResizeBuffers failed 0x%08X, recreating swapchain", (unsigned)hr);
+        }
+
+        // Recreate from scratch (format changed, first call, or ResizeBuffers failed)
+        s.previewSwapchain.Reset();
+        {
+            std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+            rt::g_persistentSwapchain.Reset();
+        }
+        s.previewWidth = width;
+        s.previewHeight = height;
+        s.previewFormat = format;
+
         ComPtr<IDXGIDevice> dxgiDev; s.d3d11Device.As(&dxgiDev);
         ComPtr<IDXGIAdapter> adapter; dxgiDev->GetAdapter(adapter.GetAddressOf());
         ComPtr<IDXGIFactory2> factory; adapter->GetParent(IID_PPV_ARGS(factory.GetAddressOf()));
-        DXGI_SWAP_CHAIN_DESC1 desc{}; 
-        desc.Format = format;  // Use the format from the XR swapchain
-        desc.Width = width; 
+        DXGI_SWAP_CHAIN_DESC1 desc{};
+        desc.Format = format;
+        desc.Width = width;
         desc.Height = height;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; 
-        desc.BufferCount = 2; 
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD; 
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferCount = 2;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc.Scaling = DXGI_SCALING_STRETCH;
         desc.SampleDesc.Count = 1;
         HRESULT hr = factory->CreateSwapChainForHwnd(s.d3d11Device.Get(), s.hwnd, &desc, nullptr, nullptr, s.previewSwapchain.GetAddressOf());
-        Logf("[SimXR] ensurePreviewSized(DX11): hr=0x%08X swapchain=%p format=%d", (unsigned)hr, s.previewSwapchain.Get(), format);
+        Logf("[SimXR] ensurePreviewSized(DX11): hr=0x%08X swapchain=%p size=%ux%u format=%d",
+             (unsigned)hr, s.previewSwapchain.Get(), width, height, format);
         if (FAILED(hr)) {
             Logf("[SimXR] ERROR: Failed to create DX11 preview swapchain with format %d", format);
+        } else {
+            std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+            rt::g_persistentSwapchain = s.previewSwapchain;
+            rt::g_persistentWidth = width;
+            rt::g_persistentHeight = height;
         }
         return;
     } else {
+        // D3D12 path: rebuild the offscreen RT/readback at the requested size
+        rt::ResetD3D12PreviewResources(s);
+        s.previewWidth = width;
+        s.previewHeight = height;
+        s.previewFormat = format;
         // DX12 preview: GDI-based rendering to avoid DXGI Present hook conflicts.
         // Steam overlay (gameoverlayrenderer64) and UEVR both hook IDXGISwapChain::Present,
         // creating infinite recursion → EXCEPTION_STACK_OVERFLOW. Instead, we render to an
@@ -3120,37 +3529,79 @@ static void blitD3D12ToPreview(rt::Session& s,
     }
     s.previewFenceValue++;
 
-    // Map readback buffer and paint to window via GDI (bypasses all DXGI Present hooks)
+    // Map readback buffer and paint to window via GDI (bypasses all DXGI Present hooks).
+    // The RT here is at the natural content size; StretchDIBits scales it into the
+    // letterbox fit rect inside the current window client area, so resizing the
+    // window scales the stereo image (with black bars) instead of cropping it.
     void* mapped = nullptr;
     D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * rtHeight };
     hr = s.previewReadback12->Map(0, &readRange, &mapped);
     if (SUCCEEDED(hr) && mapped && s.hwnd) {
         HDC hdc = GetDC(s.hwnd);
         if (hdc) {
-            BITMAPINFO bmi = {};
-            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            bmi.bmiHeader.biWidth = (LONG)rtWidth;
-            bmi.bmiHeader.biHeight = -(LONG)rtHeight;  // top-down
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB;
+            // Get current client area (live, in case a resize is mid-flight)
+            RECT cr{};
+            GetClientRect(s.hwnd, &cr);
+            int clientW = cr.right - cr.left;
+            int clientH = cr.bottom - cr.top;
+            if (clientW > 0 && clientH > 0) {
+                rt::FitRect fit = rt::ComputeFitRect((int)rtWidth, (int)rtHeight, clientW, clientH);
+                int dstX = (int)fit.x;
+                int dstY = (int)fit.y;
+                int dstW = (int)fit.w;
+                int dstH = (int)fit.h;
+                if (dstW < 1) dstW = 1;
+                if (dstH < 1) dstH = 1;
 
-            // Handle aligned row pitch: if pitch matches width*4, blit directly; otherwise copy rows
-            UINT expectedPitch = rtWidth * 4;
-            if (s.previewReadbackPitch == expectedPitch) {
-                StretchDIBits(hdc, 0, 0, rtWidth, rtHeight,
-                              0, 0, rtWidth, rtHeight,
-                              mapped, &bmi, DIB_RGB_COLORS, SRCCOPY);
-            } else {
-                // Copy rows with correct pitch to a contiguous buffer
-                std::vector<uint8_t> pixels(expectedPitch * rtHeight);
-                const uint8_t* src = (const uint8_t*)mapped;
-                for (UINT row = 0; row < rtHeight; ++row) {
-                    memcpy(pixels.data() + row * expectedPitch, src + row * s.previewReadbackPitch, expectedPitch);
+                BITMAPINFO bmi = {};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = (LONG)rtWidth;
+                bmi.bmiHeader.biHeight = -(LONG)rtHeight;  // top-down
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
+
+                // Bilinear scaling for the StretchDIBits downscale path
+                SetStretchBltMode(hdc, HALFTONE);
+                SetBrushOrgEx(hdc, 0, 0, nullptr);
+
+                // Paint the letterbox borders black so resizing doesn't leave
+                // stale pixels around the scaled stereo image.
+                HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+                if (dstY > 0) {
+                    RECT top{0, 0, clientW, dstY};
+                    FillRect(hdc, &top, black);
                 }
-                StretchDIBits(hdc, 0, 0, rtWidth, rtHeight,
-                              0, 0, rtWidth, rtHeight,
-                              pixels.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+                if (dstY + dstH < clientH) {
+                    RECT bot{0, dstY + dstH, clientW, clientH};
+                    FillRect(hdc, &bot, black);
+                }
+                if (dstX > 0) {
+                    RECT left{0, dstY, dstX, dstY + dstH};
+                    FillRect(hdc, &left, black);
+                }
+                if (dstX + dstW < clientW) {
+                    RECT right{dstX + dstW, dstY, clientW, dstY + dstH};
+                    FillRect(hdc, &right, black);
+                }
+
+                // Handle aligned row pitch: if pitch matches width*4, blit directly; otherwise copy rows
+                UINT expectedPitch = rtWidth * 4;
+                if (s.previewReadbackPitch == expectedPitch) {
+                    StretchDIBits(hdc, dstX, dstY, dstW, dstH,
+                                  0, 0, rtWidth, rtHeight,
+                                  mapped, &bmi, DIB_RGB_COLORS, SRCCOPY);
+                } else {
+                    // Copy rows with correct pitch to a contiguous buffer
+                    std::vector<uint8_t> pixels(expectedPitch * rtHeight);
+                    const uint8_t* src = (const uint8_t*)mapped;
+                    for (UINT row = 0; row < rtHeight; ++row) {
+                        memcpy(pixels.data() + row * expectedPitch, src + row * s.previewReadbackPitch, expectedPitch);
+                    }
+                    StretchDIBits(hdc, dstX, dstY, dstW, dstH,
+                                  0, 0, rtWidth, rtHeight,
+                                  pixels.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+                }
             }
             ReleaseDC(s.hwnd, hdc);
         }
@@ -3198,6 +3649,10 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             if (itR->second.height > height) height = itR->second.height;
         }
     }
+    // Publish the source per-eye size so menu/keyboard zoom callbacks can
+    // compute a window target without having to walk the swapchain map.
+    rt::g_sourceWidth.store(width);
+    rt::g_sourceHeight.store(height);
     {
         std::lock_guard<std::mutex> lock(s.previewMutex);
 
@@ -3284,9 +3739,13 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // MCP Integration - check for screenshot requests and capture (OpenGL path)
             mcp::CheckScreenshotRequest();
             if (mcp::g_screenshotRequested) {
+                bool captured = false;
+                std::string outPath = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
                 if (mcp::g_screenshotLayer == "quad") {
                     // Capture only quad layer
                     mcp::CaptureQuadScreenshot();
+                    outPath = mcp::GetSimulatorDataPath() + "\\screenshot_quad.bmp";
+                    captured = true;
                 } else if (mcp::g_screenshotLayer == "all") {
                     // Capture both projection and quad layers
                     mcp::CaptureScreenshotGL(
@@ -3300,12 +3759,18 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                             mcp::g_quadLayerWidth, mcp::g_quadLayerHeight, quadPath.c_str());
                     }
                     mcp::g_screenshotRequested = false;
+                    captured = true;
                 } else {
                     // Default: capture projection layer
                     mcp::CaptureScreenshotGL(
                         leftTex != 0 ? leftPixels.data() : nullptr,
                         rightTex != 0 ? rightPixels.data() : nullptr,
                         width, height);
+                    captured = true;
+                }
+                if (captured) {
+                    std::wstring wp(outPath.begin(), outPath.end());
+                    ui::NotifyScreenshotSaved(wp);
                 }
             }
 
@@ -3378,12 +3843,15 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             DXGI_FORMAT displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
             const auto viewMode = ui::g_uiState.viewMode;
             const auto layout = ui::g_uiState.displayLayout;
+
+            // Swapchain backbuffer = current window client area so DXGI doesn't
+            // have to scale; we letterbox the stereo content into it ourselves.
             int targetWidth = (int)width;
             int targetHeight = (int)height;
-            ui::CalculateWindowSize((int)width, (int)height, targetWidth, targetHeight);
+            rt::GetPreviewClientSize(s, (int)width, (int)height, targetWidth, targetHeight);
 
             if (glFrameCount % 60 == 1) {
-                Logf("[SimXR] GL PREVIEW: targetSize=%dx%d, calling ensurePreviewSized", targetWidth, targetHeight);
+                Logf("[SimXR] GL PREVIEW: clientSize=%dx%d, calling ensurePreviewSized", targetWidth, targetHeight);
             }
 
             ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
@@ -3460,32 +3928,32 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                      leftTex2D.Get(), rightTex2D.Get(), leftSRV.Get(), rightSRV.Get());
             }
 
-            // Clear the render target
+            // Clear the render target (full backbuffer → black borders for letterbox)
             ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
             s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
-            const float clearColor[4] = {0.1f, 0.1f, 0.2f, 1.0f};  // Dark blue
+            const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
 
-            // Setup viewports for left and right eyes
-            D3D11_VIEWPORT fullVp = {};
-            fullVp.TopLeftX = 0.0f;
-            fullVp.TopLeftY = 0.0f;
-            fullVp.Width = (float)s.previewWidth;
-            fullVp.Height = (float)s.previewHeight;
-            fullVp.MinDepth = 0.0f;
-            fullVp.MaxDepth = 1.0f;
+            // Compute letterboxed fit rect: largest aspect-correct rect that
+            // fits in the current backbuffer (= client area). This way a
+            // small window shows the full stereo image scaled, not cropped.
+            int contentW = 0, contentH = 0;
+            rt::ComputeContentDims((int)width, (int)height, viewMode, layout, contentW, contentH);
+            rt::FitRect fit = rt::ComputeFitRect(contentW, contentH,
+                                                  (int)s.previewWidth, (int)s.previewHeight);
 
+            D3D11_VIEWPORT fullVp = { fit.x, fit.y, fit.w, fit.h, 0.0f, 1.0f };
             D3D11_VIEWPORT leftVp = fullVp;
             D3D11_VIEWPORT rightVp = fullVp;
             if (!singleEye) {
                 if (layout == ui::DisplayLayout::SideBySide) {
-                    leftVp.Width = (float)s.previewWidth / 2.0f;
-                    rightVp.Width = (float)s.previewWidth / 2.0f;
-                    rightVp.TopLeftX = (float)s.previewWidth / 2.0f;
+                    leftVp.Width  = fit.w * 0.5f;
+                    rightVp.Width = fit.w * 0.5f;
+                    rightVp.TopLeftX = fit.x + fit.w * 0.5f;
                 } else if (layout == ui::DisplayLayout::OverUnder) {
-                    leftVp.Height = (float)s.previewHeight / 2.0f;
-                    rightVp.Height = (float)s.previewHeight / 2.0f;
-                    rightVp.TopLeftY = (float)s.previewHeight / 2.0f;
+                    leftVp.Height  = fit.h * 0.5f;
+                    rightVp.Height = fit.h * 0.5f;
+                    rightVp.TopLeftY = fit.y + fit.h * 0.5f;
                 }
             }
 
@@ -3558,7 +4026,13 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 glLastFPS = (int)(glTitleFrameCount * 1000 / elapsed);
                 glTitleFrameCount = 0;
                 glLastTitleUpdate = now;
-                ui::UpdateWindowTitle(s.hwnd, glLastFPS, 0);
+                ui::StatsInfo si = rt::BuildStatsInfo(s);
+                ui::UpdateWindowTitle(s.hwnd, glLastFPS, 0, &si);
+            } else if (ui::g_lastScreenshotTickMs != 0) {
+                // Refresh frequently while a screenshot notice is active so it
+                // appears immediately rather than at the next 500ms tick.
+                ui::StatsInfo si = rt::BuildStatsInfo(s);
+                ui::UpdateWindowTitle(s.hwnd, glLastFPS, 0, &si);
             }
 
             // Present (may be deferred if overlays are pending)
@@ -3612,7 +4086,15 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
         const auto layout = ui::g_uiState.displayLayout;
         int targetWidth = (int)width;
         int targetHeight = (int)height;
-        ui::CalculateWindowSize((int)width, (int)height, targetWidth, targetHeight);
+        if (!s.usesD3D12) {
+            // D3D11: backbuffer size = current window client area. The eyes
+            // get letterboxed into it (no DXGI scaling = no aspect squish).
+            rt::GetPreviewClientSize(s, (int)width, (int)height, targetWidth, targetHeight);
+        } else {
+            // D3D12 (GDI path): keep the offscreen RT at the natural content
+            // size — StretchDIBits stretches it to the window's fit rect.
+            rt::ComputeContentDims((int)width, (int)height, viewMode, layout, targetWidth, targetHeight);
+        }
         ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
         const bool singleEye = (viewMode != ui::ViewMode::BothEyes);
         const bool showLeft = (viewMode != ui::ViewMode::RightEyeOnly);
@@ -3667,33 +4149,33 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 }
             }
 
-            // Bind RTV and clear
+            // Bind RTV and clear the full backbuffer (= client area) to black
+            // so any letterbox border ends up black instead of stale content.
             ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
             s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
-            const float clearColorDefault[4] = {0.1f, 0.1f, 0.2f, 1.0f};
-            const float clearColorAnaglyph[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            const float* clearColor = (layout == ui::DisplayLayout::Anaglyph) ? clearColorAnaglyph : clearColorDefault;
+            const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
 
-            D3D11_VIEWPORT fullVp = {};
-            fullVp.TopLeftX = 0.0f;
-            fullVp.TopLeftY = 0.0f;
-            fullVp.Width = (float)s.previewWidth;
-            fullVp.Height = (float)s.previewHeight;
-            fullVp.MinDepth = 0.0f;
-            fullVp.MaxDepth = 1.0f;
+            // Letterbox: pick the largest content-aspect rect inside the
+            // backbuffer (= client area). Single eye uses it whole; SBS /
+            // OverUnder split it; Anaglyph overlays both eyes into it.
+            int contentW = 0, contentH = 0;
+            rt::ComputeContentDims((int)width, (int)height, viewMode, layout, contentW, contentH);
+            rt::FitRect fit = rt::ComputeFitRect(contentW, contentH,
+                                                  (int)s.previewWidth, (int)s.previewHeight);
 
+            D3D11_VIEWPORT fullVp = { fit.x, fit.y, fit.w, fit.h, 0.0f, 1.0f };
             D3D11_VIEWPORT leftVp = fullVp;
             D3D11_VIEWPORT rightVp = fullVp;
             if (!singleEye) {
                 if (layout == ui::DisplayLayout::SideBySide) {
-                    leftVp.Width = (float)s.previewWidth / 2.0f;
-                    rightVp.Width = (float)s.previewWidth / 2.0f;
-                    rightVp.TopLeftX = (float)s.previewWidth / 2.0f;
+                    leftVp.Width  = fit.w * 0.5f;
+                    rightVp.Width = fit.w * 0.5f;
+                    rightVp.TopLeftX = fit.x + fit.w * 0.5f;
                 } else if (layout == ui::DisplayLayout::OverUnder) {
-                    leftVp.Height = (float)s.previewHeight / 2.0f;
-                    rightVp.Height = (float)s.previewHeight / 2.0f;
-                    rightVp.TopLeftY = (float)s.previewHeight / 2.0f;
+                    leftVp.Height  = fit.h * 0.5f;
+                    rightVp.Height = fit.h * 0.5f;
+                    rightVp.TopLeftY = fit.y + fit.h * 0.5f;
                 }
             }
 
@@ -3747,13 +4229,20 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 lastFPS = (int)(titleFrameCount * 1000 / elapsed);
                 titleFrameCount = 0;
                 lastTitleUpdate = now;
-                ui::UpdateWindowTitle(s.hwnd, lastFPS, 0);
+                ui::StatsInfo si = rt::BuildStatsInfo(s);
+                ui::UpdateWindowTitle(s.hwnd, lastFPS, 0, &si);
+            } else if (ui::g_lastScreenshotTickMs != 0) {
+                ui::StatsInfo si = rt::BuildStatsInfo(s);
+                ui::UpdateWindowTitle(s.hwnd, lastFPS, 0, &si);
             }
 
             // MCP Integration - check for screenshot requests and capture
             mcp::CheckScreenshotRequest();
             if (mcp::g_screenshotRequested) {
                 mcp::CaptureScreenshot(s.d3d11Device.Get(), s.d3d11Context.Get(), s.previewSwapchain.Get());
+                std::string p = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
+                std::wstring wp(p.begin(), p.end());
+                ui::NotifyScreenshotSaved(wp);
             }
 
         } else {
@@ -3799,7 +4288,11 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 d3d12LastFPS = (int)(d3d12TitleFrameCount * 1000 / elapsed12);
                 d3d12TitleFrameCount = 0;
                 d3d12LastTitleUpdate = now12;
-                ui::UpdateWindowTitle(s.hwnd, d3d12LastFPS, 0);
+                ui::StatsInfo si = rt::BuildStatsInfo(s);
+                ui::UpdateWindowTitle(s.hwnd, d3d12LastFPS, 0, &si);
+            } else if (ui::g_lastScreenshotTickMs != 0) {
+                ui::StatsInfo si = rt::BuildStatsInfo(s);
+                ui::UpdateWindowTitle(s.hwnd, d3d12LastFPS, 0, &si);
             }
 
             // MCP Integration - check for screenshot requests and capture (D3D12)
@@ -3811,6 +4304,9 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                                              s.previewCmdAlloc.Get(), s.previewCmdList.Get(),
                                              s.previewFence.Get(), s.previewFenceEvent,
                                              s.previewFenceValue);
+                std::string p = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
+                std::wstring wp(p.begin(), p.end());
+                ui::NotifyScreenshotSaved(wp);
             }
         }
     }
@@ -4054,28 +4550,36 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     ComPtr<ID3D11ShaderResourceView> srv;
     if (FAILED(s.d3d11Device->CreateShaderResourceView(quadTex.Get(), nullptr, srv.GetAddressOf()))) return;
 
-    // Calculate viewports matching the projection layer layout
+    // Calculate viewports matching the projection layer layout (letterboxed)
     const auto layout = ui::g_uiState.displayLayout;
     const auto viewMode = ui::g_uiState.viewMode;
-    float screenW = (float)s.previewWidth;
-    float screenH = (float)s.previewHeight;
 
     bool showLeft = (viewMode == ui::ViewMode::BothEyes || viewMode == ui::ViewMode::LeftEyeOnly);
     bool showRight = (viewMode == ui::ViewMode::BothEyes || viewMode == ui::ViewMode::RightEyeOnly);
     bool singleEye = (viewMode != ui::ViewMode::BothEyes);
 
-    // Build left/right viewports to match projection layer layout
-    D3D11_VIEWPORT leftVp = { 0, 0, screenW, screenH, 0.0f, 1.0f };
-    D3D11_VIEWPORT rightVp = { 0, 0, screenW, screenH, 0.0f, 1.0f };
+    // Use the per-eye source dims (cached by presentProjection) to mirror the
+    // letterbox math used for the projection layer.
+    int qSrcW = (int)rt::g_sourceWidth.load();
+    int qSrcH = (int)rt::g_sourceHeight.load();
+    if (qSrcW <= 0) qSrcW = (int)texWidth;
+    if (qSrcH <= 0) qSrcH = (int)texHeight;
+    int qContentW = 0, qContentH = 0;
+    rt::ComputeContentDims(qSrcW, qSrcH, viewMode, layout, qContentW, qContentH);
+    rt::FitRect qFit = rt::ComputeFitRect(qContentW, qContentH,
+                                           (int)s.previewWidth, (int)s.previewHeight);
+
+    D3D11_VIEWPORT leftVp  = { qFit.x, qFit.y, qFit.w, qFit.h, 0.0f, 1.0f };
+    D3D11_VIEWPORT rightVp = leftVp;
     if (!singleEye) {
         if (layout == ui::DisplayLayout::SideBySide) {
-            leftVp.Width = screenW / 2.0f;
-            rightVp.Width = screenW / 2.0f;
-            rightVp.TopLeftX = screenW / 2.0f;
+            leftVp.Width  = qFit.w * 0.5f;
+            rightVp.Width = qFit.w * 0.5f;
+            rightVp.TopLeftX = qFit.x + qFit.w * 0.5f;
         } else if (layout == ui::DisplayLayout::OverUnder) {
-            leftVp.Height = screenH / 2.0f;
-            rightVp.Height = screenH / 2.0f;
-            rightVp.TopLeftY = screenH / 2.0f;
+            leftVp.Height  = qFit.h * 0.5f;
+            rightVp.Height = qFit.h * 0.5f;
+            rightVp.TopLeftY = qFit.y + qFit.h * 0.5f;
         }
     }
 
@@ -4307,7 +4811,7 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
                             XR_VIEW_STATE_POSITION_TRACKED_BIT; 
     }
     if (cap < 2 || !views) return XR_SUCCESS;
-    const float ipd = rt::g_useCustomIpd ? rt::g_customIpd : 0.064f;
+    const float ipd = rt::g_useCustomIpd ? rt::g_customIpd : rt::GetUiIpdMeters();
 
     // Pose-sweep tick: drive yaw/pitch/roll from a sine wave so apps see
     // a continuous range of orientations and any handedness/axis bug
@@ -4378,12 +4882,7 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
             views[i].fov = { rt::g_eyeFovL[i], rt::g_eyeFovR[i],
                              rt::g_eyeFovU[i], rt::g_eyeFovD[i] };
         } else {
-            // Symmetric default from UI slider.
-            int fovDeg = ui::g_uiState.fovDegrees;
-            if (fovDeg <= 0 || fovDeg > 180) fovDeg = 90;
-            float fovRadians = fovDeg * 0.5f * 3.14159265f / 180.0f;
-            float fovTan = tanf(fovRadians);
-            views[i].fov = { -fovTan, fovTan, fovTan, -fovTan };
+            views[i].fov = rt::GetUiFov(i);
         }
     }
     static int locateCount = 0;
