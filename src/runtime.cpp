@@ -2491,8 +2491,35 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
     static long long periodNs = (long long)(periodSec * 1e9);
     static double nextTick = [](){ LARGE_INTEGER t; QueryPerformanceCounter(&t); return (double)t.QuadPart; }();
     
-    // Handle WASD keyboard input for movement (relative to head orientation)
-    if (rt::g_session.isFocused) {
+    // Handle WASD keyboard input for movement (relative to head orientation).
+    //
+    // Accept input when the foreground window is our preview window OR ANY window owned by the host
+    // process (the OpenXR app — e.g. the game). The simulator runtime lives in-process with the host,
+    // so checking the foreground window's PID against our own lets head WASD/look work whether the user
+    // has focused the small "O" preview or the host's own (often fullscreen) window — yet never steals
+    // keystrokes when the user has alt-tabbed to an unrelated app (terminal/browser), since those have a
+    // different PID.
+    //
+    // WHY THIS MATTERS (6DOF translation bug): previously this required `foreground == preview &&
+    // isFocused`. As soon as the game's window took the foreground (which it does on launch / when
+    // fullscreen), the preview went inactive (isFocused=false) and WASD silently stopped feeding
+    // g_headPos — so interactive head translation looked completely dead, even though the underlying
+    // pose pipeline was fine (scripted head_pose_command.json poses are focus-independent, which is
+    // exactly why those worked while WASD didn't). Gating on "any window of our process is foreground"
+    // fixes that. Note: FH5 also binds W/S/A/D to throttle/brake/steer, so while the game window is
+    // focused these keys additionally drive the car — park the car when isolating head-only translation.
+    const HWND foregroundWindow = GetForegroundWindow();
+    bool previewWindowFocused = false;
+    if (foregroundWindow != nullptr) {
+        if (foregroundWindow == rt::g_session.hwnd) {
+            previewWindowFocused = rt::g_session.isFocused.load();
+        } else {
+            DWORD fgPid = 0;
+            GetWindowThreadProcessId(foregroundWindow, &fgPid);
+            previewWindowFocused = (fgPid != 0 && fgPid == GetCurrentProcessId());
+        }
+    }
+    if (previewWindowFocused) {
         const float moveSpeed = 3.0f;  // meters per second
         float deltaTime = (float)periodSec;
 
@@ -3167,10 +3194,23 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
         case DXGI_FORMAT_R32G32B32A32_TYPELESS: 
             typedFormat = DXGI_FORMAT_R32G32B32A32_FLOAT; 
             break;
-        case DXGI_FORMAT_R10G10B10A2_TYPELESS: 
-            typedFormat = DXGI_FORMAT_R10G10B10A2_UNORM; 
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+            typedFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
             break;
-        default: 
+        // Typed UNORM source submitted into an sRGB swapchain: the bytes are
+        // sRGB-ENCODED, so the SRV must be the matching _SRGB view to decode
+        // sRGB->linear on sample. The preview RTV re-encodes linear->sRGB, so
+        // without this decode we double-encode (blues boosted -> magenta reads
+        // as purple in the preview window).
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+            if (chain.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+                typedFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            break;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+            if (chain.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+                typedFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            break;
+        default:
             break; // Already typed or unknown
     }
     
@@ -3553,13 +3593,42 @@ static void blitD3D12ToPreview(rt::Session& s,
                 if (dstW < 1) dstW = 1;
                 if (dstH < 1) dstH = 1;
 
-                BITMAPINFO bmi = {};
-                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                bmi.bmiHeader.biWidth = (LONG)rtWidth;
-                bmi.bmiHeader.biHeight = -(LONG)rtHeight;  // top-down
-                bmi.bmiHeader.biPlanes = 1;
-                bmi.bmiHeader.biBitCount = 32;
-                bmi.bmiHeader.biCompression = BI_RGB;
+                // GDI 32bpp BI_RGB DIBs are interpreted as BGRA byte order. The
+                // readback buffer holds bytes in the channel order of the offscreen
+                // RT (rtDesc.Format / s.previewFormat), which mirrors the submitted
+                // swapchain's channel layout (see displayFormat selection in the
+                // present path). If the source is RGBA (R8G8B8A8) the readback bytes
+                // are R,G,B,A — GDI would swap R<->B and show pink as purple. Use
+                // BI_BITFIELDS with explicit RGBA masks so GDI reads the existing
+                // byte order correctly, with zero per-pixel cost. Genuinely-BGRA
+                // sources (B8G8R8A8) already match GDI's BGRA expectation, so they
+                // keep BI_RGB and are not double-swapped.
+                const bool srcIsRGBA =
+                    (rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                     rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                     rtDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS);
+
+                // BITMAPINFO only reserves one RGBQUAD; BI_BITFIELDS needs three
+                // DWORD masks immediately after the header, so use a wrapper struct.
+                struct { BITMAPINFOHEADER hdr; DWORD masks[3]; } bmiBF = {};
+                BITMAPINFO bmiRGB = {};
+                BITMAPINFO* pbmi = srcIsRGBA ? (BITMAPINFO*)&bmiBF : &bmiRGB;
+                BITMAPINFOHEADER& hdr = srcIsRGBA ? bmiBF.hdr : bmiRGB.bmiHeader;
+
+                hdr.biSize = sizeof(BITMAPINFOHEADER);
+                hdr.biWidth = (LONG)rtWidth;
+                hdr.biHeight = -(LONG)rtHeight;  // top-down
+                hdr.biPlanes = 1;
+                hdr.biBitCount = 32;
+                if (srcIsRGBA) {
+                    // RGBA byte order in memory -> little-endian DWORD 0xAABBGGRR
+                    hdr.biCompression = BI_BITFIELDS;
+                    bmiBF.masks[0] = 0x000000FF;  // Red   (byte 0)
+                    bmiBF.masks[1] = 0x0000FF00;  // Green (byte 1)
+                    bmiBF.masks[2] = 0x00FF0000;  // Blue  (byte 2)
+                } else {
+                    hdr.biCompression = BI_RGB;    // BGRA byte order matches GDI default
+                }
 
                 // Bilinear scaling for the StretchDIBits downscale path
                 SetStretchBltMode(hdc, HALFTONE);
@@ -3590,7 +3659,7 @@ static void blitD3D12ToPreview(rt::Session& s,
                 if (s.previewReadbackPitch == expectedPitch) {
                     StretchDIBits(hdc, dstX, dstY, dstW, dstH,
                                   0, 0, rtWidth, rtHeight,
-                                  mapped, &bmi, DIB_RGB_COLORS, SRCCOPY);
+                                  mapped, pbmi, DIB_RGB_COLORS, SRCCOPY);
                 } else {
                     // Copy rows with correct pitch to a contiguous buffer
                     std::vector<uint8_t> pixels(expectedPitch * rtHeight);
@@ -3600,7 +3669,7 @@ static void blitD3D12ToPreview(rt::Session& s,
                     }
                     StretchDIBits(hdc, dstX, dstY, dstW, dstH,
                                   0, 0, rtWidth, rtHeight,
-                                  pixels.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+                                  pixels.data(), pbmi, DIB_RGB_COLORS, SRCCOPY);
                 }
             }
             ReleaseDC(s.hwnd, hdc);
@@ -4507,6 +4576,18 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
                 break;
             case DXGI_FORMAT_R10G10B10A2_TYPELESS:
                 typedFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
+                break;
+            // Typed UNORM source in an sRGB swapchain: sample through the
+            // matching _SRGB view so the GPU decodes sRGB->linear (the preview
+            // RTV re-encodes); otherwise we double-encode and colors shift
+            // (magenta -> purple).
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+                if (chain.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+                    typedFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                break;
+            case DXGI_FORMAT_B8G8R8A8_UNORM:
+                if (chain.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+                    typedFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
                 break;
             default:
                 break; // Already typed or unknown
