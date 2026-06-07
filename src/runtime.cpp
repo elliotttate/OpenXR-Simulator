@@ -310,6 +310,12 @@ struct Session {
     ComPtr<ID3D12Resource> previewRT12;         // offscreen render target (replaces swapchain backbuffer)
     ComPtr<ID3D12Resource> previewReadback12;   // CPU-readable buffer for GDI blit
     UINT previewReadbackPitch{0};               // row pitch aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+    // Quad-layer readback (D3D12): the quad swapchain texture is copied here so its pixels can be GDI-painted
+    // over the eye preview. Lazily (re)created to the quad texture size; pitch aligned to 256.
+    ComPtr<ID3D12Resource> quadReadback12;
+    UINT quadReadbackPitch{0};
+    uint32_t quadReadbackW{0};
+    uint32_t quadReadbackH{0};
     ComPtr<ID3D12CommandAllocator> previewCmdAlloc;
     ComPtr<ID3D12GraphicsCommandList> previewCmdList;
     ComPtr<ID3D12Fence> previewFence;
@@ -4382,19 +4388,78 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 }
 
 // Render a quad layer as 2D overlay (supports both D3D11 and OpenGL)
+// GDI-paint a quad's RGBA pixels (top-down, qw x qh) over the already-painted eye preview, for the D3D12
+// path. The head-locked quad (view-space pose+size) is projected to NDC with a default FOV and placed into
+// each eye half of the letterboxed preview. Opaque (StretchDIBits) for now; per-pixel alpha is a TODO
+// (needs Msimg32/AlphaBlend or a CPU read-blend of the window). Position/size are live-tunable from the mod
+// (hudx/hudy/hudz/hudw), so the FOV constant here only sets the default scale.
+static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
+                             const uint8_t* rgba, uint32_t qw, uint32_t qh) {
+    if (!s.hwnd || !rgba || qw == 0 || qh == 0) return;
+    HDC hdc = GetDC(s.hwnd);
+    if (!hdc) return;
+
+    RECT cr{}; GetClientRect(s.hwnd, &cr);
+    const int clientW = cr.right - cr.left, clientH = cr.bottom - cr.top;
+    if (clientW <= 0 || clientH <= 0) { ReleaseDC(s.hwnd, hdc); return; }
+
+    // Mirror blitD3D12ToPreview's letterbox so the quad lands in the same client coords as the eyes.
+    rt::FitRect fit = rt::ComputeFitRect((int)s.previewWidth, (int)s.previewHeight, clientW, clientH);
+
+    // Default preview is side-by-side BothEyes (L | R). Composite into both halves.
+    const int eyeW = (int)fit.w / 2;
+    const int eyeH = (int)fit.h;
+    const int eyeOriginX[2] = { (int)fit.x, (int)fit.x + eyeW };
+    const int eyeOriginY = (int)fit.y;
+    if (eyeW < 2 || eyeH < 2) { ReleaseDC(s.hwnd, hdc); return; }
+
+    // Project the head-locked quad (view-space) to NDC. -z is forward.
+    const float z = quad->pose.position.z;
+    const float dist = (z < -0.01f) ? -z : 1.5f;
+    const float tanHx = 1.0f;                                  // ~90deg total H FOV (approx; tune via hudz/hudw)
+    const float tanHy = tanHx * ((float)eyeH / (float)eyeW);
+    const float cx = quad->pose.position.x / (dist * tanHx);
+    const float cy = quad->pose.position.y / (dist * tanHy);
+    const float hw = (quad->size.width  * 0.5f) / (dist * tanHx);
+    const float hh = (quad->size.height * 0.5f) / (dist * tanHy);
+    const float ndcL = cx - hw, ndcR = cx + hw, ndcT = cy + hh, ndcB = cy - hh;
+
+    // RGBA top-down DIB; BI_BITFIELDS so GDI reads R,G,B byte order (matches the eye-path masks).
+    struct { BITMAPINFOHEADER hdr; DWORD masks[3]; } bmi = {};
+    bmi.hdr.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.hdr.biWidth = (LONG)qw;
+    bmi.hdr.biHeight = -(LONG)qh;     // top-down
+    bmi.hdr.biPlanes = 1;
+    bmi.hdr.biBitCount = 32;
+    bmi.hdr.biCompression = BI_BITFIELDS;
+    bmi.masks[0] = 0x000000FF; bmi.masks[1] = 0x0000FF00; bmi.masks[2] = 0x00FF0000;
+
+    SetStretchBltMode(hdc, HALFTONE);
+    SetBrushOrgEx(hdc, 0, 0, nullptr);
+
+    for (int eye = 0; eye < 2; ++eye) {
+        const int px = eyeOriginX[eye] + (int)((ndcL * 0.5f + 0.5f) * eyeW);
+        const int py = eyeOriginY      + (int)((1.0f - (ndcT * 0.5f + 0.5f)) * eyeH);
+        const int pw = (int)((ndcR - ndcL) * 0.5f * eyeW);
+        const int ph = (int)((ndcT - ndcB) * 0.5f * eyeH);
+        if (pw < 1 || ph < 1) continue;
+        StretchDIBits(hdc, px, py, pw, ph, 0, 0, (int)qw, (int)qh,
+                      rgba, (BITMAPINFO*)&bmi, DIB_RGB_COLORS, SRCCOPY);
+    }
+
+    ReleaseDC(s.hwnd, hdc);
+    static int s_qlog = 0;
+    if (++s_qlog % 120 == 1) {
+        Logf("[SimXR] D3D12 quad composited: tex=%ux%u pose=(%.2f,%.2f,%.2f) size=(%.2f,%.2f) fit=(%.0f,%.0f,%.0f,%.0f)",
+             qw, qh, quad->pose.position.x, quad->pose.position.y, quad->pose.position.z,
+             quad->size.width, quad->size.height, fit.x, fit.y, fit.w, fit.h);
+    }
+}
+
 static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) {
     if (!quad) return;
     // D3D12 sessions use previewRT12, not previewSwapchain
     if (!s.previewSwapchain && !s.previewRT12) return;
-
-    if (s.usesD3D12) {
-        static bool warnedD3D12 = false;
-        if (!warnedD3D12) {
-            Log("[SimXR] WARNING: Quad layer rendering not implemented for D3D12 sessions");
-            warnedD3D12 = true;
-        }
-        return;
-    }
 
     auto it = rt::g_swapchains.find(quad->subImage.swapchain);
     if (it == rt::g_swapchains.end()) return;
@@ -4410,6 +4475,92 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     // Get texture index
     uint32_t texIdx = (chain.lastReleased != UINT32_MAX) ? chain.lastReleased :
                       (chain.lastAcquired != UINT32_MAX) ? chain.lastAcquired : 0;
+
+    // --- D3D12 quad compositing -----------------------------------------------------------------------
+    // The D3D12 preview is GDI-painted (eyes already on the window via blitD3D12ToPreview). Read the quad
+    // swapchain texture to CPU (reusing the idle preview cmd list/queue/fence), then GDI-paint it over the
+    // eyes at the quad's projected rect, in each eye half. Opaque (StretchDIBits) when the quad has no
+    // source-alpha flag; per-pixel AlphaBlend otherwise (for the real UI texture). Self-contained: does not
+    // touch the eye composite path.
+    if (s.usesD3D12) {
+        if (texIdx >= chain.images12.size() || !chain.images12[texIdx]) return;
+        if (chain.imageStates12.size() <= texIdx) return;
+        if (!s.previewCmdList || !s.previewCmdAlloc || !s.previewQueue12 || !s.previewFence || !s.hwnd) return;
+
+        const uint32_t qw = chain.width, qh = chain.height;
+        const UINT qpitch = (qw * 4 + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+
+        // Lazily (re)create the quad readback buffer.
+        if (!s.quadReadback12 || s.quadReadbackW != qw || s.quadReadbackH != qh) {
+            D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC bd = {};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = (UINT64)qpitch * qh;
+            bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            s.quadReadback12.Reset();
+            if (FAILED(s.d3d12Device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(s.quadReadback12.GetAddressOf())))) {
+                Log("[SimXR] quad: readback CreateCommittedResource failed");
+                return;
+            }
+            s.quadReadbackPitch = qpitch; s.quadReadbackW = qw; s.quadReadbackH = qh;
+        }
+
+        // Copy quad texture -> readback (reusing the preview cmd list; it is idle after blitD3D12ToPreview).
+        if (s.previewFence->GetCompletedValue() < s.previewFenceValue - 1) {
+            s.previewFence->SetEventOnCompletion(s.previewFenceValue - 1, s.previewFenceEvent);
+            WaitForSingleObject(s.previewFenceEvent, 1000);
+        }
+        if (FAILED(s.previewCmdAlloc->Reset())) return;
+        if (FAILED(s.previewCmdList->Reset(s.previewCmdAlloc.Get(), nullptr))) return;
+
+        ID3D12Resource* quadTex = chain.images12[texIdx].Get();
+        auto& quadState = chain.imageStates12[texIdx];
+        auto barrier12 = [&](ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+            D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = res; b.Transition.StateBefore = before; b.Transition.StateAfter = after;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            s.previewCmdList->ResourceBarrier(1, &b);
+        };
+        const D3D12_RESOURCE_STATES qstate = quadState;
+        if (qstate != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier12(quadTex, qstate, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = s.quadReadback12.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Footprint.Format = (chain.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) ? DXGI_FORMAT_R8G8B8A8_UNORM : chain.format;
+        dst.PlacedFootprint.Footprint.Width = qw; dst.PlacedFootprint.Footprint.Height = qh;
+        dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = qpitch;
+        D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = quadTex;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+        s.previewCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        if (qstate != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier12(quadTex, D3D12_RESOURCE_STATE_COPY_SOURCE, qstate);
+        s.previewCmdList->Close();
+        ID3D12CommandList* lists[] = { s.previewCmdList.Get() };
+        s.previewQueue12->ExecuteCommandLists(1, lists);
+        s.previewQueue12->Signal(s.previewFence.Get(), s.previewFenceValue);
+        if (s.previewFence->GetCompletedValue() < s.previewFenceValue) {
+            s.previewFence->SetEventOnCompletion(s.previewFenceValue, s.previewFenceEvent);
+            WaitForSingleObject(s.previewFenceEvent, 1000);
+        }
+        s.previewFenceValue++;
+
+        void* qmapped = nullptr;
+        D3D12_RANGE rr = { 0, (SIZE_T)qpitch * qh };
+        if (FAILED(s.quadReadback12->Map(0, &rr, &qmapped)) || !qmapped) return;
+
+        // Pack the quad pixels into a contiguous top-down RGBA buffer for GDI.
+        std::vector<uint8_t> qpix((size_t)qw * qh * 4);
+        for (uint32_t y = 0; y < qh; ++y) {
+            memcpy(qpix.data() + (size_t)y * qw * 4, (const uint8_t*)qmapped + (size_t)y * qpitch, (size_t)qw * 4);
+        }
+        D3D12_RANGE noWrite = { 0, 0 };
+        s.quadReadback12->Unmap(0, &noWrite);
+
+        compositeQuadGDI(s, quad, qpix.data(), qw, qh);
+        return;
+    }
 
     static int quadLogCount = 0;
     bool shouldLog = (++quadLogCount % 60 == 1);
