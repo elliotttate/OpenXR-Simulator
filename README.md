@@ -14,8 +14,9 @@ A lightweight OpenXR runtime that enables VR applications to run in a desktop wi
 - **Desktop VR Preview** - Run VR applications in a resizable desktop window with side-by-side stereo view
 - **Mouse & Keyboard Controls** - Navigate the virtual space using standard input devices
 - **Proper sRGB Handling** - Automatic gamma correction for accurate color reproduction
-- **Unity & Unreal Compatible** - Tested with Unity's OpenXR plugin and Unreal Engine (via UEVR)
+- **Unity, Unreal & Godot Compatible** - Tested with Unity's OpenXR plugin, Unreal Engine (via UEVR), and Godot's OpenXR plugin
 - **Steam Overlay Compatible** - D3D12 uses GDI-based rendering to avoid hook conflicts with Steam overlay
+- **Physics-Based Locomotion** - IJKL drives the left controller thumbstick for engines with locomotion bindings (e.g. Godot XRTools), preserving wall collision and teleport triggers; WASD remains free-fly for simple scenes
 - **Minimal Dependencies** - Only requires Windows and a compatible GPU
 - **Easy Setup** - Simple PowerShell scripts for registration/unregistration
 
@@ -45,14 +46,24 @@ cd C:\Path\To\OpenXR-Simulator\scripts
 
 Once registered, any OpenXR application will automatically use the simulator:
 
-1. Launch your VR application (e.g., Unity project with OpenXR)
+1. Launch your VR application (e.g., Unity project with OpenXR, Godot with OpenXR plugin)
 2. A desktop window will appear showing left/right eye views
 3. Use the following controls:
    - **Mouse**: Look around (hold right-click)
    - **WASD**: Move forward/backward/strafe
    - **Q/E**: Move up/down
+   - **IJKL**: Left controller thumbstick (for physics-based locomotion in engines like Godot)
+   - **Arrow Keys**: Right controller thumbstick (typically turn/teleport)
    - **Shift**: Move faster
+   - **M**: Toggle automatic controller animation
    - **ESC**: Release mouse capture
+
+#### Godot-Specific Notes
+
+- Use the **OpenGL3** renderer (Vulkan is not supported)
+- Start the project with the default main scene (e.g., `demo_staging.tscn`) to ensure the `StartXR` node is present
+- Use **IJKL** (not WASD) to drive Godot's XRTools `MovementDirect` physics-based locomotion (wall collision, teleport areas). WASD is free-fly and will clip through walls in Godot
+- The session stays in `FOCUSED` state so input actions remain queryable even when clicking the preview window
 
 ### Uninstallation
 
@@ -100,12 +111,16 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 - ✅ D3D11 graphics binding (`XR_KHR_D3D11_enable`)
 - ✅ D3D12 graphics binding (`XR_KHR_D3D12_enable`)
 - ✅ OpenGL graphics binding (`XR_KHR_opengl_enable`)
+- ✅ OpenGL stereo array swapchains (`GL_TEXTURE_2D_ARRAY`, used by Godot)
 - ✅ Win32 time conversion (`XR_KHR_win32_convert_performance_counter_time`)
 - ✅ Multiple swapchain formats (sRGB, UNORM, HDR, typeless, depth)
 - ✅ Mutable format swapchains (typeless backing for sRGB/non-sRGB views)
 - ✅ Stereo rendering with configurable FOV
 - ✅ Reference space tracking (LOCAL, STAGE, VIEW)
-- ✅ Basic action system for input
+- ✅ VIEW space head tracking via `xrLocateSpace` (required by Godot's XRCamera3D)
+- ✅ Interaction profile passthrough (`xrSuggestInteractionProfileBindings` → `xrGetCurrentInteractionProfile`)
+- ✅ Action state for Vector2f ("thumbstick", "joystick", "move", "turn", "primary", "secondary")
+- ✅ WASD free-fly head movement + IJKL left thumbstick (original design)
 - ✅ Screenshot capture (D3D11, D3D12, and OpenGL)
 
 ### Limitations

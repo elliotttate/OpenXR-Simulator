@@ -272,12 +272,27 @@ static LUID g_adapterLuid = {};
 static bool g_adapterLuidSet = false;
 
 // Global persistent window that survives session creation/destruction
+// Use SRWLOCK instead of std::mutex for robustness across DLL load/unload:
+// std::mutex can deadlock if its memory is corrupted during DLL reload,
+// while SRWLOCK is a lightweight kernel-backed primitive that tolerates
+// re-initialization gracefully.
 static HWND g_persistentWindow = nullptr;
-static std::mutex g_windowMutex;
+static SRWLOCK g_windowLock = SRWLOCK_INIT;
 static ComPtr<IDXGISwapChain1> g_persistentSwapchain;
 static UINT g_persistentWidth = 1920;
 static UINT g_persistentHeight = 540;
 static bool g_windowClassRegistered = false;
+
+// RAII wrapper for SRWLOCK exclusive access.
+// Replaces std::lock_guard<std::mutex> for g_windowLock to avoid std::mutex
+// deadlock issues across DLL load/unload cycles.
+struct SRWLockGuard {
+    SRWLOCK* m_lock;
+    explicit SRWLockGuard(SRWLOCK& lock) : m_lock(&lock) { AcquireSRWLockExclusive(m_lock); }
+    ~SRWLockGuard() { ReleaseSRWLockExclusive(m_lock); }
+    SRWLockGuard(const SRWLockGuard&) = delete;
+    SRWLockGuard& operator=(const SRWLockGuard&) = delete;
+};
 
 // Latest XR swapchain (per-eye) source dimensions, populated by presentProjection.
 // Used by menu/keyboard resize callbacks to compute a target window size.
@@ -342,7 +357,8 @@ struct Session {
     // 0 means "not yet known" — use an initial sensible size for the first frame.
     std::atomic<UINT> clientWidth{0};
     std::atomic<UINT> clientHeight{0};
-    std::mutex previewMutex;
+    // SRWLOCK instead of std::mutex for robustness across DLL reload cycles.
+    SRWLOCK previewLock{SRWLOCK_INIT};
 };
 
 struct Swapchain {
@@ -510,6 +526,11 @@ static ControllerState g_rightController = {
 // Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
 static std::unordered_map<XrSpace, int> g_controllerSpaces;
 
+// Track the VIEW reference space handle so xrLocateSpace can return the head pose.
+// Godot's OpenXR module uses xrLocateSpace(view_space, play_space) to get the head
+// center transform — NOT xrLocateViews. Without this, the XRCamera3D stays at origin.
+static XrSpace g_viewSpace = nullptr;
+
 // Map XrPath to path string for controller detection
 static std::unordered_map<XrPath, std::string> g_pathStrings;
 
@@ -518,6 +539,11 @@ static std::unordered_map<XrAction, std::string> g_actionNames;
 
 // Map XrAction to which hand it's bound to (0=both/any, 1=left, 2=right)
 static std::unordered_map<XrAction, int> g_actionHand;
+
+// Current interaction profile path (set by xrSuggestInteractionProfileBindings,
+// returned by xrGetCurrentInteractionProfile). Many OpenXR clients (e.g. Godot)
+// won't query action state until this is non-null.
+static XrPath g_currentInteractionProfile = XR_NULL_PATH;
 
 // Time tracking for velocity calculation
 static XrTime g_lastFrameTime = 0;
@@ -529,16 +555,22 @@ static void GetControllerPose(const ControllerState& ctrl, XrPosef* outPose) {
     float totalPitch = g_headPitch + ctrl.pitchOffset;
     outPose->orientation = QuatFromYawPitch(totalYaw, totalPitch);
 
-    // Controller position = head position + rotated offset
-    // Rotate the offset by head yaw only (not pitch) for natural hand movement
-    XrQuaternionf headYawQ = QuatFromYawPitch(g_headYaw, 0.0f);
-
-    // Simple rotation of offset by head yaw
+    // Controller position = head position + rotated offset.
+    // The offset is in head-local space (x=right, y=up, z=forward-axis where
+    // forward is -Z). We must rotate it by the SAME yaw as the head so the
+    // hands stay relative to where the player is looking.
+    //
+    // Standard right-handed Y-axis rotation R(yaw) applied to (x, z):
+    //   x' =  x*cos(yaw) + z*sin(yaw)
+    //   z' = -x*sin(yaw) + z*cos(yaw)
+    // The previous code used the transposed (inverse) matrix, which spun the
+    // hands in the opposite direction to the camera — hence "hands rotate
+    // the wrong way when looking around".
     float cosY = cosf(g_headYaw);
     float sinY = sinf(g_headYaw);
-    outPose->position.x = g_headPos.x + ctrl.posOffset.x * cosY - ctrl.posOffset.z * sinY;
+    outPose->position.x = g_headPos.x + ctrl.posOffset.x * cosY + ctrl.posOffset.z * sinY;
     outPose->position.y = g_headPos.y + ctrl.posOffset.y;
-    outPose->position.z = g_headPos.z + ctrl.posOffset.x * sinY + ctrl.posOffset.z * cosY;
+    outPose->position.z = g_headPos.z - ctrl.posOffset.x * sinY + ctrl.posOffset.z * cosY;
 }
 
 // Helper function to create quaternion from yaw and pitch
@@ -846,10 +878,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 Log("[SimXR] WndProc: WM_ACTIVATE -> unfocused");
                 rt::g_mouseCapture = false;  // Release mouse capture when window loses focus
                 ReleaseCapture();
-                // Push VISIBLE state if we were FOCUSED
-                if (rt::g_session.state == XR_SESSION_STATE_FOCUSED) {
-                    rt::PushState(rt::g_session.handle, XR_SESSION_STATE_VISIBLE);
-                }
+                // Keep session in FOCUSED state even when preview window loses focus.
+                // The preview window and the host (Godot/Unity) window are in the same
+                // process — if we demote to VISIBLE here, the host stops processing XR
+                // input actions whenever the user clicks the preview window to look around.
+                // As long as any window of our process is foreground, input should work.
+                // (Previously: demoted to VISIBLE here, which broke input after clicking preview)
             }
             return 0;
         case WM_LBUTTONDOWN:
@@ -1452,7 +1486,7 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
         // The OpenXR loader may unload our DLL after this call.
         // If the window stays alive, its WndProc points to unloaded code = crash.
         {
-            std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+            rt::SRWLockGuard lock(rt::g_windowLock);
             if (rt::g_persistentWindow) {
                 Log("[SimXR] xrDestroyInstance: Destroying preview window");
                 DestroyWindow(rt::g_persistentWindow);
@@ -1471,6 +1505,11 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
             rt::g_windowClassRegistered = false;
             Log("[SimXR] xrDestroyInstance: Window class unregistered");
         }
+
+        // Reset Godot-support globals so a new instance starts clean
+        rt::g_viewSpace = nullptr;
+        rt::g_currentInteractionProfile = XR_NULL_PATH;
+
         Log("[SimXR] xrDestroyInstance: Window destroyed for safe DLL unload");
     }
 
@@ -1663,7 +1702,7 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     // Transfer window and swapchain to global persistent storage
     // Unity likes to create/destroy sessions rapidly for compatibility checks
     {
-        std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+        rt::SRWLockGuard lock(rt::g_windowLock);
         if (rt::g_session.hwnd && !rt::g_persistentWindow) {
             rt::g_persistentWindow = rt::g_session.hwnd;
             rt::g_persistentSwapchain = rt::g_session.previewSwapchain;
@@ -1996,8 +2035,11 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
             chain.imagesGL.push_back(tex);
             Logf("[SimXR] Created GL texture[%u]: %u (format=0x%X, valid=%d)", i, tex, glInternalFormat, isValid);
 
-            // DEBUG: Immediately read back the texture to verify it has the correct content
-            if (!isDepthFormat && EnsureGLFramebufferFuncs()) {
+            // DEBUG: Immediately read back the texture to verify it has the correct content.
+            // Only valid for 2D textures — glFramebufferTexture2D with GL_TEXTURE_2D target
+            // is illegal for GL_TEXTURE_2D_ARRAY and would leave a stale GL_INVALID_OPERATION
+            // error that pollutes the next iteration's glGetError() check.
+            if (chain.arraySize <= 1 && !isDepthFormat && EnsureGLFramebufferFuncs()) {
                 GLuint verifyFBO = 0;
                 g_glGenFramebuffers(1, &verifyFBO);
                 g_glBindFramebuffer(GL_FRAMEBUFFER, verifyFBO);
@@ -2014,6 +2056,9 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
 
                 g_glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 g_glDeleteFramebuffers(1, &verifyFBO);
+                // Drain any GL errors left by the readback path so they don't leak
+                // into the next iteration's glGetError() check.
+                while (glGetError() != GL_NO_ERROR) {}
             }
         }
 
@@ -2251,6 +2296,13 @@ static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const 
             // Check if texture is valid
             GLboolean isValidTex = glIsTexture(glTex);
 
+            // Read a single pixel to see what's there.
+            // NOTE: This debug block uses GL_TEXTURE_2D target APIs which are ILLEGAL
+            // for GL_TEXTURE_2D_ARRAY textures (arraySize > 1). Calling them on an
+            // array texture produces GL_INVALID_OPERATION and can crash AMD drivers.
+            // Skip the entire debug block for array textures to avoid corrupting GL state.
+            const bool isArrayTex = (ch.arraySize > 1);
+
             // First, check what FBO is currently bound (might be game's FBO)
             GLint currentBoundFBO = 0;
             glGetIntegerv(0x8CA6, &currentBoundFBO);  // GL_FRAMEBUFFER_BINDING = 0x8CA6
@@ -2263,8 +2315,10 @@ static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const 
 
             GLenum glError1 = glGetError();
 
-            // Method 1: Read via new FBO attached to swapchain texture
-            if (EnsureGLFramebufferFuncs()) {
+            if (isArrayTex) {
+                Logf("[SimXR]   At release: tex=%u (array texture, size=%ux%u arraySize=%u) - skipping 2D-only debug readback",
+                     glTex, ch.width, ch.height, ch.arraySize);
+            } else if (EnsureGLFramebufferFuncs()) {
                 GLuint readFBO = 0;
                 g_glGenFramebuffers(1, &readFBO);
                 g_glBindFramebuffer(GL_FRAMEBUFFER, readFBO);
@@ -2478,13 +2532,15 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
     Logf("[SimXR] xrBeginSession called (session=%llu)", (unsigned long long)s);
     Log("[SimXR] Session started - moving to SYNCHRONIZED/VISIBLE states");
     Log("[SimXR] ============================================");
-    rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
+    rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED);
     rt::PushState(s, XR_SESSION_STATE_VISIBLE);
-    // Only push FOCUSED if window is actually active/focused
-    if (rt::g_session.hwnd && rt::g_session.isFocused) {
-        rt::PushState(s, XR_SESSION_STATE_FOCUSED);
-    }
-    return XR_SUCCESS; 
+    // Always push FOCUSED — this is a simulator, not a real HMD. Godot only
+    // queries action states (xrGetActionState*) while the session is FOCUSED,
+    // so without this the teleport trigger, grab, etc. never fire. The preview
+    // window may not exist yet at this point, so we cannot rely on WM_ACTIVATE.
+    rt::PushState(s, XR_SESSION_STATE_FOCUSED);
+    rt::g_session.isFocused = true;
+    return XR_SUCCESS;
 }
 static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) { Log("[SimXR] xrEndSession"); rt::PushState(s, XR_SESSION_STATE_STOPPING); rt::PushState(s, XR_SESSION_STATE_IDLE); return XR_SUCCESS; }
 static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) { rt::PushState(s, XR_SESSION_STATE_EXITING); return XR_SUCCESS; }
@@ -2529,10 +2585,10 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
         const float moveSpeed = 3.0f;  // meters per second
         float deltaTime = (float)periodSec;
 
+        // WASD: free-fly head movement
         XrQuaternionf headQ = rt::QuatFromYawPitch(rt::g_headYaw, rt::g_headPitch);
         XrVector3f fwd = rt::RotateVectorByQuaternion(headQ, XrVector3f{0.0f, 0.0f, -1.0f});
         XrVector3f right = rt::RotateVectorByQuaternion(headQ, XrVector3f{1.0f, 0.0f, 0.0f});
-
         if (GetAsyncKeyState('W') & 0x8000) {
             rt::g_headPos.x += fwd.x * moveSpeed * deltaTime;
             rt::g_headPos.y += fwd.y * moveSpeed * deltaTime;
@@ -2564,7 +2620,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
         // Automatic Controller Animation Mode
         // ========================================
         // Press 'M' to toggle automatic motion - controller moves in a pattern
-        static bool autoMotionEnabled = true;  // Start with auto motion ON for testing
+        static bool autoMotionEnabled = false;  // Default OFF - controllers stay relative to head
         static bool mKeyWasPressed = false;
         static float animTime = 0.0f;
 
@@ -2916,7 +2972,7 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
 
     // Try to adopt a persistent window from a previous DLL load
     {
-        std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+        rt::SRWLockGuard lock(rt::g_windowLock);
         if (rt::g_persistentWindow && IsWindow(rt::g_persistentWindow)) {
             s.hwnd = rt::g_persistentWindow;
             // After DLL reload, the old WndProc pointer is invalid
@@ -2945,7 +3001,7 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
     s.hwnd = CreateWindowExW(0, L"OpenXR Simulator", L"OpenXR Simulator (Mouse Look + WASD)", WS_OVERLAPPEDWINDOW,
                              100, 100, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!s.hwnd) {
-        Log("[SimXR] Failed to create preview window!");
+        Logf("[SimXR] Failed to create preview window! GetLastError=%u", GetLastError());
         return;
     }
     ShowWindow(s.hwnd, SW_SHOW);
@@ -2962,7 +3018,7 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
     s.clientHeight.store(initialClientH);
 
     {
-        std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+        rt::SRWLockGuard lock(rt::g_windowLock);
         rt::g_persistentWindow = s.hwnd;
         Log("[SimXR] Saved new window to persistent storage");
     }
@@ -2985,7 +3041,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
     // still be cached against the persistent HWND — adopt it so we don't try
     // to create a second swapchain for the same window (which DXGI forbids).
     if (!s.usesD3D12 && !s.previewSwapchain) {
-        std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+        rt::SRWLockGuard lock(rt::g_windowLock);
         if (rt::g_persistentSwapchain) {
             s.previewSwapchain = rt::g_persistentSwapchain;
             DXGI_SWAP_CHAIN_DESC1 d{};
@@ -3015,7 +3071,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
                 s.previewWidth = width;
                 s.previewHeight = height;
                 {
-                    std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+                    rt::SRWLockGuard lock(rt::g_windowLock);
                     rt::g_persistentSwapchain = s.previewSwapchain;
                     rt::g_persistentWidth = width;
                     rt::g_persistentHeight = height;
@@ -3028,16 +3084,28 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         // Recreate from scratch (format changed, first call, or ResizeBuffers failed)
         s.previewSwapchain.Reset();
         {
-            std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+            rt::SRWLockGuard lock(rt::g_windowLock);
             rt::g_persistentSwapchain.Reset();
         }
         s.previewWidth = width;
         s.previewHeight = height;
         s.previewFormat = format;
 
+        if (!s.d3d11Device) {
+            Log("[SimXR] ensurePreviewSized: ERROR - d3d11Device is null!");
+            return;
+        }
+        if (!s.hwnd) {
+            Log("[SimXR] ensurePreviewSized: ERROR - hwnd is null!");
+            return;
+        }
+
         ComPtr<IDXGIDevice> dxgiDev; s.d3d11Device.As(&dxgiDev);
+        if (!dxgiDev) return;
         ComPtr<IDXGIAdapter> adapter; dxgiDev->GetAdapter(adapter.GetAddressOf());
+        if (!adapter) return;
         ComPtr<IDXGIFactory2> factory; adapter->GetParent(IID_PPV_ARGS(factory.GetAddressOf()));
+        if (!factory) return;
         DXGI_SWAP_CHAIN_DESC1 desc{};
         desc.Format = format;
         desc.Width = width;
@@ -3053,7 +3121,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         if (FAILED(hr)) {
             Logf("[SimXR] ERROR: Failed to create DX11 preview swapchain with format %d", format);
         } else {
-            std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+            rt::SRWLockGuard lock(rt::g_windowLock);
             rt::g_persistentSwapchain = s.previewSwapchain;
             rt::g_persistentWidth = width;
             rt::g_persistentHeight = height;
@@ -3729,7 +3797,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
     rt::g_sourceWidth.store(width);
     rt::g_sourceHeight.store(height);
     {
-        std::lock_guard<std::mutex> lock(s.previewMutex);
+        rt::SRWLockGuard lock(s.previewLock);
 
         // OpenGL preview path - read pixels from GL textures and display via D3D11
         if (s.usesOpenGL) {
@@ -3784,17 +3852,60 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 }
             }
 
-            // Read left eye pixels using glGetTexImage
-            if (leftTex != 0) {
-                glBindTexture(GL_TEXTURE_2D, leftTex);
-                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, leftPixels.data());
+            // Read pixel data from GL textures into CPU buffers.
+            // IMPORTANT: Godot (and other engines) may request arraySize=2 swapchains,
+            // which are GL_TEXTURE_2D_ARRAY textures. Binding an array texture to
+            // GL_TEXTURE_2D and calling glGetTexImage(GL_TEXTURE_2D, ...) is illegal
+            // and crashes AMD drivers. We must:
+            //   - For array textures: bind to GL_TEXTURE_2D_ARRAY, read ALL slices
+            //     in one glGetTexImage call (buffer = w*h*arraySize*4), then split.
+            //   - For 2D textures: use the original GL_TEXTURE_2D path.
+            // Godot puts left eye in slice 0, right eye in slice 1 of the SAME
+            // swapchain — so chL and chRPtr point to the same swapchain, and
+            // chRPtr->imagesGL[idx] == chL.imagesGL[idx] (same GL texture name).
+
+            const bool isArrayTexture = (chL.arraySize > 1);
+
+            if (isArrayTexture) {
+                // ---- Array texture path: read all slices at once ----
+                GLuint tex = leftTex;  // chL and chRPtr share the same texture
+                if (tex == 0) tex = rightTex;
+                if (tex != 0) {
+                    const uint32_t arraySize = chL.arraySize;
+                    const uint32_t sliceBytes = width * height * 4;
+                    std::vector<uint8_t> allPixels((size_t)sliceBytes * arraySize);
+
+                    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+                    glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, GL_UNSIGNED_BYTE, allPixels.data());
+                    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+
+                    // Slice 0 -> left eye, slice 1 -> right eye (if present)
+                    if (arraySize >= 1) {
+                        memcpy(leftPixels.data(), allPixels.data(), sliceBytes);
+                    }
+                    if (arraySize >= 2) {
+                        memcpy(rightPixels.data(), allPixels.data() + sliceBytes, sliceBytes);
+                    }
+                }
+            } else {
+                // ---- Regular 2D texture path (original behavior) ----
+                // Read left eye pixels using glGetTexImage
+                if (leftTex != 0) {
+                    glBindTexture(GL_TEXTURE_2D, leftTex);
+                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, leftPixels.data());
+                    glBindTexture(GL_TEXTURE_2D, 0);
+                }
+
+                // Read right eye (may be a separate swapchain in non-array mode)
+                if (rightTex != 0 && rightTex != leftTex) {
+                    glBindTexture(GL_TEXTURE_2D, rightTex);
+                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, rightPixels.data());
+                    glBindTexture(GL_TEXTURE_2D, 0);
+                }
             }
 
-            // Read right eye pixels
-            if (rightTex != 0) {
-                glBindTexture(GL_TEXTURE_2D, rightTex);
-                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, rightPixels.data());
-            }
+            // Drain any GL errors so they don't propagate to the app
+            while (glGetError() != GL_NO_ERROR) {}
 
             // Flip images vertically - OpenGL has Y=0 at bottom, D3D expects Y=0 at top
             auto flipImageVertically = [](std::vector<uint8_t>& pixels, uint32_t width, uint32_t height) {
@@ -5131,7 +5242,14 @@ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrRefe
     if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
     static uintptr_t nextSpace = 100;
     *space = (XrSpace)(nextSpace++);
-    Logf("[SimXR] xrCreateReferenceSpace: type=%d space=%p", info->referenceSpaceType, *space);
+    // XR_REFERENCE_SPACE_TYPE_VIEW == 1. Godot locates the head by calling
+    // xrLocateSpace(view_space, play_space, ...) — we must remember the handle.
+    if (info->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_VIEW) {
+        rt::g_viewSpace = *space;
+        Logf("[SimXR] xrCreateReferenceSpace: VIEW space=%p (head tracking)", *space);
+    } else {
+        Logf("[SimXR] xrCreateReferenceSpace: type=%d space=%p", info->referenceSpaceType, *space);
+    }
     return XR_SUCCESS;
 }
 
@@ -5179,6 +5297,22 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
             location->locationFlags = 0;
             location->pose.orientation = {0, 0, 0, 1};
             location->pose.position = {0, 0, 0};
+        }
+    } else if (space == rt::g_viewSpace) {
+        // Godot's OpenXR module calls xrLocateSpace(view_space, play_space, ...)
+        // to get the head center transform for XRCamera3D. Return the simulated
+        // head pose (g_headPos + orientation) so the camera actually moves.
+        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                  XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                                  XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                                  XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+        location->pose.orientation = rt::QuatFromYawPitchRoll(rt::g_headYaw, rt::g_headPitch, rt::g_headRoll);
+        location->pose.position = rt::g_headPos;
+        static int headLogCount = 0;
+        if (++headLogCount % 90 == 1) {
+            Logf("[SimXR] xrLocateSpace: VIEW(head) pos=(%.2f,%.2f,%.2f) yaw=%.2f pitch=%.2f",
+                 rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z,
+                 rt::g_headYaw, rt::g_headPitch);
         }
     } else {
         // Default for non-controller spaces (identity pose)
@@ -5290,6 +5424,10 @@ static XrResult XRAPI_PTR xrSuggestInteractionProfileBindings_runtime(XrInstance
     // interactionProfile is an XrPath (integer), not a C-string
     Logf("[SimXR] xrSuggestInteractionProfileBindings: profile=0x%llx",
          (unsigned long long)bindings->interactionProfile);
+    // Save the suggested profile so xrGetCurrentInteractionProfile can return it.
+    // Many runtimes (e.g. Godot's OpenXR module) won't query action state until a
+    // non-null interaction profile is reported.
+    rt::g_currentInteractionProfile = bindings->interactionProfile;
     return XR_SUCCESS;
 }
 
@@ -5409,7 +5547,8 @@ static XrResult XRAPI_PTR xrGetActionStateVector2f_runtime(XrSession, const XrAc
     if (nameIt != rt::g_actionNames.end()) {
         const std::string& name = nameIt->second;
         if (ActionNameMatches(name, "thumbstick") || ActionNameMatches(name, "joystick") ||
-            ActionNameMatches(name, "move") || ActionNameMatches(name, "turn")) {
+            ActionNameMatches(name, "move") || ActionNameMatches(name, "turn") ||
+            ActionNameMatches(name, "primary") || ActionNameMatches(name, "secondary")) {
             state->currentState = ctrl->thumbstick;
         } else {
             state->currentState = {0.0f, 0.0f};
@@ -5455,7 +5594,14 @@ static XrResult XRAPI_PTR xrPathToString_runtime(XrInstance, XrPath path, uint32
 static XrResult XRAPI_PTR xrGetCurrentInteractionProfile_runtime(XrSession, XrPath topLevelUserPath, XrInteractionProfileState* interactionProfile) {
     if (!interactionProfile) return XR_ERROR_VALIDATION_FAILURE;
     interactionProfile->type = XR_TYPE_INTERACTION_PROFILE_STATE;
-    interactionProfile->interactionProfile = XR_NULL_PATH;
+    interactionProfile->interactionProfile = rt::g_currentInteractionProfile;
+    // Throttle: Godot calls this every frame, so only log occasionally
+    static int profileLogCount = 0;
+    if (++profileLogCount % 300 == 1) {
+        Logf("[SimXR] xrGetCurrentInteractionProfile: topLevelUserPath=%llu -> profile=0x%llx",
+             (unsigned long long)topLevelUserPath,
+             (unsigned long long)rt::g_currentInteractionProfile);
+    }
     return XR_SUCCESS;
 }
 
