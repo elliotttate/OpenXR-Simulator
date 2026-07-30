@@ -130,11 +130,13 @@ static void EnsureLogFile() {
     if (len > 0 && len < sizeof(base)) {
         snprintf(path, sizeof(path), "%s\\OpenXR-Simulator", base);
         CreateDirectoryA(path, nullptr);
-        snprintf(path, sizeof(path), "%s\\OpenXR-Simulator\\openxr_simulator.log", base);
+        snprintf(path, sizeof(path), "%s\\OpenXR-Simulator\\openxr_simulator.%lu.log", base, GetCurrentProcessId());
     } else {
-        snprintf(path, sizeof(path), ".\\openxr_simulator.log");
+        snprintf(path, sizeof(path), ".\\openxr_simulator.%lu.log", GetCurrentProcessId());
     }
-    fopen_s(&g_LogFile, path, "a");
+    // Per-process and shared: fopen_s is exclusive, so a host that keeps a child
+    // process alive (launcher + game) silently loses the child's log entirely.
+    g_LogFile = _fsopen(path, "a", _SH_DENYWR);
 }
 static void Log(const char* msg) {
     OutputDebugStringA(msg);
@@ -515,6 +517,11 @@ static std::unordered_map<XrSpace, int> g_controllerSpaces;
 
 // Map XrPath to path string for controller detection
 static std::unordered_map<XrPath, std::string> g_pathStrings;
+
+// Interaction profiles the app suggested bindings for, in suggestion order, and
+// the one xrGetCurrentInteractionProfile reports back once action sets attach.
+static std::vector<XrPath> g_suggestedProfiles;
+static XrPath g_activeProfile = XR_NULL_PATH;
 
 // Map XrAction to action name for input mapping
 static std::unordered_map<XrAction, std::string> g_actionNames;
@@ -1699,6 +1706,7 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     rt::g_session.previewWidth = 1920;
     rt::g_session.previewHeight = 540;
     rt::g_session.isFocused = false;
+    rt::g_activeProfile = XR_NULL_PATH;  // re-bound by the next xrAttachSessionActionSets
     Log("[SimXR] xrDestroySession: SUCCESS");
     return XR_SUCCESS;
 }
@@ -5294,12 +5302,41 @@ static XrResult XRAPI_PTR xrSuggestInteractionProfileBindings_runtime(XrInstance
     // interactionProfile is an XrPath (integer), not a C-string
     Logf("[SimXR] xrSuggestInteractionProfileBindings: profile=0x%llx",
          (unsigned long long)bindings->interactionProfile);
+    if (bindings->interactionProfile != XR_NULL_PATH) {
+        auto& list = rt::g_suggestedProfiles;
+        if (std::find(list.begin(), list.end(), bindings->interactionProfile) == list.end()) {
+            list.push_back(bindings->interactionProfile);
+        }
+    }
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrAttachSessionActionSets_runtime(XrSession, const XrSessionActionSetsAttachInfo* info) {
     if (!info) return XR_ERROR_VALIDATION_FAILURE;
     Logf("[SimXR] xrAttachSessionActionSets: count=%u", info->countActionSets);
+
+    // The synthetic controllers behave like Touch, so prefer that profile.
+    for (XrPath p : rt::g_suggestedProfiles) {
+        auto it = rt::g_pathStrings.find(p);
+        if (it != rt::g_pathStrings.end() && it->second.find("oculus/touch") != std::string::npos) {
+            rt::g_activeProfile = p;
+            break;
+        }
+    }
+    if (rt::g_activeProfile == XR_NULL_PATH && !rt::g_suggestedProfiles.empty()) {
+        rt::g_activeProfile = rt::g_suggestedProfiles.front();
+    }
+    if (rt::g_activeProfile != XR_NULL_PATH) {
+        auto it = rt::g_pathStrings.find(rt::g_activeProfile);
+        Logf("[SimXR] xrAttachSessionActionSets: active interaction profile = %s", it != rt::g_pathStrings.end() ? it->second.c_str() : "<unknown>");
+
+        XrEventDataInteractionProfileChanged e{ XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED };
+        e.session = rt::g_session.handle;
+        XrEventDataBuffer buf{};
+        buf.type = XR_TYPE_EVENT_DATA_BUFFER;
+        std::memcpy(&buf, &e, sizeof(e));
+        rt::g_eventQueue.push_back(buf);
+    }
     return XR_SUCCESS;
 }
 
@@ -5446,20 +5483,22 @@ static XrResult XRAPI_PTR xrStringToPath_runtime(XrInstance, const char* pathStr
 }
 
 static XrResult XRAPI_PTR xrPathToString_runtime(XrInstance, XrPath path, uint32_t bufferCapacityInput, uint32_t* bufferCountOutput, char* buffer) {
-    const char* str = "/unknown/path";
-    size_t len = strlen(str) + 1;
-    if (bufferCountOutput) *bufferCountOutput = (uint32_t)len;
-    if (buffer && bufferCapacityInput > 0) {
-        strncpy(buffer, str, bufferCapacityInput - 1);
-        buffer[bufferCapacityInput - 1] = '\0';
-    }
+    auto it = rt::g_pathStrings.find(path);
+    if (it == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+    const std::string& str = it->second;
+    const uint32_t len = (uint32_t)str.size() + 1;
+    if (bufferCountOutput) *bufferCountOutput = len;
+    if (bufferCapacityInput == 0) return XR_SUCCESS;  // sizing call
+    if (!buffer) return XR_ERROR_VALIDATION_FAILURE;
+    if (bufferCapacityInput < len) return XR_ERROR_SIZE_INSUFFICIENT;
+    std::memcpy(buffer, str.c_str(), len);
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrGetCurrentInteractionProfile_runtime(XrSession, XrPath topLevelUserPath, XrInteractionProfileState* interactionProfile) {
     if (!interactionProfile) return XR_ERROR_VALIDATION_FAILURE;
     interactionProfile->type = XR_TYPE_INTERACTION_PROFILE_STATE;
-    interactionProfile->interactionProfile = XR_NULL_PATH;
+    interactionProfile->interactionProfile = rt::g_activeProfile;
     return XR_SUCCESS;
 }
 
@@ -5554,7 +5593,9 @@ static XrResult XRAPI_PTR xrConvertWin32PerformanceCounterToTimeKHR_runtime(XrIn
     QueryPerformanceFrequency(&freq);
     
     // Convert to nanoseconds
-    *time = (performanceCounter->QuadPart * 1000000000) / freq.QuadPart;
+    const long long secs = performanceCounter->QuadPart / freq.QuadPart;
+    const long long rem = performanceCounter->QuadPart % freq.QuadPart;
+    *time = secs * 1000000000LL + (rem * 1000000000LL) / freq.QuadPart;
     return XR_SUCCESS;
 }
 
@@ -5567,7 +5608,9 @@ static XrResult XRAPI_PTR xrConvertTimeToWin32PerformanceCounterKHR_runtime(XrIn
     QueryPerformanceFrequency(&freq);
     
     // Convert from nanoseconds  
-    performanceCounter->QuadPart = (time * freq.QuadPart) / 1000000000;
+    const long long secs = time / 1000000000LL;
+    const long long rem = time % 1000000000LL;
+    performanceCounter->QuadPart = secs * freq.QuadPart + (rem * freq.QuadPart) / 1000000000LL;
     return XR_SUCCESS;
 }
 
