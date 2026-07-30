@@ -1,0 +1,91 @@
+# Using this runtime with BetterVR
+
+[BetterVR](https://github.com/Crementif/BotW-BetterVR) is a Cemu VR layer. It is a
+Vulkan layer, but its OpenXR session uses `XrGraphicsBindingD3D12KHR` and does its
+own Vulkan to D3D12 interop, so this runtime needs no Vulkan support to host it.
+
+This branch fills the same slot as Meta's XR Simulator: a desktop OpenXR runtime
+for developing without a headset, but source-built and patchable.
+
+## What BetterVR requires
+
+Enabled unconditionally at `xrCreateInstance`, so all three must be advertised:
+
+- `XR_KHR_D3D12_enable`
+- `XR_KHR_composition_layer_depth`
+- `XR_KHR_win32_convert_performance_counter_time`
+
+Plus `DXGI_FORMAT_R8G8B8A8_UNORM_SRGB` and `DXGI_FORMAT_D32_FLOAT` swapchain
+formats, a `STAGE` and a `VIEW` reference space, and a stereo view configuration
+with exactly two views.
+
+## Build and install
+
+```powershell
+.\build_simulator.ps1
+```
+
+Builds the runtime and installs `openxr_simulator.dll`, a relocatable
+`openxr_simulator.json` and the activate/deactivate scripts into
+`..\BotW-BetterVR\OpenXRSimulator` — laid out the same way `MetaXRSimulator\` is,
+and gitignored by BetterVR so only build output ever lands in that checkout. Use
+`-InstallTo` for a different location.
+
+## Use
+
+Per-process, which leaves the machine-wide runtime registration (Virtual Desktop,
+SteamVR, Quest Link) untouched — prefer this:
+
+```powershell
+$env:XR_RUNTIME_JSON = "C:\path\to\BotW-BetterVR\OpenXRSimulator\openxr_simulator.json"
+```
+
+BetterVR's own harness takes it directly, and its Visual Studio and CLion launch
+configurations have matching entries:
+
+```powershell
+.\run_probe_test.ps1              # uses this simulator
+.\run_probe_test.ps1 -Runtime meta
+```
+
+Machine-wide, if something ignores the environment variable: `activate_simulator.ps1`
+in the install folder (self-elevates, stashes the old runtime in
+`PreviousActiveRuntime`) and `deactivate_simulator.ps1` to put it back.
+
+## Checking a runtime against BetterVR
+
+```powershell
+.\probe\run_xr_probe.ps1
+.\probe\run_xr_probe.ps1 -RuntimeJson ..\BotW-BetterVR\MetaXRSimulator\meta_openxr_simulator.json
+```
+
+`probe/xr_probe.cpp` replays BetterVR's OpenXR sequence — the three extensions
+above, the D3D12 binding, both swapchain formats, the action shapes from
+`CreateActions`, and a 30-frame loop submitting a projection layer with chained
+depth plus a quad layer. Exit code 0 means BetterVR should run. It borrows
+`openxr_loader.lib` from a configured BetterVR `cmake-build-*` tree.
+
+It runs with the D3D12 debug layer on and fails on any validation error. That
+matters: the probe renders into each acquired image and releases it without a
+barrier, exactly as `Layer3D::RecordRender` does, which is the only way
+resource-state bugs show up at all. An earlier version only did
+acquire/wait/release and passed a runtime that was corrupting every frame.
+
+## Differences from the Meta simulator
+
+- `xrGetInstanceProperties` reports `"OpenXR Simulator Runtime"`, so BetterVR's
+  `m_capabilities.isMetaSimulator` stays false and the swapchain-size workaround in
+  `src\hooking\framebuffer.cpp` does not kick in. That is deliberate: this runtime
+  accepts swapchains at the game's own render resolution, so BetterVR takes the
+  same code path a real headset takes.
+- Recommended per-eye resolution is 1280x720 (Meta's is 1440x1584).
+- `xrEndSession` immediately after `xrRequestExitSession` succeeds here. The Meta
+  simulator returns `XR_ERROR_SESSION_NOT_STOPPING`, which older BetterVR builds
+  turn into a throw from `RND_Renderer::~RND_Renderer`.
+
+## Known gap
+
+`xrBeginSession` only pushes `XR_SESSION_STATE_FOCUSED` if the preview window
+already exists, but that window is created lazily on the first presented frame. On
+that path the session settles at `VISIBLE` and never reaches `FOCUSED`. Anything
+gating input on `FOCUSED` will not see it.
