@@ -355,6 +355,9 @@ struct Swapchain {
     std::vector<ComPtr<ID3D11Texture2D>> images;      // D3D11 path
     std::vector<ComPtr<ID3D12Resource>> images12;     // D3D12 path
     std::vector<D3D12_RESOURCE_STATES> imageStates12;
+    // State the app is required to release images in, per XR_KHR_D3D12_enable:
+    // RENDER_TARGET for colour, DEPTH_WRITE for depth.
+    D3D12_RESOURCE_STATES releaseState12{D3D12_RESOURCE_STATE_COMMON};
     std::vector<GLuint> imagesGL;                     // OpenGL path
     GLenum glInternalFormat{GL_RGBA8};                // OpenGL internal format
     uint32_t nextIndex{0};
@@ -1866,6 +1869,7 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
             }
             chain.images12.push_back(res);
             chain.imageStates12.push_back(init);
+            chain.releaseState12 = init;
         }
         rt::g_swapchains.emplace(chain.handle, std::move(chain));
         *sc = chain.handle;
@@ -2203,7 +2207,7 @@ static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const 
     // For D3D12: the app has finished using this image, reset our tracked state to COMMON.
     // D3D12 implicit state promotion/decay means COMMON is always safe after a GPU sync point.
     if (ch.backend == rt::Swapchain::Backend::D3D12 && ch.lastReleased < ch.imageStates12.size()) {
-        ch.imageStates12[ch.lastReleased] = D3D12_RESOURCE_STATE_COMMON;
+        ch.imageStates12[ch.lastReleased] = ch.releaseState12;
     }
 
     static int releaseCount = 0;
@@ -3491,7 +3495,7 @@ static void blitD3D12ToPreview(rt::Session& s,
 
         s.previewCmdList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, &srcBox);
         // Transition back to COMMON so the app can use implicit promotion next frame
-        transition(srcTex, chain.imageStates12[idx], D3D12_RESOURCE_STATE_COMMON);
+        transition(srcTex, chain.imageStates12[idx], chain.releaseState12);
         return true;
     };
 
