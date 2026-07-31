@@ -912,6 +912,15 @@ static ui::StatsInfo BuildStatsInfo(rt::Session& s) {
     return si;
 }
 
+// Repaint the title from the message loop, so a toggle that changes what the
+// title says lands immediately instead of at the render loop's next 500ms tick
+// -- which never arrives at all if the app has stopped submitting frames.
+static void RefreshTitleNow(HWND hwnd) {
+    if (!hwnd || hwnd != rt::g_session.hwnd) return;
+    ui::StatsInfo si = BuildStatsInfo(rt::g_session);
+    ui::UpdateWindowTitle(hwnd, ui::g_lastFps, 0, &si);
+}
+
 // Read the current preview-window client size (set on WM_SIZE). If the user
 // hasn't sized it yet, fall back to the menu-zoom-derived target.
 static void GetPreviewClientSize(rt::Session& s, int srcW, int srcH, int& outW, int& outH) {
@@ -1263,6 +1272,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; },
                 [](int cmd) { rt::HandleUiSettingsCommand(cmd); }
             )) {
+                rt::RefreshTitleNow(hWnd);
                 return 0;
             }
             break;
@@ -1290,6 +1300,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; },
                     [](int cmd) { rt::HandleUiSettingsCommand(cmd); }
                 )) {
+                    rt::RefreshTitleNow(hWnd);
                     return 0;
                 }
             }
@@ -4405,21 +4416,20 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // Update window title with FPS
             static int glTitleFrameCount = 0;
             static auto glLastTitleUpdate = std::chrono::high_resolution_clock::now();
-            static int glLastFPS = 0;
             glTitleFrameCount++;
             auto now = std::chrono::high_resolution_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - glLastTitleUpdate).count();
             if (elapsed >= 500) {
-                glLastFPS = (int)(glTitleFrameCount * 1000 / elapsed);
+                ui::g_lastFps = (int)(glTitleFrameCount * 1000 / elapsed);
                 glTitleFrameCount = 0;
                 glLastTitleUpdate = now;
                 ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, glLastFPS, 0, &si);
+                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
             } else if (ui::g_lastScreenshotTickMs != 0) {
                 // Refresh frequently while a screenshot notice is active so it
                 // appears immediately rather than at the next 500ms tick.
                 ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, glLastFPS, 0, &si);
+                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
             }
 
             // Present (may be deferred if overlays are pending)
@@ -4608,19 +4618,18 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // Update window title with stats
             static int titleFrameCount = 0;
             static auto lastTitleUpdate = std::chrono::high_resolution_clock::now();
-            static int lastFPS = 0;
             titleFrameCount++;
             auto now = std::chrono::high_resolution_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTitleUpdate).count();
             if (elapsed >= 500) {
-                lastFPS = (int)(titleFrameCount * 1000 / elapsed);
+                ui::g_lastFps = (int)(titleFrameCount * 1000 / elapsed);
                 titleFrameCount = 0;
                 lastTitleUpdate = now;
                 ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, lastFPS, 0, &si);
+                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
             } else if (ui::g_lastScreenshotTickMs != 0) {
                 ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, lastFPS, 0, &si);
+                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
             }
 
             // MCP Integration - check for screenshot requests and capture
@@ -4667,19 +4676,18 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // Update window title with FPS stats
             static int d3d12TitleFrameCount = 0;
             static auto d3d12LastTitleUpdate = std::chrono::high_resolution_clock::now();
-            static int d3d12LastFPS = 0;
             d3d12TitleFrameCount++;
             auto now12 = std::chrono::high_resolution_clock::now();
             auto elapsed12 = std::chrono::duration_cast<std::chrono::milliseconds>(now12 - d3d12LastTitleUpdate).count();
             if (elapsed12 >= 500) {
-                d3d12LastFPS = (int)(d3d12TitleFrameCount * 1000 / elapsed12);
+                ui::g_lastFps = (int)(d3d12TitleFrameCount * 1000 / elapsed12);
                 d3d12TitleFrameCount = 0;
                 d3d12LastTitleUpdate = now12;
                 ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, d3d12LastFPS, 0, &si);
+                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
             } else if (ui::g_lastScreenshotTickMs != 0) {
                 ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, d3d12LastFPS, 0, &si);
+                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
             }
 
             // MCP Integration - check for screenshot requests and capture (D3D12)

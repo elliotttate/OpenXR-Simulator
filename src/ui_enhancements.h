@@ -109,6 +109,11 @@ struct UIState {
 
 inline UIState g_uiState;
 
+// Last FPS the render loop measured. Shared so a title refresh triggered from
+// outside the loop (a menu toggle, say) can keep the FPS field rather than
+// blanking it until the next tick.
+inline int g_lastFps = 0;
+
 // Native per-eye panel resolution for the active profile. Two jobs: it is what
 // xrEnumerateViewConfigurationViews recommends, and it is the shape the preview maps
 // each eye onto. The second matters more. These headsets have frusta that are taller
@@ -648,8 +653,6 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
 
         case ID_TOOLS_TOGGLE_STATS: {
             g_uiState.showStats = !g_uiState.showStats;
-            // Refresh the menu checkmark and force an immediate title-bar
-            // update so the user sees the stats appear/disappear right away.
             HMENU menuT = GetMenu(hwnd);
             if (menuT) UpdateMenuState(menuT);
             return true;
@@ -733,8 +736,7 @@ inline bool HandleKeyboardShortcut(HWND hwnd, WPARAM vk,
             ShowControlsDialog(hwnd);
             return true;
         case VK_F3:
-            g_uiState.showStats = !g_uiState.showStats;
-            return true;
+            return HandleMenuCommand(hwnd, ID_TOOLS_TOGGLE_STATS, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_F12:
             if (screenshotCallback) screenshotCallback();
             return true;
