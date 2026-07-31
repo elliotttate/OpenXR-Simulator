@@ -277,7 +277,16 @@ int main() {
     if (!haveDepth) { printf("  [FAIL] DXGI_FORMAT_D32_FLOAT not offered - depth Swapchain<> ctor throws\n"); g_fail++; }
     else ok("D32_FLOAT offered");
 
-    const uint32_t W = 1440, H = 1584;  // a game-render-sized request, not the recommended size
+    // XR_PROBE_SUBRECT replays the shape VR mods use: render 1920x1080 into a bigger
+    // square swapchain and declare the used region with subImage.imageRect. Off by
+    // default so the plain BetterVR replay is unchanged.
+    const bool subRect = getenv("XR_PROBE_SUBRECT") != nullptr;
+    const uint32_t W = subRect ? 2048u : 1440u;   // a game-render-sized request, not the recommended size
+    const uint32_t H = subRect ? 2048u : 1584u;
+    const XrRect2Di viewRect = subRect ? XrRect2Di{ {64, 128}, {1920, 1080} }
+                                       : XrRect2Di{ {0, 0}, {(int32_t)W, (int32_t)H} };
+    if (subRect) printf("       sub-rect mode: %ux%u swapchain, imageRect (%d,%d) %dx%d\n",
+                        W, H, viewRect.offset.x, viewRect.offset.y, viewRect.extent.width, viewRect.extent.height);
     struct Chain { XrSwapchain handle = XR_NULL_HANDLE; std::vector<ComPtr<ID3D12Resource>> tex; uint32_t idx = 0; };
     auto makeChain = [&](DXGI_FORMAT fmt, bool depth, Chain& c, const char* label) -> bool {
         XrSwapchainCreateInfo ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
@@ -451,16 +460,27 @@ int main() {
                 rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
                 D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap->GetCPUDescriptorHandleForHeapStart();
                 device->CreateRenderTargetView(c.tex[idx].Get(), &rv, h);
+
+                // Everything outside the declared rect gets a colour the preview must
+                // never show. Green on screen means imageRect was ignored somewhere.
+                if (subRect) {
+                    const float outside[4] = { 0.0f, 0.9f, 0.1f, 1.0f };
+                    cmdList->ClearRenderTargetView(h, outside, 0, nullptr);
+                }
+                const D3D12_RECT rect = { viewRect.offset.x, viewRect.offset.y,
+                                          viewRect.offset.x + viewRect.extent.width,
+                                          viewRect.offset.y + viewRect.extent.height };
                 if (eye >= 0) {
                     const float clear[4] = { 0.1f, 0.2f, 0.4f, 1.0f };
-                    cmdList->ClearRenderTargetView(h, clear, 0, nullptr);
+                    cmdList->ClearRenderTargetView(h, clear, 1, &rect);
 
                     // A flat clear is indistinguishable between the eyes, so a stereo
                     // checker can only ever report "no parallax" on it. Mark each eye
                     // with the same square at a 20px horizontal offset: real, known
                     // disparity, inside the center window a disparity search looks at.
                     const float mark[4] = { 0.95f, 0.9f, 0.25f, 1.0f };
-                    const LONG cx = (LONG)(W / 2) + (eye == 0 ? 10 : -10), cy = (LONG)(H / 2);
+                    const LONG cx = rect.left + viewRect.extent.width / 2 + (eye == 0 ? 10 : -10);
+                    const LONG cy = rect.top + viewRect.extent.height / 2;
                     D3D12_RECT square = { cx - 100, cy - 100, cx + 100, cy + 100 };
                     cmdList->ClearRenderTargetView(h, mark, 1, &square);
                 } else {
@@ -468,7 +488,7 @@ int main() {
                     // way to see, in the preview window, whether the overlay survives the
                     // eye blit that lands in the same frame.
                     const float hud[4] = { 0.8f, 0.1f, 0.5f, 1.0f };
-                    cmdList->ClearRenderTargetView(h, hud, 0, nullptr);
+                    cmdList->ClearRenderTargetView(h, hud, 1, &rect);
                 }
             }
             if (FAILED(cmdList->Close())) return false;
@@ -504,7 +524,7 @@ int main() {
         for (int e = 0; e < 2; ++e) {
             depthInfo[e] = { XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR };
             depthInfo[e].subImage.swapchain = depthChains[e]->handle;
-            depthInfo[e].subImage.imageRect = { {0,0}, {(int32_t)W, (int32_t)H} };
+            depthInfo[e].subImage.imageRect = viewRect;
             depthInfo[e].subImage.imageArrayIndex = 0;
             depthInfo[e].minDepth = 0.0f; depthInfo[e].maxDepth = 1.0f;
             depthInfo[e].nearZ = 0.05f; depthInfo[e].farZ = INFINITY;
@@ -514,7 +534,7 @@ int main() {
             projViews[e].pose = views[e].pose;
             projViews[e].fov = views[e].fov;
             projViews[e].subImage.swapchain = colorChains[e]->handle;
-            projViews[e].subImage.imageRect = { {0,0}, {(int32_t)W, (int32_t)H} };
+            projViews[e].subImage.imageRect = viewRect;
             projViews[e].subImage.imageArrayIndex = 0;
         }
         XrCompositionLayerProjection proj = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
@@ -525,7 +545,7 @@ int main() {
         quad.space = stageSpace;
         quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
         quad.subImage.swapchain = quadChain.handle;
-        quad.subImage.imageRect = { {0,0}, {(int32_t)W, (int32_t)H} };
+        quad.subImage.imageRect = viewRect;
         // World-locked at eye height, 2 m ahead, like a BetterVR 2D screen. A runtime
         // that reads a STAGE pose as head-relative throws this off the top of the view.
         quad.pose = identity;

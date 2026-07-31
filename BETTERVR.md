@@ -66,6 +66,10 @@ in turn: quad-only first (its boot and title sequence), then a projection layer
 with chained depth plus a quad layer (in game). Exit code 0 means BetterVR should
 run. It borrows `openxr_loader.lib` from a configured BetterVR `cmake-build-*` tree.
 
+`XR_PROBE_SUBRECT=1` switches it to a 2048x2048 swapchain with a 1920x1080
+`imageRect` at offset (64,128). Everything outside the rect is cleared bright
+green, so any green in the preview means a runtime ignored the rect somewhere.
+
 It runs with the D3D12 debug layer on and fails on any validation error. That
 matters: the probe renders into each acquired image and releases it without a
 barrier, exactly as `Layer3D::RecordRender` does, which is the only way
@@ -96,6 +100,21 @@ reached `FOCUSED`.
 Frames with no projection layer now clear the preview to black and still
 composite their quad layers, so a 2D-only screen shows its HUD rather than a
 frozen copy of the last 3D frame.
+
+## Sub-rect swapchains
+
+An app may render into part of a swapchain image and declare the used region with
+`XrSwapchainSubImage::imageRect` — a 1920x1080 eye inside a square 2048x2048
+texture, say. The D3D11 path honoured that rect; the D3D12 path was never handed
+it, so it copied the whole texture and the preview showed the unrendered remainder
+at the wrong aspect.
+
+The rect now drives the D3D12 eye copy, the quad readback and the preview size:
+`g_sourceWidth`/`g_sourceHeight` carry the rect extent rather than the swapchain
+dimensions, so the offscreen RT and the window aspect follow the region the app
+actually rendered. `imageArrayIndex` selects the source slice on the quad path too,
+which it previously ignored. The "show full render" toggle still bypasses cropping
+on both backends.
 
 ## Quad layer placement
 

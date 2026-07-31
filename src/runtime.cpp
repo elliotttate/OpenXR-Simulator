@@ -837,6 +837,39 @@ static FitRect ComputeFitRect(int contentW, int contentH, int dstW, int dstH) {
     return r;
 }
 
+// The region of a swapchain image the app declared valid (XrSwapchainSubImage::imageRect),
+// clamped to the texture. Apps commonly render a 16:9 eye into a larger or square
+// swapchain and describe it with this rect, so everything downstream - the copy, the
+// preview size, the window aspect - has to work from it and not from the texture.
+// A zero or unusable rect means the whole image, and so does the "show full render" toggle.
+struct SubImageRect { uint32_t x, y, w, h; };
+static SubImageRect ResolveSubImageRect(const XrRect2Di& rect, uint32_t texW, uint32_t texH,
+                                        const char* label) {
+    const SubImageRect full{ 0, 0, texW, texH };
+    if (ui::g_uiState.showFullRender) return full;
+    if (rect.extent.width <= 0 || rect.extent.height <= 0) return full;
+
+    int64_t x = rect.offset.x, y = rect.offset.y;
+    int64_t w = rect.extent.width, h = rect.extent.height;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x >= (int64_t)texW || y >= (int64_t)texH) {
+        w = h = 0;
+    } else {
+        if (x + w > (int64_t)texW) w = (int64_t)texW - x;
+        if (y + h > (int64_t)texH) h = (int64_t)texH - y;
+    }
+    if (w <= 0 || h <= 0) {
+        static int badRect = 0;
+        if (++badRect % 60 == 1) {
+            Logf("[SimXR] %s: unusable imageRect (offset=%d,%d extent=%dx%d, texture %ux%u); using full image",
+                 label, rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height, texW, texH);
+        }
+        return full;
+    }
+    return SubImageRect{ (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h };
+}
+
 // Build the stats payload for the title bar (used when "Show Statistics" is on).
 static ui::StatsInfo BuildStatsInfo(rt::Session& s) {
     ui::StatsInfo si;
@@ -3582,8 +3615,8 @@ static void presentPreviewBackBuffer(rt::Session& s) {
 // D3D12 blit function - copies swapchain textures to offscreen RT, reads back to CPU, paints via GDI.
 // Uses GDI instead of DXGI Present to avoid hook conflicts with Steam overlay / UEVR.
 static void blitD3D12ToPreview(rt::Session& s,
-                                rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice,
-                                rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice,
+                                rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice, const rt::SubImageRect& rectL,
+                                rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice, const rt::SubImageRect& rectR,
                                 ui::DisplayLayout layout, ui::ViewMode viewMode) {
     if (!s.previewRT12 || !s.previewReadback12 || !s.previewCmdList || !s.previewCmdAlloc) {
         Log("[SimXR] blitD3D12ToPreview: Missing D3D12 preview resources");
@@ -3655,7 +3688,7 @@ static void blitD3D12ToPreview(rt::Session& s,
     UINT rtWidth = (UINT)rtDesc.Width;
     UINT rtHeight = rtDesc.Height;
 
-    auto copyEye = [&](rt::Swapchain& chain, uint32_t idx, uint32_t slice,
+    auto copyEye = [&](rt::Swapchain& chain, uint32_t idx, uint32_t slice, const rt::SubImageRect& rect,
                        UINT dstX, UINT dstY, const char* label) -> bool {
         if (idx >= chain.images12.size() || !chain.images12[idx]) return false;
         if (chain.imageStates12.size() <= idx) {
@@ -3681,18 +3714,18 @@ static void blitD3D12ToPreview(rt::Session& s,
         src.SubresourceIndex = subresource;
 
         // Clip source box to fit within render target (CopyTextureRegion is 1:1 pixel copy, no scaling)
-        UINT copyW = chain.width;
-        UINT copyH = chain.height;
+        UINT copyW = rect.w;
+        UINT copyH = rect.h;
         if (dstX + copyW > rtWidth)  copyW = (dstX < rtWidth)  ? rtWidth  - dstX : 0;
         if (dstY + copyH > rtHeight) copyH = (dstY < rtHeight) ? rtHeight - dstY : 0;
         if (copyW == 0 || copyH == 0) return false;
 
         D3D12_BOX srcBox = {};
-        srcBox.left = 0;
-        srcBox.top = 0;
+        srcBox.left = rect.x;
+        srcBox.top = rect.y;
         srcBox.front = 0;
-        srcBox.right = copyW;
-        srcBox.bottom = copyH;
+        srcBox.right = rect.x + copyW;
+        srcBox.bottom = rect.y + copyH;
         srcBox.back = 1;
 
         s.previewCmdList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, &srcBox);
@@ -3722,23 +3755,23 @@ static void blitD3D12ToPreview(rt::Session& s,
     // Single-eye mode: render selected eye full-screen
     if (singleEye || forceSingleEye) {
         if (viewMode == ui::ViewMode::RightEyeOnly && hasRight) {
-            copyEye(*chainR, rightIdx, rightSlice, 0, 0, "R");
+            copyEye(*chainR, rightIdx, rightSlice, rectR, 0, 0, "R");
         } else if (hasLeft) {
-            copyEye(chainL, leftIdx, leftSlice, 0, 0, "L");
+            copyEye(chainL, leftIdx, leftSlice, rectL, 0, 0, "L");
         } else if (hasRight) {
-            copyEye(*chainR, rightIdx, rightSlice, 0, 0, "R");
+            copyEye(*chainR, rightIdx, rightSlice, rectR, 0, 0, "R");
         }
     } else {
         UINT rightX = (effectiveLayout == ui::DisplayLayout::OverUnder) ? 0 : (UINT)(s.previewWidth / 2);
         UINT rightY = (effectiveLayout == ui::DisplayLayout::OverUnder) ? (UINT)(s.previewHeight / 2) : 0;
 
         if (hasLeft) {
-            copyEye(chainL, leftIdx, leftSlice, 0, 0, "L");
+            copyEye(chainL, leftIdx, leftSlice, rectL, 0, 0, "L");
         }
         if (hasRight) {
-            copyEye(*chainR, rightIdx, rightSlice, rightX, rightY, "R");
+            copyEye(*chainR, rightIdx, rightSlice, rectR, rightX, rightY, "R");
         } else if (hasLeft) {
-            copyEye(chainL, leftIdx, leftSlice, rightX, rightY, "L");
+            copyEye(chainL, leftIdx, leftSlice, rectL, rightX, rightY, "L");
         }
     }
 
@@ -3948,15 +3981,20 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
         return;
     }
     auto& chL = itL->second;
-    uint32_t width = chL.width, height = chL.height;
+    // Size from the declared rect, not the texture: an app rendering 1920x1080 into a
+    // square swapchain wants a 16:9 eye, not the square.
+    const rt::SubImageRect rectL = rt::ResolveSubImageRect(vL.subImage.imageRect, chL.width, chL.height, "left eye");
+    rt::SubImageRect rectR = rectL;
+    uint32_t width = rectL.w, height = rectL.h;
     const rt::Swapchain* chRPtr = &chL;
     if (proj.viewCount > 1) {
         const auto& vR = proj.views[1];
         auto itR = rt::g_swapchains.find(vR.subImage.swapchain);
         if (itR != rt::g_swapchains.end()) {
             chRPtr = &itR->second;
-            if (itR->second.width > width) width = itR->second.width;
-            if (itR->second.height > height) height = itR->second.height;
+            rectR = rt::ResolveSubImageRect(vR.subImage.imageRect, itR->second.width, itR->second.height, "right eye");
+            if (rectR.w > width) width = rectR.w;
+            if (rectR.h > height) height = rectR.h;
         }
     }
     // Publish the source per-eye size so menu/keyboard zoom callbacks can
@@ -4584,12 +4622,12 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 } else if (chR.lastAcquired != UINT32_MAX && chR.lastAcquired < chR.imageCount) {
                     rightIdx = chR.lastAcquired;
                 }
-                blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex,
-                                   &chR, rightIdx, vR.subImage.imageArrayIndex,
+                blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex, rectL,
+                                   &chR, rightIdx, vR.subImage.imageArrayIndex, rectR,
                                    layout, viewMode);
             } else {
-                blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex,
-                                   nullptr, 0, 0, layout, viewMode);
+                blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex, rectL,
+                                   nullptr, 0, 0, rectL, layout, viewMode);
             }
 
             // No Present call needed - blitD3D12ToPreview handles GDI painting directly
@@ -4813,8 +4851,22 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         if (chain.imageStates12.size() <= texIdx) return;
         if (!s.previewCmdList || !s.previewCmdAlloc || !s.previewQueue12 || !s.previewFence || !s.hwnd) return;
 
-        const uint32_t qw = chain.width, qh = chain.height;
+        // Read back only the region the app declared valid, so the packed buffer the
+        // compositor stretches into the quad is exactly the submitted image.
+        const rt::SubImageRect qrect = rt::ResolveSubImageRect(quad->subImage.imageRect, chain.width, chain.height, "quad");
+        const uint32_t qw = qrect.w, qh = qrect.h;
         const UINT qpitch = (qw * 4 + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+
+        const uint32_t qArraySize = chain.arraySize ? chain.arraySize : 1;
+        const uint32_t qMipLevels = chain.mipCount ? chain.mipCount : 1;
+        if (quad->subImage.imageArrayIndex >= qArraySize) {
+            static int badSlice = 0;
+            if (++badSlice % 60 == 1) {
+                Logf("[SimXR] quad: imageArrayIndex %u out of range (arraySize=%u)",
+                     quad->subImage.imageArrayIndex, qArraySize);
+            }
+            return;
+        }
 
         // Lazily (re)create the quad readback buffer.
         if (!s.quadReadback12 || s.quadReadbackW != qw || s.quadReadbackH != qh) {
@@ -4858,8 +4910,12 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         dst.PlacedFootprint.Footprint.Width = qw; dst.PlacedFootprint.Footprint.Height = qh;
         dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = qpitch;
         D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = quadTex;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
-        s.previewCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = D3D12CalcSubresource(0, quad->subImage.imageArrayIndex, 0, qMipLevels, qArraySize);
+        D3D12_BOX qbox = {};
+        qbox.left = qrect.x; qbox.top = qrect.y; qbox.front = 0;
+        qbox.right = qrect.x + qw; qbox.bottom = qrect.y + qh; qbox.back = 1;
+        s.previewCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, &qbox);
 
         if (qstate != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier12(quadTex, D3D12_RESOURCE_STATE_COPY_SOURCE, qstate);
         s.previewCmdList->Close();
