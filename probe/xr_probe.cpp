@@ -336,11 +336,22 @@ int main() {
     }
     if (!began) { printf("  [FAIL] runtime never delivered SESSION_STATE_READY - BetterVR would hang before its first frame\n"); return 1; }
 
-    step("frame loop x 30 (waitFrame/beginFrame/locateViews/acquire/release/endFrame + syncActions)");
-    int framesRendered = 0, focusedFrames = 0;
+    // 30 frames is enough to prove the sequence works, but far too short for anything
+    // that has to observe a live session from outside (the MCP screenshot tools, for
+    // one). XR_PROBE_FRAMES holds the session open for as long as the observer needs.
+    int totalFrames = 30;
+    if (const char* env = getenv("XR_PROBE_FRAMES")) {
+        int parsed = atoi(env);
+        if (parsed > 0) totalFrames = parsed;
+    }
+
+    char stepLabel[128];
+    snprintf(stepLabel, sizeof(stepLabel), "frame loop x %d (waitFrame/beginFrame/locateViews/acquire/release/endFrame + syncActions)", totalFrames);
+    step(stepLabel);
+    int framesRendered = 0, focusedFrames = 0, quadOnlyFrames = 0;
     bool sawPosVar = false, sawSaneFov = true;
     float firstYaw = 0.0f;
-    for (int f = 0; f < 30; ++f) {
+    for (int f = 0; f < totalFrames; ++f) {
         XrEventDataBuffer ev = { XR_TYPE_EVENT_DATA_BUFFER };
         while (xrPollEvent(g_instance, &ev) == XR_SUCCESS) {
             if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) state = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev)->state;
@@ -418,7 +429,7 @@ int main() {
         // RENDER_TARGET and depth in DEPTH_WRITE and wants them back that way
         // (renderer.cpp:492 and :514). A runtime that tracks them as anything else
         // issues a mismatched barrier, which is what validation catches here.
-        auto cycle = [&](Chain& c, bool depth) -> bool {
+        auto cycle = [&](Chain& c, bool depth, int eye = -1) -> bool {
             uint32_t idx = 0;
             if (XR_FAILED(xrAcquireSwapchainImage(c.handle, nullptr, &idx))) return false;
             XrSwapchainImageWaitInfo wi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
@@ -440,8 +451,25 @@ int main() {
                 rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
                 D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap->GetCPUDescriptorHandleForHeapStart();
                 device->CreateRenderTargetView(c.tex[idx].Get(), &rv, h);
-                const float clear[4] = { 0.1f, 0.2f, 0.4f, 1.0f };
-                cmdList->ClearRenderTargetView(h, clear, 0, nullptr);
+                if (eye >= 0) {
+                    const float clear[4] = { 0.1f, 0.2f, 0.4f, 1.0f };
+                    cmdList->ClearRenderTargetView(h, clear, 0, nullptr);
+
+                    // A flat clear is indistinguishable between the eyes, so a stereo
+                    // checker can only ever report "no parallax" on it. Mark each eye
+                    // with the same square at a 20px horizontal offset: real, known
+                    // disparity, inside the center window a disparity search looks at.
+                    const float mark[4] = { 0.95f, 0.9f, 0.25f, 1.0f };
+                    const LONG cx = (LONG)(W / 2) + (eye == 0 ? 10 : -10), cy = (LONG)(H / 2);
+                    D3D12_RECT square = { cx - 100, cy - 100, cx + 100, cy + 100 };
+                    cmdList->ClearRenderTargetView(h, mark, 1, &square);
+                } else {
+                    // The quad (2D) layer, in a colour nothing else uses: it is the only
+                    // way to see, in the preview window, whether the overlay survives the
+                    // eye blit that lands in the same frame.
+                    const float hud[4] = { 0.8f, 0.1f, 0.5f, 1.0f };
+                    cmdList->ClearRenderTargetView(h, hud, 0, nullptr);
+                }
             }
             if (FAILED(cmdList->Close())) return false;
             ID3D12CommandList* lists[] = { cmdList.Get() };
@@ -455,7 +483,17 @@ int main() {
             XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             return XR_SUCCEEDED(xrReleaseSwapchainImage(c.handle, &ri));
         };
-        if (!cycle(colorL, false) || !cycle(colorR, false) || !cycle(depthL, true) || !cycle(depthR, true) || !cycle(quadChain, false)) { printf("  [FAIL] swapchain acquire/render/release cycle failed on frame %d\n", f); g_fail++; break; }
+        // BetterVR gates its projection layer on IsInGame() (RND_Renderer::EndFrame),
+        // so its whole boot and title sequence is quad-only frames. Replay both shapes.
+        const bool quadOnly = (f < totalFrames / 2);
+        if (quadOnly) quadOnlyFrames++;
+
+        bool cycled = cycle(quadChain, false);
+        if (!quadOnly) {
+            cycled = cycled && cycle(colorL, false, 0) && cycle(colorR, false, 1)
+                            && cycle(depthL, true)     && cycle(depthR, true);
+        }
+        if (!cycled) { printf("  [FAIL] swapchain acquire/render/release cycle failed on frame %d\n", f); g_fail++; break; }
 
         if (FAILED(device->GetDeviceRemovedReason())) { printf("  [FAIL] D3D12 device removed on frame %d (reason 0x%08X)\n", f, (unsigned)device->GetDeviceRemovedReason()); g_fail++; break; }
 
@@ -488,24 +526,35 @@ int main() {
         quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
         quad.subImage.swapchain = quadChain.handle;
         quad.subImage.imageRect = { {0,0}, {(int32_t)W, (int32_t)H} };
-        quad.pose = identity; quad.pose.position.z = -2.0f;
+        // World-locked at eye height, 2 m ahead, like a BetterVR 2D screen. A runtime
+        // that reads a STAGE pose as head-relative throws this off the top of the view.
+        quad.pose = identity;
+        quad.pose.position.y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
+        quad.pose.position.z = -2.0f;
         quad.size = { 1.6f, 0.9f };
 
-        const XrCompositionLayerBaseHeader* layers[2] = {
-            reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj),
-            reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad),
-        };
+        const XrCompositionLayerBaseHeader* layers[2];
+        uint32_t layerCount = 0;
+        if (!quadOnly) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj);
+        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
+
         XrFrameEndInfo fei = { XR_TYPE_FRAME_END_INFO };
         fei.displayTime = fs.predictedDisplayTime;
         fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        fei.layerCount = 2;
+        fei.layerCount = layerCount;
         fei.layers = const_cast<const XrCompositionLayerBaseHeader**>(layers);
         r = xrEndFrame(session, &fei);
         if (XR_FAILED(r)) { fail("xrEndFrame", r); break; }
         framesRendered++;
     }
-    printf("       rendered %d/30 frames, %d of them with state==FOCUSED\n", framesRendered, focusedFrames);
-    if (framesRendered == 30) ok("30 clean frames with a projection(+depth) layer and a quad layer");
+    printf("       rendered %d/%d frames (%d quad-only), %d of them with state==FOCUSED\n",
+           framesRendered, totalFrames, quadOnlyFrames, focusedFrames);
+    if (framesRendered == totalFrames) {
+        char label[160];
+        snprintf(label, sizeof(label), "%d clean frames: %d quad-only, then %d with a projection(+depth) layer and a quad layer",
+                 totalFrames, quadOnlyFrames, totalFrames - quadOnlyFrames);
+        ok(label);
+    }
     if (focusedFrames == 0) warn("session never reached FOCUSED - BetterVR gates its input handling on that");
     if (!sawSaneFov) { printf("  [FAIL] nonsensical FOV angles (left>=right or down>=up)\n"); g_fail++; }
 

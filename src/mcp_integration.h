@@ -480,7 +480,7 @@ inline void CaptureScreenshotGL(const uint8_t* leftPixels, const uint8_t* rightP
 // Write frame status JSON for MCP
 inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t height,
                               const char* format, const char* sessionState,
-                              float headYaw = 0, float headPitch = 0,
+                              float headYaw = 0, float headPitch = 0, float headRoll = 0,
                               float headX = 0, float headY = 1.7f, float headZ = 0) {
     static uint32_t lastWrite = UINT32_MAX;
     // Only write every 30 frames to reduce I/O (but always write the first frame)
@@ -508,7 +508,8 @@ inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t heigh
     fprintf(file, "  \"head_tracking\": {\n");
     fprintf(file, "    \"position\": {\"x\": %.3f, \"y\": %.3f, \"z\": %.3f},\n", headX, headY, headZ);
     fprintf(file, "    \"yaw\": %.3f,\n", headYaw);
-    fprintf(file, "    \"pitch\": %.3f\n", headPitch);
+    fprintf(file, "    \"pitch\": %.3f,\n", headPitch);
+    fprintf(file, "    \"roll\": %.3f\n", headRoll);
     fprintf(file, "  }\n");
     fprintf(file, "}\n");
     fclose(file);

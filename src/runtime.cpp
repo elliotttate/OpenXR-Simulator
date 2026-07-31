@@ -261,6 +261,11 @@ static DXGI_FORMAT ToTypeless(DXGI_FORMAT format) {
     }
 }
 
+// Released from WndProc and instance teardown, both of which run long before the D3D12
+// preview path where it is defined.
+namespace rt { struct Session; }
+static void destroyPreviewBackBuffer(rt::Session& s);
+
 // Runtime state
 namespace rt {
 
@@ -318,6 +323,16 @@ struct Session {
     UINT quadReadbackPitch{0};
     uint32_t quadReadbackW{0};
     uint32_t quadReadbackH{0};
+    // Preview back buffer (D3D12/GDI): every layer paints into this memory DC, which is
+    // blitted to the window once per frame. Painting layers straight to the window makes
+    // the eye blit erase overlays for the length of the quad readback that follows it,
+    // which shows up as a flickering 2D layer.
+    HDC previewMemDC{nullptr};
+    HBITMAP previewMemBitmap{nullptr};
+    HGDIOBJ previewMemOldBitmap{nullptr};
+    int previewMemW{0};
+    int previewMemH{0};
+    bool previewMemDirty{false};
     ComPtr<ID3D12CommandAllocator> previewCmdAlloc;
     ComPtr<ID3D12GraphicsCommandList> previewCmdList;
     ComPtr<ID3D12Fence> previewFence;
@@ -515,6 +530,14 @@ static ControllerState g_rightController = {
 // Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
 static std::unordered_map<XrSpace, int> g_controllerSpaces;
 
+// Composition layers carry a pose plus the space it is in, and VIEW (head-locked)
+// against STAGE (world) changes where the layer belongs entirely.
+struct RefSpace {
+    XrReferenceSpaceType type;
+    XrPosef poseInRef;   // space origin expressed in that reference space
+};
+static std::unordered_map<XrSpace, RefSpace> g_referenceSpaces;
+
 // Map XrPath to path string for controller detection
 static std::unordered_map<XrPath, std::string> g_pathStrings;
 
@@ -589,21 +612,57 @@ XrQuaternionf QuatFromYawPitchRoll(float yaw, float pitch, float roll) {
     return q;
 }
 
+static inline XrQuaternionf MultiplyQuaternions(const XrQuaternionf& a, const XrQuaternionf& b) {
+    return XrQuaternionf{
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+    };
+}
+
 // Rotate a vector by a quaternion (q * v * q^-1)
 static inline XrVector3f RotateVectorByQuaternion(const XrQuaternionf& q, const XrVector3f& v) {
-    XrQuaternionf qv{ v.x, v.y, v.z, 0.0f };
-    XrQuaternionf qinv{ -q.x, -q.y, -q.z, q.w };
-    auto mul = [](const XrQuaternionf& a, const XrQuaternionf& b) -> XrQuaternionf {
-        return XrQuaternionf{
-            a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-            a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-            a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
-            a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
-        };
-    };
-    XrQuaternionf t = mul(q, qv);
-    XrQuaternionf r = mul(t, qinv);
+    const XrQuaternionf qv{ v.x, v.y, v.z, 0.0f };
+    const XrQuaternionf qinv{ -q.x, -q.y, -q.z, q.w };
+    const XrQuaternionf r = MultiplyQuaternions(MultiplyQuaternions(q, qv), qinv);
     return XrVector3f{ r.x, r.y, r.z };
+}
+
+static inline XrPosef ComposePose(const XrPosef& parent, const XrPosef& child) {
+    const XrVector3f r = RotateVectorByQuaternion(parent.orientation, child.position);
+    XrPosef out;
+    out.orientation = MultiplyQuaternions(parent.orientation, child.orientation);
+    out.position = { parent.position.x + r.x, parent.position.y + r.y, parent.position.z + r.z };
+    return out;
+}
+
+static void GetEffectiveHeadAngles(float& yaw, float& pitch, float& roll) {
+    yaw = g_headYaw; pitch = g_headPitch; roll = g_headRoll;
+    if (!g_poseSweepEnabled) return;
+    const float t = (float)GetTickCount64() * 0.001f - g_poseSweepStartT;
+    const float TWO_PI = 6.2831853f;
+    const float w = TWO_PI * g_poseSweepFreq;
+    yaw   = g_poseSweepYawAmp   * sinf(w * t);
+    pitch = g_poseSweepPitchAmp * sinf(w * t + 1.0f);
+    roll  = g_poseSweepRollAmp  * sinf(w * t + 2.0f);
+}
+
+// Angles are passed in, not sampled here, so both eyes of a frame come from one
+// instant of the pose sweep.
+static XrPosef ViewPoseFromAngles(uint32_t eye, float yaw, float pitch, float roll) {
+    XrPosef pose{};
+    pose.orientation = QuatFromYawPitchRoll(yaw, pitch, roll);
+    const float ipd = g_useCustomIpd ? g_customIpd : GetUiIpdMeters();
+    const float offset = (eye == 0) ? -ipd * 0.5f : ipd * 0.5f;
+    const XrVector3f rotated = RotateVectorByQuaternion(pose.orientation, XrVector3f{ offset, 0.0f, 0.0f });
+    pose.position = { g_headPos.x + rotated.x, g_headPos.y + rotated.y, g_headPos.z + rotated.z };
+    return pose;
+}
+
+static XrFovf GetViewFov(uint32_t eye) {
+    if (g_useCustomFov) return XrFovf{ g_eyeFovL[eye], g_eyeFovR[eye], g_eyeFovU[eye], g_eyeFovD[eye] };
+    return GetUiFov(eye);
 }
 
 // Initialize shader resources for blitting
@@ -812,6 +871,41 @@ static void GetPreviewClientSize(rt::Session& s, int srcW, int srcH, int& outW, 
     outH = th;
 }
 
+// Snap the preview window so its client aspect matches the content aspect,
+// keeping the current client width. Height is ours to derive; width is whatever
+// the user last chose. No-op when the aspect already matches. Called from
+// WM_SIZE, and from the render path when the content aspect itself changes.
+static void FitWindowToContentAspect(HWND hWnd) {
+    if (!hWnd) return;
+
+    RECT cr{};
+    if (!GetClientRect(hWnd, &cr)) return;
+    const int cw = cr.right - cr.left;
+    const int ch = cr.bottom - cr.top;
+    if (cw <= 0 || ch <= 0) return;
+
+    const UINT srcW = g_sourceWidth.load();
+    const UINT srcH = g_sourceHeight.load();
+    if (srcW == 0 || srcH == 0) return;
+
+    int contentW = 0, contentH = 0;
+    ComputeContentDims((int)srcW, (int)srcH, ui::g_uiState.viewMode, ui::g_uiState.displayLayout, contentW, contentH);
+    if (contentW <= 0 || contentH <= 0) return;
+
+    const double contentAspect = (double)contentW / (double)contentH;
+    const double clientAspect  = (double)cw / (double)ch;
+    if (fabs(contentAspect - clientAspect) < 0.005 * (contentAspect + clientAspect)) return;
+
+    int targetCH = (int)((double)cw / contentAspect + 0.5);
+    if (targetCH < 1) targetCH = 1;
+
+    RECT rc{0, 0, (LONG)cw, targetCH};
+    AdjustWindowRectEx(&rc, (DWORD)GetWindowLongW(hWnd, GWL_STYLE), GetMenu(hWnd) != nullptr,
+                       (DWORD)GetWindowLongW(hWnd, GWL_EXSTYLE));
+    SetWindowPos(hWnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+                 SWP_NOMOVE | SWP_NOZORDER);
+}
+
 static void ResetD3D12PreviewResources(rt::Session& s) {
     s.previewRT12.Reset();
     s.previewReadback12.Reset();
@@ -836,6 +930,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 rt::PushState(rt::g_session.handle, XR_SESSION_STATE_EXITING);
             }
             Log("[SimXR] WndProc: WM_CLOSE received");
+            ::destroyPreviewBackBuffer(rt::g_session);
             DestroyWindow(hWnd);
             return 0;
         case WM_DESTROY:
@@ -1052,16 +1147,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             } else {
                 // Anything else (DPI change, programmatic, Aero snap, etc.):
                 // preserve the new width, recompute height to match aspect.
-                int targetCH = (int)((double)cw / contentAspect + 0.5);
-                if (targetCH < 1) targetCH = 1;
-
-                RECT rc{0, 0, (LONG)cw, targetCH};
-                AdjustWindowRectEx(&rc, style, hasMenu, exStyle);
-
                 inFix = true;
-                SetWindowPos(hWnd, nullptr, 0, 0,
-                             rc.right - rc.left, rc.bottom - rc.top,
-                             SWP_NOMOVE | SWP_NOZORDER);
+                rt::FitWindowToContentAspect(hWnd);
                 inFix = false;
             }
             return 0;
@@ -1465,6 +1552,7 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
             std::lock_guard<std::mutex> lock(rt::g_windowMutex);
             if (rt::g_persistentWindow) {
                 Log("[SimXR] xrDestroyInstance: Destroying preview window");
+                destroyPreviewBackBuffer(rt::g_session);
                 DestroyWindow(rt::g_persistentWindow);
                 rt::g_persistentWindow = nullptr;
             }
@@ -2485,11 +2573,25 @@ static XrResult XRAPI_PTR xrPollEvent_runtime(XrInstance, XrEventDataBuffer* b) 
     }
     return XR_SUCCESS;
 }
+// Defined further down, with the rest of the preview plumbing.
+static void ensurePreviewWithoutProjection(rt::Session& s);
+
 static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeginInfo*) { 
     Log("[SimXR] ============================================");
     Logf("[SimXR] xrBeginSession called (session=%llu)", (unsigned long long)s);
     Log("[SimXR] Session started - moving to SYNCHRONIZED/VISIBLE states");
     Log("[SimXR] ============================================");
+
+    // Bring the preview up now instead of waiting for the first projection
+    // layer. An app that boots into a 2D-only screen submits nothing but quad
+    // layers, and quads cannot bootstrap the preview themselves, so the window
+    // would never appear at all - and the FOCUSED check below could never fire.
+    ensurePreviewWithoutProjection(rt::g_session);
+
+    // Pump once so the activation raised by creating the window is handled
+    // before we decide whether the session starts out focused.
+    MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+
     rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
     rt::PushState(s, XR_SESSION_STATE_VISIBLE);
     // Only push FOCUSED if window is actually active/focused
@@ -3150,6 +3252,47 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
     }
 }
 
+// Bring the preview window (and its backing store) up with no projection layer
+// to take a size from. Every other route into ensurePreviewSized hangs off
+// presentProjection, so an app showing only 2D - BetterVR sits on quad-only
+// frames for its whole boot and title sequence - would never get a window at
+// all. Sizes from the last projection frame if there was one, otherwise from
+// the resolution xrEnumerateViewConfigurationViews recommends.
+static void ensurePreviewWithoutProjection(rt::Session& s) {
+    std::lock_guard<std::mutex> lock(s.previewMutex);
+
+    int srcW = (int)rt::g_sourceWidth.load();
+    int srcH = (int)rt::g_sourceHeight.load();
+    if (srcW <= 0 || srcH <= 0) {
+        srcW = 1280;
+        srcH = 720;
+        rt::g_sourceWidth.store((uint32_t)srcW);
+        rt::g_sourceHeight.store((uint32_t)srcH);
+    }
+
+    // Open the window at the zoom-adjusted size, not the raw canvas size:
+    // side-by-side content is twice as wide as one eye, and ensurePreviewSized
+    // would pass that straight through as the initial client size.
+    int windowW = srcW, windowH = srcH;
+    ui::CalculateWindowSize(srcW, srcH, windowW, windowH);
+    ensurePreviewWindow(s, (UINT)windowW, (UINT)windowH);
+    if (!s.hwnd) return;
+
+    // OpenGL sessions create their D3D11 preview device lazily inside
+    // presentProjection; until that happens there is nothing to build a
+    // swapchain on, so leave the backing store to the first 3D frame.
+    if (s.usesD3D12 ? !s.d3d12Device : !s.d3d11Device) return;
+
+    int targetW = srcW, targetH = srcH;
+    if (!s.usesD3D12) {
+        rt::GetPreviewClientSize(s, srcW, srcH, targetW, targetH);
+    } else {
+        rt::ComputeContentDims(srcW, srcH, ui::g_uiState.viewMode, ui::g_uiState.displayLayout, targetW, targetH);
+    }
+    const DXGI_FORMAT format = (s.previewFormat != DXGI_FORMAT_UNKNOWN) ? s.previewFormat : DXGI_FORMAT_R8G8B8A8_UNORM;
+    ensurePreviewSized(s, (UINT)targetW, (UINT)targetH, format);
+}
+
 static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcIndex, uint32_t arraySlice,
                            const XrRect2Di& rect, ID3D11RenderTargetView* rtv,
                            const D3D11_VIEWPORT& vp, ID3D11BlendState* blendState) {
@@ -3385,6 +3528,57 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
     }
 }
 
+// --- Preview back buffer (D3D12/GDI) ---------------------------------------------------------------
+// The eye blit and the quad overlay both paint with GDI, from different points in the
+// xrEndFrame layer loop and with a full GPU readback between them. Straight to the window
+// that is visibly two-step: the eyes land first and erase the overlay, which only comes
+// back milliseconds later. Both now draw into this off-screen DC and the window is
+// updated once, after every layer of the frame has been composited.
+static void destroyPreviewBackBuffer(rt::Session& s) {
+    if (s.previewMemDC) {
+        if (s.previewMemOldBitmap) SelectObject(s.previewMemDC, s.previewMemOldBitmap);
+        DeleteDC(s.previewMemDC);
+    }
+    if (s.previewMemBitmap) DeleteObject(s.previewMemBitmap);
+    s.previewMemDC = nullptr;
+    s.previewMemBitmap = nullptr;
+    s.previewMemOldBitmap = nullptr;
+    s.previewMemW = s.previewMemH = 0;
+    s.previewMemDirty = false;
+}
+
+static HDC acquirePreviewBackBuffer(rt::Session& s, int clientW, int clientH) {
+    if (!s.hwnd || clientW <= 0 || clientH <= 0) return nullptr;
+    if (s.previewMemDC && (s.previewMemW != clientW || s.previewMemH != clientH)) destroyPreviewBackBuffer(s);
+    if (!s.previewMemDC) {
+        HDC windowDC = GetDC(s.hwnd);
+        if (!windowDC) return nullptr;
+        s.previewMemDC = CreateCompatibleDC(windowDC);
+        s.previewMemBitmap = CreateCompatibleBitmap(windowDC, clientW, clientH);
+        ReleaseDC(s.hwnd, windowDC);
+        if (!s.previewMemDC || !s.previewMemBitmap) {
+            destroyPreviewBackBuffer(s);
+            return nullptr;
+        }
+        s.previewMemOldBitmap = SelectObject(s.previewMemDC, s.previewMemBitmap);
+        s.previewMemW = clientW;
+        s.previewMemH = clientH;
+        RECT full{0, 0, clientW, clientH};
+        FillRect(s.previewMemDC, &full, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    }
+    return s.previewMemDC;
+}
+
+static void presentPreviewBackBuffer(rt::Session& s) {
+    if (!s.previewMemDC || !s.previewMemDirty || !s.hwnd) return;
+    HDC windowDC = GetDC(s.hwnd);
+    if (windowDC) {
+        BitBlt(windowDC, 0, 0, s.previewMemW, s.previewMemH, s.previewMemDC, 0, 0, SRCCOPY);
+        ReleaseDC(s.hwnd, windowDC);
+    }
+    s.previewMemDirty = false;
+}
+
 // D3D12 blit function - copies swapchain textures to offscreen RT, reads back to CPU, paints via GDI.
 // Uses GDI instead of DXGI Present to avoid hook conflicts with Steam overlay / UEVR.
 static void blitD3D12ToPreview(rt::Session& s,
@@ -3595,14 +3789,14 @@ static void blitD3D12ToPreview(rt::Session& s,
     D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * rtHeight };
     hr = s.previewReadback12->Map(0, &readRange, &mapped);
     if (SUCCEEDED(hr) && mapped && s.hwnd) {
-        HDC hdc = GetDC(s.hwnd);
+        // Get current client area (live, in case a resize is mid-flight)
+        RECT cr{};
+        GetClientRect(s.hwnd, &cr);
+        int clientW = cr.right - cr.left;
+        int clientH = cr.bottom - cr.top;
+        HDC hdc = acquirePreviewBackBuffer(s, clientW, clientH);
         if (hdc) {
-            // Get current client area (live, in case a resize is mid-flight)
-            RECT cr{};
-            GetClientRect(s.hwnd, &cr);
-            int clientW = cr.right - cr.left;
-            int clientH = cr.bottom - cr.top;
-            if (clientW > 0 && clientH > 0) {
+            {
                 rt::FitRect fit = rt::ComputeFitRect((int)rtWidth, (int)rtHeight, clientW, clientH);
                 int dstX = (int)fit.x;
                 int dstY = (int)fit.y;
@@ -3690,7 +3884,7 @@ static void blitD3D12ToPreview(rt::Session& s,
                                   pixels.data(), pbmi, DIB_RGB_COLORS, SRCCOPY);
                 }
             }
-            ReleaseDC(s.hwnd, hdc);
+            s.previewMemDirty = true;
         }
         D3D12_RANGE writeRange = { 0, 0 };
         s.previewReadback12->Unmap(0, &writeRange);
@@ -3708,6 +3902,35 @@ static void blitD3D12ToPreview(rt::Session& s,
 
 // Flag to track if Present should be called (deferred until all layers rendered)
 static bool g_presentPending = false;
+
+// Wipe the preview to black. Used on frames that carry no projection layer so
+// overlays are not composited over the stale - and by then wrong - stereo image
+// the last 3D frame left behind.
+static void clearPreviewToBlack(rt::Session& s) {
+    if (!s.hwnd) return;
+
+    if (s.usesD3D12) {
+        // Clearing the window instead would be undone by presentPreviewBackBuffer.
+        RECT cr{};
+        GetClientRect(s.hwnd, &cr);
+        HDC hdc = acquirePreviewBackBuffer(s, cr.right - cr.left, cr.bottom - cr.top);
+        if (!hdc) return;
+        FillRect(hdc, &cr, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        s.previewMemDirty = true;
+        return;
+    }
+
+    if (!s.previewSwapchain || !s.d3d11Device || !s.d3d11Context) return;
+    ComPtr<ID3D11Texture2D> backbuffer;
+    if (FAILED(s.previewSwapchain->GetBuffer(0, IID_PPV_ARGS(backbuffer.GetAddressOf())))) return;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(s.d3d11Device->CreateRenderTargetView(backbuffer.Get(), nullptr, rtv.GetAddressOf()))) return;
+    const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    s.d3d11Context->ClearRenderTargetView(rtv.Get(), black);
+    // presentProjection normally owns the Present; with no projection layer
+    // nothing else would flip this frame.
+    g_presentPending = true;
+}
 
 static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj, bool skipPresent = false) {
     Log("[SimXR] ============================================");
@@ -3738,8 +3961,15 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
     }
     // Publish the source per-eye size so menu/keyboard zoom callbacks can
     // compute a window target without having to walk the swapchain map.
-    rt::g_sourceWidth.store(width);
-    rt::g_sourceHeight.store(height);
+    const UINT prevSourceW = rt::g_sourceWidth.exchange(width);
+    const UINT prevSourceH = rt::g_sourceHeight.exchange(height);
+
+    // The window is opened at xrBeginSession, before any projection layer exists,
+    // so it starts out sized from the recommended resolution rather than this one.
+    // Re-fit it the first time a real size arrives, and on any later change.
+    if (s.hwnd && (prevSourceW != width || prevSourceH != height)) {
+        rt::FitWindowToContentAspect(s.hwnd);
+    }
     {
         std::lock_guard<std::mutex> lock(s.previewMutex);
 
@@ -4401,40 +4631,76 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
 // Render a quad layer as 2D overlay (supports both D3D11 and OpenGL)
 // GDI-paint a quad's RGBA pixels (top-down, qw x qh) over the already-painted eye preview, for the D3D12
-// path. The head-locked quad (view-space pose+size) is projected to NDC with a default FOV and placed into
-// each eye half of the letterboxed preview. Opaque (StretchDIBits) for now; per-pixel alpha is a TODO
-// (needs Msimg32/AlphaBlend or a CPU read-blend of the window). Position/size are live-tunable from the mod
-// (hudx/hudy/hudz/hudw), so the FOV constant here only sets the default scale.
+// path. Opaque (StretchDIBits) for now; per-pixel alpha is a TODO (needs Msimg32/AlphaBlend or a CPU
+// read-blend of the window).
 static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
                              const uint8_t* rgba, uint32_t qw, uint32_t qh) {
     if (!s.hwnd || !rgba || qw == 0 || qh == 0) return;
-    HDC hdc = GetDC(s.hwnd);
-    if (!hdc) return;
 
     RECT cr{}; GetClientRect(s.hwnd, &cr);
     const int clientW = cr.right - cr.left, clientH = cr.bottom - cr.top;
-    if (clientW <= 0 || clientH <= 0) { ReleaseDC(s.hwnd, hdc); return; }
+    if (clientW <= 0 || clientH <= 0) return;
+
+    // Paints over the eyes the frame already put in the back buffer, not over the window.
+    HDC hdc = acquirePreviewBackBuffer(s, clientW, clientH);
+    if (!hdc) return;
 
     // Mirror blitD3D12ToPreview's letterbox so the quad lands in the same client coords as the eyes.
     rt::FitRect fit = rt::ComputeFitRect((int)s.previewWidth, (int)s.previewHeight, clientW, clientH);
 
-    // Default preview is side-by-side BothEyes (L | R). Composite into both halves.
-    const int eyeW = (int)fit.w / 2;
-    const int eyeH = (int)fit.h;
-    const int eyeOriginX[2] = { (int)fit.x, (int)fit.x + eyeW };
-    const int eyeOriginY = (int)fit.y;
-    if (eyeW < 2 || eyeH < 2) { ReleaseDC(s.hwnd, hdc); return; }
+    // Must match how blitD3D12ToPreview packs the eyes into the offscreen RT, down to
+    // its anaglyph-degrades-to-left-eye fallback.
+    struct EyeRect { uint32_t eye; int x, y, w, h; };
+    EyeRect eyes[2];
+    int eyeCount = 0;
+    const ui::ViewMode mode = ui::g_uiState.viewMode;
+    const ui::DisplayLayout layout = ui::g_uiState.displayLayout;
+    if (mode != ui::ViewMode::BothEyes || layout == ui::DisplayLayout::Anaglyph) {
+        const uint32_t eye = (mode == ui::ViewMode::RightEyeOnly) ? 1u : 0u;
+        eyes[eyeCount++] = { eye, (int)fit.x, (int)fit.y, (int)fit.w, (int)fit.h };
+    } else if (layout == ui::DisplayLayout::OverUnder) {
+        const int h = (int)fit.h / 2;
+        eyes[eyeCount++] = { 0u, (int)fit.x, (int)fit.y,     (int)fit.w, h };
+        eyes[eyeCount++] = { 1u, (int)fit.x, (int)fit.y + h, (int)fit.w, h };
+    } else {
+        const int w = (int)fit.w / 2;
+        eyes[eyeCount++] = { 0u, (int)fit.x,     (int)fit.y, w, (int)fit.h };
+        eyes[eyeCount++] = { 1u, (int)fit.x + w, (int)fit.y, w, (int)fit.h };
+    }
 
-    // Project the head-locked quad (view-space) to NDC. -z is forward.
-    const float z = quad->pose.position.z;
-    const float dist = (z < -0.01f) ? -z : 1.5f;
-    const float tanHx = 1.0f;                                  // ~90deg total H FOV (approx; tune via hudz/hudw)
-    const float tanHy = tanHx * ((float)eyeH / (float)eyeW);
-    const float cx = quad->pose.position.x / (dist * tanHx);
-    const float cy = quad->pose.position.y / (dist * tanHy);
-    const float hw = (quad->size.width  * 0.5f) / (dist * tanHx);
-    const float hh = (quad->size.height * 0.5f) / (dist * tanHy);
-    const float ndcL = cx - hw, ndcR = cx + hw, ndcT = cy + hh, ndcB = cy - hh;
+    // LOCAL and STAGE are the same world here, and an unknown handle falls back to it
+    // the way xrLocateSpace does.
+    float yaw, pitch, roll;
+    rt::GetEffectiveHeadAngles(yaw, pitch, roll);
+
+    XrPosef spaceOrigin{};
+    spaceOrigin.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+    spaceOrigin.position = { 0.0f, 0.0f, 0.0f };
+    bool headLocked = false;
+    auto spaceIt = rt::g_referenceSpaces.find(quad->space);
+    if (spaceIt != rt::g_referenceSpaces.end()) {
+        headLocked = (spaceIt->second.type == XR_REFERENCE_SPACE_TYPE_VIEW);
+        spaceOrigin = spaceIt->second.poseInRef;
+    }
+    if (headLocked) {
+        XrPosef head{};
+        head.orientation = rt::QuatFromYawPitchRoll(yaw, pitch, roll);
+        head.position = rt::g_headPos;
+        spaceOrigin = rt::ComposePose(head, spaceOrigin);
+    }
+    const XrPosef quadWorld = rt::ComposePose(spaceOrigin, quad->pose);
+
+    const float halfW = quad->size.width * 0.5f;
+    const float halfH = quad->size.height * 0.5f;
+    const XrVector3f localCorners[4] = {
+        { -halfW,  halfH, 0.0f }, {  halfW,  halfH, 0.0f },
+        {  halfW, -halfH, 0.0f }, { -halfW, -halfH, 0.0f },
+    };
+    XrVector3f worldCorners[4];
+    for (int i = 0; i < 4; ++i) {
+        const XrVector3f r = rt::RotateVectorByQuaternion(quadWorld.orientation, localCorners[i]);
+        worldCorners[i] = { quadWorld.position.x + r.x, quadWorld.position.y + r.y, quadWorld.position.z + r.z };
+    }
 
     // RGBA top-down DIB; BI_BITFIELDS so GDI reads R,G,B byte order (matches the eye-path masks).
     struct { BITMAPINFOHEADER hdr; DWORD masks[3]; } bmi = {};
@@ -4449,22 +4715,70 @@ static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
     SetStretchBltMode(hdc, HALFTONE);
     SetBrushOrgEx(hdc, 0, 0, nullptr);
 
-    for (int eye = 0; eye < 2; ++eye) {
-        const int px = eyeOriginX[eye] + (int)((ndcL * 0.5f + 0.5f) * eyeW);
-        const int py = eyeOriginY      + (int)((1.0f - (ndcT * 0.5f + 0.5f)) * eyeH);
-        const int pw = (int)((ndcR - ndcL) * 0.5f * eyeW);
-        const int ph = (int)((ndcT - ndcB) * 0.5f * eyeH);
-        if (pw < 1 || ph < 1) continue;
-        StretchDIBits(hdc, px, py, pw, ph, 0, 0, (int)qw, (int)qh,
+    int dbgX = 0, dbgY = 0, dbgW = 0, dbgH = 0;
+    bool painted = false;
+    for (int e = 0; e < eyeCount; ++e) {
+        const EyeRect& er = eyes[e];
+        if (er.w < 2 || er.h < 2) continue;
+
+        if ((quad->eyeVisibility == XR_EYE_VISIBILITY_LEFT  && er.eye != 0) ||
+            (quad->eyeVisibility == XR_EYE_VISIBILITY_RIGHT && er.eye != 1)) continue;
+
+        const XrPosef view = rt::ViewPoseFromAngles(er.eye, yaw, pitch, roll);
+        const XrQuaternionf toView{ -view.orientation.x, -view.orientation.y,
+                                    -view.orientation.z,  view.orientation.w };
+        const XrFovf fov = rt::GetViewFov(er.eye);
+        const float tanL = tanf(fov.angleLeft),  tanR = tanf(fov.angleRight);
+        const float tanU = tanf(fov.angleUp),    tanD = tanf(fov.angleDown);
+        if (tanR - tanL < 1e-6f || tanU - tanD < 1e-6f) continue;
+
+        // GDI only places axis-aligned rects, so an oriented quad becomes the
+        // screen-space bounding box of its corners.
+        float minX = 0, minY = 0, maxX = 0, maxY = 0;
+        bool inFront = true;
+        for (int i = 0; i < 4; ++i) {
+            const XrVector3f d{ worldCorners[i].x - view.position.x,
+                                worldCorners[i].y - view.position.y,
+                                worldCorners[i].z - view.position.z };
+            const XrVector3f v = rt::RotateVectorByQuaternion(toView, d);
+            if (v.z > -0.01f) { inFront = false; break; }   // crosses the near plane; no sane rect for it
+            const float u = (v.x / -v.z - tanL) / (tanR - tanL);
+            const float w = (tanU - v.y / -v.z) / (tanU - tanD);
+            const float px = (float)er.x + u * (float)er.w;
+            const float py = (float)er.y + w * (float)er.h;
+            if (i == 0) { minX = maxX = px; minY = maxY = py; continue; }
+            minX = (std::min)(minX, px); maxX = (std::max)(maxX, px);
+            minY = (std::min)(minY, py); maxY = (std::max)(maxY, py);
+        }
+        if (!inFront) continue;
+
+        const int dstX = (int)floorf(minX), dstY = (int)floorf(minY);
+        const int dstW = (int)ceilf(maxX) - dstX, dstH = (int)ceilf(maxY) - dstY;
+        if (dstW < 1 || dstH < 1) continue;
+        if (dstX >= er.x + er.w || dstY >= er.y + er.h ||
+            dstX + dstW <= er.x || dstY + dstH <= er.y) continue;
+
+        HRGN clip = CreateRectRgn(er.x, er.y, er.x + er.w, er.y + er.h);
+        SelectClipRgn(hdc, clip);
+        StretchDIBits(hdc, dstX, dstY, dstW, dstH, 0, 0, (int)qw, (int)qh,
                       rgba, (BITMAPINFO*)&bmi, DIB_RGB_COLORS, SRCCOPY);
+        SelectClipRgn(hdc, nullptr);
+        DeleteObject(clip);
+
+        painted = true;
+        dbgX = dstX; dbgY = dstY; dbgW = dstW; dbgH = dstH;
     }
 
-    ReleaseDC(s.hwnd, hdc);
+    if (painted) s.previewMemDirty = true;
     static int s_qlog = 0;
     if (++s_qlog % 120 == 1) {
-        Logf("[SimXR] D3D12 quad composited: tex=%ux%u pose=(%.2f,%.2f,%.2f) size=(%.2f,%.2f) fit=(%.0f,%.0f,%.0f,%.0f)",
-             qw, qh, quad->pose.position.x, quad->pose.position.y, quad->pose.position.z,
-             quad->size.width, quad->size.height, fit.x, fit.y, fit.w, fit.h);
+        Logf("[SimXR] D3D12 quad composited: tex=%ux%u space=%s pose=(%.2f,%.2f,%.2f) size=(%.2f,%.2f) "
+             "world=(%.2f,%.2f,%.2f) dst=(%d,%d,%d,%d)%s",
+             qw, qh, headLocked ? "VIEW" : "WORLD",
+             quad->pose.position.x, quad->pose.position.y, quad->pose.position.z,
+             quad->size.width, quad->size.height,
+             quadWorld.position.x, quadWorld.position.y, quadWorld.position.z,
+             dbgX, dbgY, dbgW, dbgH, painted ? "" : " (off-view)");
     }
 }
 
@@ -4549,6 +4863,16 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
 
         if (qstate != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier12(quadTex, D3D12_RESOURCE_STATE_COPY_SOURCE, qstate);
         s.previewCmdList->Close();
+
+        // Same cross-queue sync presentProjection does before it copies the eyes. On a
+        // quad-only frame presentProjection never runs, so without this the copy races
+        // the app still rendering into the texture.
+        if (s.crossQueueFence && s.d3d12Queue) {
+            s.crossQueueFenceValue++;
+            s.d3d12Queue->Signal(s.crossQueueFence.Get(), s.crossQueueFenceValue);
+            s.previewQueue12->Wait(s.crossQueueFence.Get(), s.crossQueueFenceValue);
+        }
+
         ID3D12CommandList* lists[] = { s.previewCmdList.Get() };
         s.previewQueue12->ExecuteCommandLists(1, lists);
         s.previewQueue12->Signal(s.previewFence.Get(), s.previewFenceValue);
@@ -4985,6 +5309,15 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         }
     }
 
+    // No projection layer this frame - the app is on a 2D-only screen. Bring the
+    // preview up ourselves (nothing else will) and clear it, so the overlay pass
+    // below has somewhere to composite instead of bailing out at its
+    // !previewSwapchain && !previewRT12 guard.
+    if (projectionCount == 0) {
+        ensurePreviewWithoutProjection(rt::g_session);
+        clearPreviewToBlack(rt::g_session);
+    }
+
     // Third pass: render overlay layers (quad, cylinder) on top of the projection
     for (uint32_t i = 0; i < info->layerCount; ++i) {
         const XrCompositionLayerBaseHeader* base = info->layers[i];
@@ -5005,10 +5338,13 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         }
     }
 
+    // Every layer of this frame has now been composited, so show it in one blit.
+    if (rt::g_session.usesD3D12) presentPreviewBackBuffer(rt::g_session);
+
     // MCP Integration - write frame status BEFORE Present (Present may block on D3D12)
     mcp::WriteFrameStatus(frameCount, rt::g_session.previewWidth, rt::g_session.previewHeight,
                           "RGBA8", mcp::GetSessionStateName((int)rt::g_session.state),
-                          rt::g_headYaw, rt::g_headPitch,
+                          rt::g_headYaw, rt::g_headPitch, rt::g_headRoll,
                           rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z);
 
     // Drain MCP projection-log dump request if pending.
@@ -5037,7 +5373,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     }
 
     if (projectionCount == 0 && shouldLog) {
-        Log("[SimXR] xrEndFrame: WARNING - No projection layers found!");
+        Logf("[SimXR] xrEndFrame: no projection layer - 2D-only frame (%d overlay layers)",
+             quadCount + cylinderCount);
     }
 
     inEndFrame = false;
@@ -5055,79 +5392,16 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
                             XR_VIEW_STATE_POSITION_TRACKED_BIT; 
     }
     if (cap < 2 || !views) return XR_SUCCESS;
-    const float ipd = rt::g_useCustomIpd ? rt::g_customIpd : rt::GetUiIpdMeters();
 
-    // Pose-sweep tick: drive yaw/pitch/roll from a sine wave so apps see
-    // a continuous range of orientations and any handedness/axis bug
-    // produces a visible "world rotates wrong way" symptom instantly.
-    // Each axis uses a different phase so the signal isn't degenerate.
-    float effYaw   = rt::g_headYaw;
-    float effPitch = rt::g_headPitch;
-    float effRoll  = rt::g_headRoll;
-    if (rt::g_poseSweepEnabled) {
-        float t = (float)GetTickCount64() * 0.001f - rt::g_poseSweepStartT;
-        const float TWO_PI = 6.2831853f;
-        float w = TWO_PI * rt::g_poseSweepFreq;
-        effYaw   = rt::g_poseSweepYawAmp   * sinf(w * t);
-        effPitch = rt::g_poseSweepPitchAmp * sinf(w * t + 1.0f);
-        effRoll  = rt::g_poseSweepRollAmp  * sinf(w * t + 2.0f);
-    }
-
-    // Use dynamic head pose from mouse look (yaw + pitch) plus optional
-    // MCP-injected roll so off-axis quaternion-handedness bugs (which
-    // identity pose hides) actually surface in the simulator.
-    XrQuaternionf orientation = rt::QuatFromYawPitchRoll(effYaw, effPitch, effRoll);
-    
-    // Helper function to rotate a vector by a quaternion
-    auto rotateVector = [](XrQuaternionf q, XrVector3f v) -> XrVector3f {
-        // quaternion-vector rotation: q * v * q^-1
-        XrQuaternionf qv{ v.x, v.y, v.z, 0 };
-        XrQuaternionf qinv{ -q.x, -q.y, -q.z, q.w };
-        
-        // Quaternion multiplication: q * qv
-        XrQuaternionf temp{
-            q.w*qv.x + q.x*qv.w + q.y*qv.z - q.z*qv.y,
-            q.w*qv.y - q.x*qv.z + q.y*qv.w + q.z*qv.x,
-            q.w*qv.z + q.x*qv.y - q.y*qv.x + q.z*qv.w,
-            q.w*qv.w - q.x*qv.x - q.y*qv.y - q.z*qv.z
-        };
-        
-        // temp * qinv
-        XrQuaternionf result{
-            temp.w*qinv.x + temp.x*qinv.w + temp.y*qinv.z - temp.z*qinv.y,
-            temp.w*qinv.y - temp.x*qinv.z + temp.y*qinv.w + temp.z*qinv.x,
-            temp.w*qinv.z + temp.x*qinv.y - temp.y*qinv.x + temp.z*qinv.w,
-            temp.w*qinv.w - temp.x*qinv.x - temp.y*qinv.y - temp.z*qinv.z
-        };
-        
-        return XrVector3f{ result.x, result.y, result.z };
-    };
+    // Composition-layer placement reads these same two helpers, which is what keeps
+    // an overlay pinned to the geometry the app renders around it.
+    float effYaw, effPitch, effRoll;
+    rt::GetEffectiveHeadAngles(effYaw, effPitch, effRoll);
 
     for (uint32_t i = 0; i < 2; ++i) {
         views[i].type = XR_TYPE_VIEW;
-        views[i].pose.orientation = orientation;
-        
-        // Apply IPD offset in full head orientation space (yaw+pitch)
-        // This fixes stereo geometry and eliminates warping when pitching
-        float eyeOffset = (i == 0 ? -ipd * 0.5f : ipd * 0.5f);
-        XrVector3f localEyeOffset{ eyeOffset, 0.0f, 0.0f };
-        XrVector3f rotatedOffset = rotateVector(orientation, localEyeOffset);
-        
-        views[i].pose.position = {
-            rt::g_headPos.x + rotatedOffset.x,
-            rt::g_headPos.y + rotatedOffset.y,
-            rt::g_headPos.z + rotatedOffset.z
-        };
-        
-        if (rt::g_useCustomFov) {
-            // Per-eye asymmetric FOV (XrFovf convention: aL<0, aR>0, aU>0, aD<0).
-            // Set via MCP set_fov / set_headset_profile. Real-headset bugs that
-            // hide under the simulator's symmetric default surface here.
-            views[i].fov = { rt::g_eyeFovL[i], rt::g_eyeFovR[i],
-                             rt::g_eyeFovU[i], rt::g_eyeFovD[i] };
-        } else {
-            views[i].fov = rt::GetUiFov(i);
-        }
+        views[i].pose = rt::ViewPoseFromAngles(i, effYaw, effPitch, effRoll);
+        views[i].fov = rt::GetViewFov(i);
     }
     static int locateCount = 0;
     if (++locateCount % 90 == 1) {  // Log every 90 frames (~1 second)
@@ -5143,11 +5417,13 @@ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrRefe
     if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
     static uintptr_t nextSpace = 100;
     *space = (XrSpace)(nextSpace++);
+    rt::g_referenceSpaces[*space] = rt::RefSpace{ info->referenceSpaceType, info->poseInReferenceSpace };
     Logf("[SimXR] xrCreateReferenceSpace: type=%d space=%p", info->referenceSpaceType, *space);
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrDestroySpace_runtime(XrSpace space) {
+    rt::g_referenceSpaces.erase(space);
     Logf("[SimXR] xrDestroySpace: space=%p", space);
     return XR_SUCCESS;
 }
