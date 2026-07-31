@@ -7,7 +7,11 @@
 #include <string>
 #include <functional>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <cstdlib>
+
+#include "json.h"
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -251,6 +255,145 @@ inline bool IsIpdSettingsCommand(int cmd) {
     return cmd == ID_IPD_0 || cmd == ID_IPD_58 || cmd == ID_IPD_64 ||
            cmd == ID_IPD_70 || cmd == ID_IPD_80 ||
            cmd == ID_IPD_DECREASE || cmd == ID_IPD_INCREASE;
+}
+
+// ---------------------------------------------------------------------------
+// Settings persistence
+//
+// The runtime is a DLL with no dependable shutdown hook -- the preview window
+// deliberately never posts a quit message, and hosts get killed outright -- so
+// every change writes the file instead of waiting for an exit that may not come.
+// ---------------------------------------------------------------------------
+
+inline const char* ViewModeName(ViewMode m) {
+    switch (m) {
+        case ViewMode::LeftEyeOnly:  return "left";
+        case ViewMode::RightEyeOnly: return "right";
+        case ViewMode::BothEyes:     break;
+    }
+    return "both";
+}
+
+inline ViewMode ViewModeFromName(const char* s, ViewMode def) {
+    if (strcmp(s, "left") == 0)  return ViewMode::LeftEyeOnly;
+    if (strcmp(s, "right") == 0) return ViewMode::RightEyeOnly;
+    if (strcmp(s, "both") == 0)  return ViewMode::BothEyes;
+    return def;
+}
+
+inline const char* DisplayLayoutName(DisplayLayout l) {
+    switch (l) {
+        case DisplayLayout::OverUnder: return "over_under";
+        case DisplayLayout::Anaglyph:  return "anaglyph";
+        case DisplayLayout::SideBySide: break;
+    }
+    return "side_by_side";
+}
+
+inline DisplayLayout DisplayLayoutFromName(const char* s, DisplayLayout def) {
+    if (strcmp(s, "over_under") == 0)   return DisplayLayout::OverUnder;
+    if (strcmp(s, "anaglyph") == 0)     return DisplayLayout::Anaglyph;
+    if (strcmp(s, "side_by_side") == 0) return DisplayLayout::SideBySide;
+    return def;
+}
+
+inline const char* HeadsetProfileName(HeadsetProfile p) {
+    return GetHeadsetSpec(p).id;
+}
+
+inline HeadsetProfile HeadsetProfileFromName(const char* s, HeadsetProfile def) {
+    int i = FindHeadsetSpec(s);
+    return i < 0 ? def : (HeadsetProfile)i;
+}
+
+// Empty until LoadSettings() runs, which makes every SaveSettings() before that
+// a no-op -- startup can't write defaults over a file it hasn't read yet.
+inline std::string g_settingsPath;
+inline std::string g_lastSettingsJson;
+
+inline std::string SerializeSettings() {
+    char buf[768];
+    snprintf(buf, sizeof(buf),
+        "{\n"
+        "  \"view_mode\": \"%s\",\n"
+        "  \"layout\": \"%s\",\n"
+        "  \"headset_profile\": \"%s\",\n"
+        "  \"asymmetric_fov\": %s,\n"
+        "  \"fov_degrees\": %d,\n"
+        "  \"ipd_mm\": %d,\n"
+        "  \"zoom\": %.2f,\n"
+        "  \"fit_to_window\": %s,\n"
+        "  \"full_render\": %s,\n"
+        "  \"show_stats\": %s\n"
+        "}\n",
+        ViewModeName(g_uiState.viewMode),
+        DisplayLayoutName(g_uiState.displayLayout),
+        HeadsetProfileName(g_uiState.headsetProfile),
+        g_uiState.useAsymmetricFov ? "true" : "false",
+        g_uiState.fovDegrees,
+        GetIpdMillimeters(),
+        g_uiState.zoomLevel,
+        g_uiState.fitToWindow ? "true" : "false",
+        g_uiState.showFullRender ? "true" : "false",
+        g_uiState.showStats ? "true" : "false");
+    return buf;
+}
+
+inline void SaveSettings() {
+    if (g_settingsPath.empty()) return;
+
+    std::string json = SerializeSettings();
+    if (json == g_lastSettingsJson) return;
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, g_settingsPath.c_str(), "w") != 0 || !f) return;
+    fwrite(json.data(), 1, json.size(), f);
+    fclose(f);
+    g_lastSettingsJson = std::move(json);
+}
+
+inline void ApplySettingsJson(const char* text) {
+    json::Object o(text);
+
+    // Profile first: it resets FOV symmetry and IPD, so the saved values for
+    // those have to land after it.
+    std::string profile = o.string("headset_profile");
+    if (!profile.empty()) {
+        SetHeadsetProfile(HeadsetProfileFromName(profile.c_str(), g_uiState.headsetProfile));
+    }
+
+    g_uiState.viewMode = ViewModeFromName(
+        o.string("view_mode").c_str(), g_uiState.viewMode);
+    g_uiState.displayLayout = DisplayLayoutFromName(
+        o.string("layout").c_str(), g_uiState.displayLayout);
+
+    g_uiState.useAsymmetricFov = o.boolean("asymmetric_fov", g_uiState.useAsymmetricFov);
+    g_uiState.fovDegrees = (std::max)(30, (std::min)(170,
+        o.number("fov_degrees", g_uiState.fovDegrees)));
+    SetIpdMillimeters(o.number("ipd_mm", GetIpdMillimeters()));
+
+    g_uiState.zoomLevel = (std::max)(0.1f, (std::min)(2.0f,
+        o.number("zoom", g_uiState.zoomLevel)));
+    g_uiState.fitToWindow = o.boolean("fit_to_window", g_uiState.fitToWindow);
+    g_uiState.showFullRender = o.boolean("full_render", g_uiState.showFullRender);
+    g_uiState.showStats = o.boolean("show_stats", g_uiState.showStats);
+}
+
+// Restore saved settings from `dataDir` and arm SaveSettings().
+inline void LoadSettings(const std::string& dataDir) {
+    CreateDirectoryA(dataDir.c_str(), nullptr);
+    std::string path = dataDir + "\\settings.json";
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") == 0 && f) {
+        char buf[2048];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+        ApplySettingsJson(buf);
+    }
+
+    g_settingsPath = std::move(path);
 }
 
 // Dark mode colors
@@ -681,6 +824,7 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
 
         case ID_TOOLS_TOGGLE_STATS: {
             g_uiState.showStats = !g_uiState.showStats;
+            SaveSettings();
             HMENU menuT = GetMenu(hwnd);
             if (menuT) UpdateMenuState(menuT);
             return true;
@@ -709,6 +853,8 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
     if (settingsChanged && settingsChangedCallback) {
         settingsChangedCallback(cmd);
     }
+
+    SaveSettings();
 
     // Update menu checkmarks
     HMENU menu = GetMenu(hwnd);
@@ -784,6 +930,7 @@ inline bool HandleMouseWheel(HWND hwnd, short delta,
 
     float zoomDelta = (delta > 0) ? 0.05f : -0.05f;
     AdjustZoom(zoomDelta);
+    SaveSettings();
 
     if (resizeCallback) resizeCallback();
 

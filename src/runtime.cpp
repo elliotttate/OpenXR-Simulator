@@ -1565,7 +1565,19 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
          createInfo->applicationInfo.applicationVersion);
     rt::g_instance = {};
     rt::g_instance.enabledExtensions.clear();
-    
+
+    // Restore the saved UI settings here rather than at window creation: apps ask
+    // for view configurations, whose panel resolution and FOV both come from the
+    // saved headset profile, long before a preview window exists.
+    static bool s_settingsLoaded = false;
+    if (!s_settingsLoaded) {
+        s_settingsLoaded = true;
+        ui::LoadSettings(mcp::GetSimulatorDataPath());
+        Logf("[SimXR] Settings restored: profile=%ls ipd=%dmm asymmetric=%d zoom=%d%%",
+             ui::GetHeadsetProfileShortName(), ui::GetIpdMillimeters(),
+             (int)ui::g_uiState.useAsymmetricFov, (int)(ui::g_uiState.zoomLevel * 100));
+    }
+
     // Validate that all requested extensions are supported
     const uint32_t supportedCount = (uint32_t)(sizeof(kSupportedExtensions)/sizeof(kSupportedExtensions[0]));
     for (uint32_t i = 0; i < createInfo->enabledExtensionCount; ++i) {

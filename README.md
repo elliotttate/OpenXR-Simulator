@@ -118,6 +118,20 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 
 ## 🎮 Configuration
 
+### Saved Settings
+
+View mode, display layout, headset profile, FOV, IPD, zoom, full-render and the
+stats toggle survive a restart. Every change is written straight to
+`%LOCALAPPDATA%\OpenXR-Simulator\settings.json`, and it is read back at
+`xrCreateInstance` — before the app asks for view configurations, so a saved
+headset profile decides the recommended per-eye resolution the app renders at.
+
+Delete the file to go back to defaults. Unknown or out-of-range values fall back
+to the default for that field rather than failing the load.
+
+MCP overrides (`set_fov`, `set_ipd`, `set_headset_profile`) are not persisted —
+they are per-session test fixtures.
+
 ### Headset Profiles
 
 A profile presets the per-eye frustum, the native panel resolution reported to
