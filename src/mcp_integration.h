@@ -8,9 +8,12 @@
 #include <wrl/client.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+
+#include "json.h"
 
 namespace mcp {
 
@@ -59,22 +62,10 @@ inline void CheckScreenshotRequest() {
         buf[n] = 0;
         fclose(f);
 
+        json::Object o(buf);
         g_screenshotRequested = true;
-        g_screenshotEye = "both";
-        g_screenshotLayer = "projection";  // default
-
-        const char* eyePos = strstr(buf, "\"eye\"");
-        if (eyePos) {
-            if (strstr(eyePos, "\"left\"")) g_screenshotEye = "left";
-            else if (strstr(eyePos, "\"right\"")) g_screenshotEye = "right";
-        }
-
-        // Check for layer type specification
-        const char* layerPos = strstr(buf, "\"layer\"");
-        if (layerPos) {
-            if (strstr(layerPos, "\"quad\"")) g_screenshotLayer = "quad";
-            else if (strstr(layerPos, "\"all\"")) g_screenshotLayer = "all";
-        }
+        g_screenshotEye = o.string("eye", "both");
+        g_screenshotLayer = o.string("layer", "projection");
 
         DeleteFileA(reqPath.c_str());
         McpLogf("Screenshot request detected: layer=%s, eye=%s", g_screenshotLayer.c_str(), g_screenshotEye.c_str());
@@ -543,27 +534,6 @@ struct HeadPoseCommand {
     bool  hasRoll = false;     // false = leave g_headRoll alone (back-compat)
 };
 
-// Simple JSON float parser
-inline float ParseJsonFloat(const char* json, const char* key, float defaultVal) {
-    char searchKey[64];
-    snprintf(searchKey, sizeof(searchKey), "\"%s\"", key);
-    const char* pos = strstr(json, searchKey);
-    if (!pos) return defaultVal;
-    pos = strchr(pos, ':');
-    if (!pos) return defaultVal;
-    pos++;
-    while (*pos == ' ' || *pos == '\t') pos++;
-    return (float)atof(pos);
-}
-
-// Returns true if `key` appears in the JSON (regardless of value).
-// Used to detect "field omitted" vs "field set to 0".
-inline bool JsonHasKey(const char* json, const char* key) {
-    char searchKey[64];
-    snprintf(searchKey, sizeof(searchKey), "\"%s\"", key);
-    return strstr(json, searchKey) != nullptr;
-}
-
 // Check for head pose command from MCP
 // File format: {"x": 0, "y": 1.7, "z": 0, "yaw": 0, "pitch": 0, "roll": 0}
 // "roll" is optional — omit to keep the simulator's current roll value.
@@ -577,17 +547,21 @@ inline HeadPoseCommand CheckHeadPoseCommand() {
         buf[n] = 0;
         fclose(f);
 
-        cmd.valid = true;
-        cmd.x = ParseJsonFloat(buf, "x", 0.0f);
-        cmd.y = ParseJsonFloat(buf, "y", 1.7f);
-        cmd.z = ParseJsonFloat(buf, "z", 0.0f);
-        cmd.yaw = ParseJsonFloat(buf, "yaw", 0.0f);
-        cmd.pitch = ParseJsonFloat(buf, "pitch", 0.0f);
-        cmd.hasRoll = JsonHasKey(buf, "roll");
-        if (cmd.hasRoll) cmd.roll = ParseJsonFloat(buf, "roll", 0.0f);
-
         // Delete the file after reading (one-shot command)
         DeleteFileA(cmdPath.c_str());
+
+        json::Object o(buf);
+        if (!o.valid()) return cmd;
+
+        cmd.valid = true;
+        cmd.x = o.number("x", 0.0f);
+        cmd.y = o.number("y", 1.7f);
+        cmd.z = o.number("z", 0.0f);
+        cmd.yaw = o.number("yaw", 0.0f);
+        cmd.pitch = o.number("pitch", 0.0f);
+        cmd.hasRoll = o.has("roll");
+        if (cmd.hasRoll) cmd.roll = o.number("roll", 0.0f);
+
         McpLogf("Head pose command: pos(%.2f, %.2f, %.2f) yaw=%.2f pitch=%.2f roll=%.2f",
                 cmd.x, cmd.y, cmd.z, cmd.yaw, cmd.pitch,
                 cmd.hasRoll ? cmd.roll : NAN);
@@ -626,24 +600,23 @@ inline FovCommand CheckFovCommand() {
     buf[n] = 0;
     fclose(f);
     DeleteFileA(p.c_str());
+
+    json::Object o(buf);
+    if (!o.valid()) return cmd;
+
     cmd.valid = true;
-    if (JsonHasKey(buf, "clear")) {
+    if (o.has("clear")) {
         cmd.clear = true;
         McpLog("FOV command: clear (revert to symmetric default)");
         return cmd;
     }
-    // Find "left": { ... } and "right": { ... } sub-objects and parse from there.
     auto parseEye = [&](const char* eyeKey, int idx) {
-        char k[16];
-        snprintf(k, sizeof(k), "\"%s\"", eyeKey);
-        const char* eye = strstr(buf, k);
-        if (!eye) return;
-        const char* brace = strchr(eye, '{');
-        if (!brace) return;
-        cmd.angleLeft[idx]  = ParseJsonFloat(brace, "aL", -1.0f);
-        cmd.angleRight[idx] = ParseJsonFloat(brace, "aR",  1.0f);
-        cmd.angleUp[idx]    = ParseJsonFloat(brace, "aU",  1.0f);
-        cmd.angleDown[idx]  = ParseJsonFloat(brace, "aD", -1.0f);
+        json::Object eye = o.object(eyeKey);
+        if (!eye.valid()) return;
+        cmd.angleLeft[idx]  = eye.number("aL", -1.0f);
+        cmd.angleRight[idx] = eye.number("aR",  1.0f);
+        cmd.angleUp[idx]    = eye.number("aU",  1.0f);
+        cmd.angleDown[idx]  = eye.number("aD", -1.0f);
     };
     parseEye("left",  0);
     parseEye("right", 1);
@@ -670,13 +643,17 @@ inline IpdCommand CheckIpdCommand() {
     buf[n] = 0;
     fclose(f);
     DeleteFileA(p.c_str());
+
+    json::Object o(buf);
+    if (!o.valid()) return cmd;
+
     cmd.valid = true;
-    if (JsonHasKey(buf, "clear")) {
+    if (o.has("clear")) {
         cmd.clear = true;
         McpLog("IPD command: clear (revert to 64mm default)");
         return cmd;
     }
-    float mm = ParseJsonFloat(buf, "ipd_mm", 64.0f);
+    float mm = o.number("ipd_mm", 64.0f);
     cmd.ipdMeters = mm * 0.001f;
     McpLogf("IPD command: %.1f mm", mm);
     return cmd;
@@ -699,19 +676,11 @@ inline HeadsetProfileCommand CheckHeadsetProfileCommand() {
     buf[n] = 0;
     fclose(f);
     DeleteFileA(p.c_str());
-    // Find "name":"value"
-    const char* k = strstr(buf, "\"name\"");
-    if (!k) return cmd;
-    const char* col = strchr(k, ':');
-    if (!col) return cmd;
-    const char* q = strchr(col, '"');
-    if (!q) return cmd;
-    ++q;
-    const char* eq = strchr(q, '"');
-    if (!eq) return cmd;
-    size_t L = (size_t)(eq - q);
-    if (L >= sizeof(cmd.name)) L = sizeof(cmd.name) - 1;
-    memcpy(cmd.name, q, L);
+
+    std::string name = json::Object(buf).string("name");
+    if (name.empty()) return cmd;
+    size_t L = (std::min)(name.size(), sizeof(cmd.name) - 1);
+    memcpy(cmd.name, name.data(), L);
     cmd.name[L] = 0;
     cmd.valid = true;
     McpLogf("Headset profile command: %s", cmd.name);
@@ -737,12 +706,16 @@ inline PoseSweepCommand CheckPoseSweepCommand() {
     buf[n] = 0;
     fclose(f);
     DeleteFileA(p.c_str());
+
+    json::Object o(buf);
+    if (!o.valid()) return cmd;
+
     cmd.valid = true;
-    cmd.enabled       = strstr(buf, "\"enabled\"") && strstr(buf, "true");
-    cmd.yawAmpDeg     = ParseJsonFloat(buf, "yaw_amp_deg",   30.0f);
-    cmd.pitchAmpDeg   = ParseJsonFloat(buf, "pitch_amp_deg", 15.0f);
-    cmd.rollAmpDeg    = ParseJsonFloat(buf, "roll_amp_deg",  15.0f);
-    cmd.freqHz        = ParseJsonFloat(buf, "freq_hz",        0.25f);
+    cmd.enabled       = o.boolean("enabled", false);
+    cmd.yawAmpDeg     = o.number("yaw_amp_deg",   30.0f);
+    cmd.pitchAmpDeg   = o.number("pitch_amp_deg", 15.0f);
+    cmd.rollAmpDeg    = o.number("roll_amp_deg",  15.0f);
+    cmd.freqHz        = o.number("freq_hz",        0.25f);
     McpLogf("Pose sweep command: enabled=%d yawAmp=%.1f pitchAmp=%.1f rollAmp=%.1f freq=%.2fHz",
             cmd.enabled, cmd.yawAmpDeg, cmd.pitchAmpDeg, cmd.rollAmpDeg, cmd.freqHz);
     return cmd;
@@ -764,9 +737,12 @@ inline AnaglyphCommand CheckAnaglyphCommand() {
     buf[n] = 0;
     fclose(f);
     DeleteFileA(p.c_str());
+
+    json::Object o(buf);
+    if (!o.valid()) return cmd;
+
     cmd.valid = true;
-    // ParseJsonFloat returns 0.0f for false-ish, !=0 for true.
-    cmd.enabled = strstr(buf, "\"enabled\"") && strstr(buf, "true");
+    cmd.enabled = o.boolean("enabled", false);
     McpLogf("Anaglyph command: enabled=%d", cmd.enabled ? 1 : 0);
     return cmd;
 }
@@ -858,20 +834,24 @@ inline ControllerPoseCommand CheckControllerPoseCommand() {
         buf[n] = 0;
         fclose(f);
 
-        cmd.valid = true;
-        cmd.hand = (int)ParseJsonFloat(buf, "hand", 1.0f);
-        cmd.posX = ParseJsonFloat(buf, "posX", 0.2f);
-        cmd.posY = ParseJsonFloat(buf, "posY", -0.3f);
-        cmd.posZ = ParseJsonFloat(buf, "posZ", -0.4f);
-        cmd.yaw = ParseJsonFloat(buf, "yaw", 0.0f);
-        cmd.pitch = ParseJsonFloat(buf, "pitch", -0.3f);
-        cmd.trigger = ParseJsonFloat(buf, "trigger", -1.0f);
-        cmd.triggerSet = (cmd.trigger >= 0.0f);
-        if (!cmd.triggerSet) cmd.trigger = 0.0f;
-        cmd.buttonA = (int)ParseJsonFloat(buf, "buttonA", -1.0f);
-
         // Delete the file after reading (one-shot command)
         DeleteFileA(cmdPath.c_str());
+
+        json::Object o(buf);
+        if (!o.valid()) return cmd;
+
+        cmd.valid = true;
+        cmd.hand = o.number("hand", 1);
+        cmd.posX = o.number("posX", 0.2f);
+        cmd.posY = o.number("posY", -0.3f);
+        cmd.posZ = o.number("posZ", -0.4f);
+        cmd.yaw = o.number("yaw", 0.0f);
+        cmd.pitch = o.number("pitch", -0.3f);
+        cmd.trigger = o.number("trigger", -1.0f);
+        cmd.triggerSet = (cmd.trigger >= 0.0f);
+        if (!cmd.triggerSet) cmd.trigger = 0.0f;
+        cmd.buttonA = o.number("buttonA", -1);
+
         McpLogf("Controller pose command: hand=%d pos(%.2f, %.2f, %.2f) yaw=%.2f pitch=%.2f trigger=%.1f",
                 cmd.hand, cmd.posX, cmd.posY, cmd.posZ, cmd.yaw, cmd.pitch, cmd.trigger);
     }
