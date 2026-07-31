@@ -31,6 +31,17 @@ Builds the runtime and installs `openxr_simulator.dll`, a relocatable
 and gitignored by BetterVR so only build output ever lands in that checkout. Use
 `-InstallTo` for a different location.
 
+The dll and scripts are **symlinked** into that folder, so a rebuild is live in
+BetterVR with no reinstall — the CMake tree and `bin\` stay in this repo and the
+BetterVR side is just a view of them. Creating symlinks needs Developer Mode
+(Settings > System > For developers) or an elevated shell; without it the script
+copies and tells you. Pass `-Copy` for real copies when the folder has to stand on
+its own — moved to another machine, or still working after the build tree is gone.
+
+One consequence of linking: if Cemu or the probe still has the runtime loaded, the
+*build* now fails at the link step rather than the install step, because the dll it
+writes is the one that process holds open. Close it and rebuild.
+
 ## Use
 
 Per-process, which leaves the machine-wide runtime registration (Virtual Desktop,
