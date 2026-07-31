@@ -109,6 +109,22 @@ struct UIState {
 
 inline UIState g_uiState;
 
+// Native per-eye panel resolution for the active profile. Two jobs: it is what
+// xrEnumerateViewConfigurationViews recommends, and it is the shape the preview maps
+// each eye onto. The second matters more. These headsets have frusta that are taller
+// than they are wide, so an app that renders one into a 16:9 buffer has non-square
+// pixels -- correct, and what a real compositor un-squeezes when it maps the buffer
+// onto the panel. Blitting that buffer 1:1 instead is what looks stretched.
+inline void GetHeadsetPanelResolution(uint32_t& width, uint32_t& height) {
+    switch (g_uiState.headsetProfile) {
+        case HeadsetProfile::Quest2:     width = 1832; height = 1920; break;
+        case HeadsetProfile::ValveIndex: width = 1440; height = 1600; break;
+        case HeadsetProfile::Quest3:     width = 2064; height = 2208; break;
+        case HeadsetProfile::GenericSymmetric:
+        default:                         width = 1440; height = 1440; break;  // square FOV, square panel
+    }
+}
+
 inline int GetIpdMillimeters() {
     return (int)(g_uiState.ipdMeters * 1000.0f + 0.5f);
 }

@@ -837,6 +837,31 @@ static FitRect ComputeFitRect(int contentW, int contentH, int dstW, int dstH) {
     return r;
 }
 
+// Shrink w x h, keeping its aspect, until it fits the desktop work area.
+static void ClampToWorkArea(int& w, int& h) {
+    if (w <= 0 || h <= 0) return;
+    RECT wa{};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) return;
+    const int maxW = (int)((wa.right - wa.left) * 0.9);
+    const int maxH = (int)((wa.bottom - wa.top) * 0.9);
+    if (maxW <= 0 || maxH <= 0 || (w <= maxW && h <= maxH)) return;
+    const double scale = (std::min)((double)maxW / w, (double)maxH / h);
+    w = (std::max)(320, (int)(w * scale));
+    h = (std::max)(240, (int)(h * scale));
+}
+
+// The shape the preview maps the eyes onto: the headset's panel, laid out for the
+// current view mode. This is deliberately NOT the app's buffer size. The app renders
+// the frustum we report, which is taller than it is wide; into a 16:9 buffer that is
+// non-square pixels, and showing those pixels 1:1 stretches the image ~2x horizontally.
+// Scaling the buffer into the panel's shape is what a real compositor does.
+static void ComputeDisplayDims(int& contentW, int& contentH) {
+    uint32_t panelW = 0, panelH = 0;
+    ui::GetHeadsetPanelResolution(panelW, panelH);
+    ComputeContentDims((int)panelW, (int)panelH, ui::g_uiState.viewMode, ui::g_uiState.displayLayout,
+                       contentW, contentH);
+}
+
 // The region of a swapchain image the app declared valid (XrSwapchainSubImage::imageRect),
 // clamped to the texture. Apps commonly render a 16:9 eye into a larger or square
 // swapchain and describe it with this rect, so everything downstream - the copy, the
@@ -917,12 +942,8 @@ static void FitWindowToContentAspect(HWND hWnd) {
     const int ch = cr.bottom - cr.top;
     if (cw <= 0 || ch <= 0) return;
 
-    const UINT srcW = g_sourceWidth.load();
-    const UINT srcH = g_sourceHeight.load();
-    if (srcW == 0 || srcH == 0) return;
-
     int contentW = 0, contentH = 0;
-    ComputeContentDims((int)srcW, (int)srcH, ui::g_uiState.viewMode, ui::g_uiState.displayLayout, contentW, contentH);
+    ComputeDisplayDims(contentW, contentH);
     if (contentW <= 0 || contentH <= 0) return;
 
     const double contentAspect = (double)contentW / (double)contentH;
@@ -1667,12 +1688,15 @@ static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance, 
         for (uint32_t i = 0; i < 2; ++i) {
             views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
             views[i].next = nullptr;
-            views[i].recommendedImageRectWidth = 1280;
-            views[i].recommendedImageRectHeight = 720;
+            uint32_t panelW = 0, panelH = 0;
+            ui::GetHeadsetPanelResolution(panelW, panelH);
+            views[i].recommendedImageRectWidth = panelW;
+            views[i].recommendedImageRectHeight = panelH;
             views[i].recommendedSwapchainSampleCount = 1;
             views[i].maxImageRectWidth = 4096; views[i].maxImageRectHeight = 4096; views[i].maxSwapchainSampleCount = 1;
         }
-        Log("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (1280x720 recommended)");
+        Logf("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (%ux%u recommended)",
+             views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight);
     }
     return XR_SUCCESS;
 }
@@ -3303,11 +3327,15 @@ static void ensurePreviewWithoutProjection(rt::Session& s) {
         rt::g_sourceHeight.store((uint32_t)srcH);
     }
 
-    // Open the window at the zoom-adjusted size, not the raw canvas size:
-    // side-by-side content is twice as wide as one eye, and ensurePreviewSized
-    // would pass that straight through as the initial client size.
-    int windowW = srcW, windowH = srcH;
-    ui::CalculateWindowSize(srcW, srcH, windowW, windowH);
+    // Open at the panel's shape so the first frame is already the right proportions,
+    // clamped to the desktop: two 2064x2208 eyes side by side is wider than any monitor.
+    int windowW = 0, windowH = 0;
+    {
+        uint32_t panelW = 0, panelH = 0;
+        ui::GetHeadsetPanelResolution(panelW, panelH);
+        ui::CalculateWindowSize((int)panelW, (int)panelH, windowW, windowH);
+        rt::ClampToWorkArea(windowW, windowH);
+    }
     ensurePreviewWindow(s, (UINT)windowW, (UINT)windowH);
     if (!s.hwnd) return;
 
@@ -3830,7 +3858,11 @@ static void blitD3D12ToPreview(rt::Session& s,
         HDC hdc = acquirePreviewBackBuffer(s, clientW, clientH);
         if (hdc) {
             {
-                rt::FitRect fit = rt::ComputeFitRect((int)rtWidth, (int)rtHeight, clientW, clientH);
+                // Fit to the panel's shape, not the render target's: this stretch is
+                // what converts the app's non-square pixels back into square ones.
+                int displayW = 0, displayH = 0;
+                rt::ComputeDisplayDims(displayW, displayH);
+                rt::FitRect fit = rt::ComputeFitRect(displayW, displayH, clientW, clientH);
                 int dstX = (int)fit.x;
                 int dstY = (int)fit.y;
                 int dstW = (int)fit.w;
@@ -4684,7 +4716,9 @@ static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
     if (!hdc) return;
 
     // Mirror blitD3D12ToPreview's letterbox so the quad lands in the same client coords as the eyes.
-    rt::FitRect fit = rt::ComputeFitRect((int)s.previewWidth, (int)s.previewHeight, clientW, clientH);
+    int displayW = 0, displayH = 0;
+    rt::ComputeDisplayDims(displayW, displayH);
+    rt::FitRect fit = rt::ComputeFitRect(displayW, displayH, clientW, clientH);
 
     // Must match how blitD3D12ToPreview packs the eyes into the offscreen RT, down to
     // its anaglyph-degrades-to-left-eye fallback.

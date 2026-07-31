@@ -94,7 +94,9 @@ acquire/wait/release and passed a runtime that was corrupting every frame.
   `src\hooking\framebuffer.cpp` does not kick in. That is deliberate: this runtime
   accepts swapchains at the game's own render resolution, so BetterVR takes the
   same code path a real headset takes.
-- Recommended per-eye resolution is 1280x720 (Meta's is 1440x1584).
+- Recommended per-eye resolution is the active headset profile's panel (2064x2208 for
+  the default Quest 3; Meta's is 1440x1584). BetterVR ignores it and asks for the
+  game's own render resolution either way.
 - `xrEndSession` immediately after `xrRequestExitSession` succeeds here. The Meta
   simulator returns `XR_ERROR_SESSION_NOT_STOPPING`, which older BetterVR builds
   turn into a throw from `RND_Renderer::~RND_Renderer`.
@@ -126,6 +128,27 @@ dimensions, so the offscreen RT and the window aspect follow the region the app
 actually rendered. `imageArrayIndex` selects the source slice on the quad path too,
 which it previously ignored. The "show full render" toggle still bypasses cropping
 on both backends.
+
+## Why the preview used to look stretched
+
+The FOV this runtime reports is a real headset frustum — Quest 3's is `(-52, +48,
++53, -52)`, whose tan ranges are 2.39 wide by 2.61 tall, so it is *taller than it is
+wide*. BetterVR renders that frustum into a 2560x1440 buffer. That is not a bug: the
+buffer just has non-square pixels, each covering about twice as much angle vertically
+as horizontally. A real compositor resolves it when it maps the buffer onto the panel.
+
+The preview did not. It blitted the app's pixels 1:1, so the squeeze survived to the
+screen and everything came out about 1.94x too wide.
+
+Each headset profile now carries its native per-eye panel resolution, and the preview
+maps the eyes onto *that* shape rather than the app's buffer — one stretch in the final
+GDI blit, which is what turns the non-square pixels back into square ones. The app's
+pixels still land in the offscreen RT 1:1, so nothing is resampled twice.
+
+Panel aspect and FOV aspect are not identical on real hardware (Quest 3: 0.935 vs
+0.917), so a world-space square still renders about 2% off. Driving the display shape
+from the FOV instead would be exact, at the cost of the window no longer being the
+panel's proportions.
 
 ## Quad layer placement
 
