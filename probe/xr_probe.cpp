@@ -422,7 +422,8 @@ int main() {
             printf("       viewStateFlags=0x%llX  n=%u\n", (unsigned long long)vs.viewStateFlags, n);
             printf("       L pos=(%.3f,%.3f,%.3f) fov=(%.3f,%.3f,%.3f,%.3f)\n", views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
                    views[0].fov.angleLeft, views[0].fov.angleRight, views[0].fov.angleUp, views[0].fov.angleDown);
-            printf("       R pos=(%.3f,%.3f,%.3f)\n", views[1].pose.position.x, views[1].pose.position.y, views[1].pose.position.z);
+            printf("       R pos=(%.3f,%.3f,%.3f) fov=(%.3f,%.3f,%.3f,%.3f)\n", views[1].pose.position.x, views[1].pose.position.y, views[1].pose.position.z,
+                   views[1].fov.angleLeft, views[1].fov.angleRight, views[1].fov.angleUp, views[1].fov.angleDown);
             firstYaw = views[0].pose.orientation.y;
             if (views[0].pose.position.x == views[1].pose.position.x) warn("both eyes share an X position - no stereo IPD separation");
         }

@@ -7,6 +7,7 @@
 #include <string>
 #include <functional>
 #include <algorithm>
+#include <cstring>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -35,10 +36,6 @@ enum MenuCommand {
     ID_FOV_110 = 1203,
     ID_FOV_SYMMETRIC = 1204,
     ID_FOV_ASYMMETRIC = 1205,
-    ID_PROFILE_GENERIC = 1210,
-    ID_PROFILE_QUEST2 = 1211,
-    ID_PROFILE_QUEST3 = 1212,
-    ID_PROFILE_INDEX = 1213,
     ID_IPD_0 = 1220,
     ID_IPD_58 = 1221,
     ID_IPD_64 = 1222,
@@ -62,7 +59,11 @@ enum MenuCommand {
 
     // Help
     ID_HELP_CONTROLS = 1501,
-    ID_HELP_ABOUT = 1502
+    ID_HELP_ABOUT = 1502,
+
+    // One id per kHeadsetSpecs entry, in table order.
+    ID_PROFILE_FIRST = 1600,
+    ID_PROFILE_LAST = 1663
 };
 
 // View mode enum
@@ -79,12 +80,19 @@ enum class DisplayLayout {
     Anaglyph
 };
 
-// Headset profile enum
+// Headset profile enum. Values index kHeadsetSpecs, so the two must stay in
+// the same order.
 enum class HeadsetProfile {
     GenericSymmetric,
     Quest2,
     Quest3,
-    ValveIndex
+    QuestPro,
+    ValveIndex,
+    VivePro2,
+    ReverbG2,
+    PSVR2,
+    Pico4,
+    BigscreenBeyond
 };
 
 // UI State
@@ -114,20 +122,84 @@ inline UIState g_uiState;
 // blanking it until the next tick.
 inline int g_lastFps = 0;
 
-// Native per-eye panel resolution for the active profile. Two jobs: it is what
-// xrEnumerateViewConfigurationViews recommends, and it is the shape the preview maps
-// each eye onto. The second matters more. These headsets have frusta that are taller
-// than they are wide, so an app that renders one into a 16:9 buffer has non-square
-// pixels -- correct, and what a real compositor un-squeezes when it maps the buffer
-// onto the panel. Blitting that buffer 1:1 instead is what looks stretched.
-inline void GetHeadsetPanelResolution(uint32_t& width, uint32_t& height) {
-    switch (g_uiState.headsetProfile) {
-        case HeadsetProfile::Quest2:     width = 1832; height = 1920; break;
-        case HeadsetProfile::ValveIndex: width = 1440; height = 1600; break;
-        case HeadsetProfile::Quest3:     width = 2064; height = 2208; break;
-        case HeadsetProfile::GenericSymmetric:
-        default:                         width = 1440; height = 1440; break;  // square FOV, square panel
+// Everything that varies per headset, in one table.
+//
+// panelWidth/panelHeight is the native per-eye panel resolution: what
+// xrEnumerateViewConfigurationViews recommends, and the shape the preview maps each
+// eye onto. The second is the one that matters -- see "Why the preview used to look
+// stretched" in BETTERVR.md.
+//
+// The frustum half-angles are in degrees, following the XrFovf sign convention. Both
+// eyes are transcribed from the HMD Geometry Database
+// (https://risa2000.github.io/hmdgdb/), which records what each headset's runtime
+// actually reports. Real hardware is not exactly mirrored, so each eye carries its own
+// measured values rather than one being derived from the other.
+struct EyeFov {
+    float angleLeft, angleRight, angleUp, angleDown;
+};
+
+struct HeadsetSpec {
+    const char*    id;          // settings key and MCP set_headset_profile name
+    const wchar_t* shortName;   // title bar
+    const wchar_t* menuLabel;
+    uint32_t       panelWidth;
+    uint32_t       panelHeight;
+    int            ipdMm;       // nominal default, not the database's per-session value
+    EyeFov         eye[2];      // [0] = left, [1] = right
+};
+
+// GenericSymmetric takes its FOV from g_uiState.fovDegrees, so its angles are unused.
+inline constexpr HeadsetSpec kHeadsetSpecs[] = {
+    { "generic",  L"Generic",    L"&Generic Symmetric", 1440, 1440, 64,
+      {{   0.00f,  0.00f,  0.00f,   0.00f }, {   0.00f,  0.00f,  0.00f,   0.00f }} },
+    { "quest2",   L"Quest 2",    L"Meta Quest &2",      1832, 1920, 64,
+      {{ -52.00f, 45.00f, 48.00f, -50.00f }, { -45.00f, 52.00f, 48.00f, -50.00f }} },
+    { "quest3",   L"Quest 3",    L"Meta Quest &3",      2064, 2208, 64,
+      {{ -54.00f, 40.00f, 43.98f, -54.27f }, { -40.00f, 54.00f, 43.98f, -54.27f }} },
+    { "questpro", L"Quest Pro",  L"Meta Quest &Pro",    1800, 1920, 64,
+      {{ -54.00f, 39.86f, 42.00f, -53.57f }, { -39.86f, 54.00f, 42.00f, -53.57f }} },
+    { "index",    L"Index",      L"Valve &Index",       1440, 1600, 63,
+      {{ -54.00f, 42.98f, 54.63f, -54.52f }, { -42.95f, 54.06f, 54.66f, -54.50f }} },
+    { "vivepro2", L"Vive Pro 2", L"HTC &Vive Pro 2",    2448, 2448, 63,
+      {{ -58.26f, 39.94f, 48.21f, -48.11f }, { -39.89f, 58.26f, 48.44f, -48.20f }} },
+    { "reverbg2", L"Reverb G2",  L"HP &Reverb G2",      2160, 2160, 64,
+      {{ -49.37f, 42.14f, 45.53f, -45.35f }, { -42.17f, 49.48f, 45.78f, -45.05f }} },
+    { "psvr2",    L"PS VR2",     L"&Sony PS VR2",       2000, 2040, 64,
+      {{ -61.50f, 43.45f, 53.04f, -53.04f }, { -43.45f, 61.50f, 53.04f, -53.04f }} },
+    { "pico4",    L"PICO 4",     L"PIC&O 4",            2160, 2160, 64,
+      {{ -52.00f, 52.00f, 52.00f, -52.00f }, { -52.00f, 52.00f, 52.00f, -52.00f }} },
+    { "beyond",   L"Beyond",     L"&Bigscreen Beyond",  2560, 2560, 64,
+      {{ -48.97f, 39.58f, 38.01f, -50.52f }, { -40.02f, 48.56f, 38.13f, -50.43f }} },
+};
+
+inline constexpr int kHeadsetProfileCount =
+    (int)(sizeof(kHeadsetSpecs) / sizeof(kHeadsetSpecs[0]));
+
+static_assert(kHeadsetProfileCount <= ID_PROFILE_LAST - ID_PROFILE_FIRST + 1,
+              "kHeadsetSpecs outgrew the reserved menu id block");
+
+inline const HeadsetSpec& GetHeadsetSpec(HeadsetProfile profile) {
+    int i = (int)profile;
+    if (i < 0 || i >= kHeadsetProfileCount) i = 0;
+    return kHeadsetSpecs[i];
+}
+
+inline const HeadsetSpec& GetActiveHeadsetSpec() {
+    return GetHeadsetSpec(g_uiState.headsetProfile);
+}
+
+// Index into kHeadsetSpecs, or -1 when `s` names no known profile.
+inline int FindHeadsetSpec(const char* s) {
+    for (int i = 0; i < kHeadsetProfileCount; ++i) {
+        if (strcmp(s, kHeadsetSpecs[i].id) == 0) return i;
     }
+    return -1;
+}
+
+inline void GetHeadsetPanelResolution(uint32_t& width, uint32_t& height) {
+    const HeadsetSpec& spec = GetActiveHeadsetSpec();
+    width = spec.panelWidth;
+    height = spec.panelHeight;
 }
 
 inline int GetIpdMillimeters() {
@@ -145,25 +217,8 @@ inline void AdjustIpdMillimeters(int deltaMm) {
 
 inline void SetHeadsetProfile(HeadsetProfile profile) {
     g_uiState.headsetProfile = profile;
-
-    switch (profile) {
-        case HeadsetProfile::GenericSymmetric:
-            g_uiState.useAsymmetricFov = false;
-            SetIpdMillimeters(64);
-            break;
-        case HeadsetProfile::Quest2:
-            g_uiState.useAsymmetricFov = true;
-            SetIpdMillimeters(64);
-            break;
-        case HeadsetProfile::Quest3:
-            g_uiState.useAsymmetricFov = true;
-            SetIpdMillimeters(64);
-            break;
-        case HeadsetProfile::ValveIndex:
-            g_uiState.useAsymmetricFov = true;
-            SetIpdMillimeters(63);
-            break;
-    }
+    g_uiState.useAsymmetricFov = (profile != HeadsetProfile::GenericSymmetric);
+    SetIpdMillimeters(GetHeadsetSpec(profile).ipdMm);
 }
 
 inline void SetSymmetricViews() {
@@ -179,20 +234,17 @@ inline void SetAsymmetricViews() {
 }
 
 inline const wchar_t* GetHeadsetProfileShortName() {
-    switch (g_uiState.headsetProfile) {
-        case HeadsetProfile::GenericSymmetric: return L"Generic";
-        case HeadsetProfile::Quest2: return L"Quest 2";
-        case HeadsetProfile::Quest3: return L"Quest 3";
-        case HeadsetProfile::ValveIndex: return L"Index";
-    }
-    return L"Generic";
+    return GetActiveHeadsetSpec().shortName;
+}
+
+inline bool IsHeadsetProfileCommand(int cmd) {
+    return cmd >= ID_PROFILE_FIRST && cmd < ID_PROFILE_FIRST + kHeadsetProfileCount;
 }
 
 inline bool IsFovSettingsCommand(int cmd) {
     return cmd == ID_FOV_70 || cmd == ID_FOV_90 || cmd == ID_FOV_110 ||
            cmd == ID_FOV_SYMMETRIC || cmd == ID_FOV_ASYMMETRIC ||
-           cmd == ID_PROFILE_GENERIC || cmd == ID_PROFILE_QUEST2 ||
-           cmd == ID_PROFILE_QUEST3 || cmd == ID_PROFILE_INDEX;
+           IsHeadsetProfileCommand(cmd);
 }
 
 inline bool IsIpdSettingsCommand(int cmd) {
@@ -274,10 +326,10 @@ inline HMENU CreateAppMenu() {
     AppendMenuW(fovMenu, MF_SEPARATOR, 0, nullptr);
 
     HMENU profileMenu = CreatePopupMenu();
-    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_GENERIC, L"&Generic Symmetric");
-    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_QUEST2, L"Quest &2");
-    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_QUEST3, L"Quest &3");
-    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_INDEX, L"Valve &Index");
+    for (int i = 0; i < kHeadsetProfileCount; ++i) {
+        if (i == 1) AppendMenuW(profileMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_FIRST + i, kHeadsetSpecs[i].menuLabel);
+    }
     AppendMenuW(fovMenu, MF_POPUP, (UINT_PTR)profileMenu, L"Headset &Profile");
 
     HMENU ipdMenu = CreatePopupMenu();
@@ -349,14 +401,10 @@ inline void UpdateMenuState(HMENU menu) {
     CheckMenuItem(menu, ID_FOV_110, (!g_uiState.useAsymmetricFov && g_uiState.fovDegrees == 110) ? MF_CHECKED : MF_UNCHECKED);
 
     // Headset profile checks
-    CheckMenuItem(menu, ID_PROFILE_GENERIC,
-        g_uiState.headsetProfile == HeadsetProfile::GenericSymmetric ? MF_CHECKED : MF_UNCHECKED);
-    CheckMenuItem(menu, ID_PROFILE_QUEST2,
-        g_uiState.headsetProfile == HeadsetProfile::Quest2 ? MF_CHECKED : MF_UNCHECKED);
-    CheckMenuItem(menu, ID_PROFILE_QUEST3,
-        g_uiState.headsetProfile == HeadsetProfile::Quest3 ? MF_CHECKED : MF_UNCHECKED);
-    CheckMenuItem(menu, ID_PROFILE_INDEX,
-        g_uiState.headsetProfile == HeadsetProfile::ValveIndex ? MF_CHECKED : MF_UNCHECKED);
+    for (int i = 0; i < kHeadsetProfileCount; ++i) {
+        CheckMenuItem(menu, ID_PROFILE_FIRST + i,
+            (int)g_uiState.headsetProfile == i ? MF_CHECKED : MF_UNCHECKED);
+    }
 
     // IPD checks
     int ipdMm = GetIpdMillimeters();
@@ -581,26 +629,6 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
             settingsChanged = true;
             break;
 
-        case ID_PROFILE_GENERIC:
-            SetHeadsetProfile(HeadsetProfile::GenericSymmetric);
-            settingsChanged = true;
-            break;
-
-        case ID_PROFILE_QUEST2:
-            SetHeadsetProfile(HeadsetProfile::Quest2);
-            settingsChanged = true;
-            break;
-
-        case ID_PROFILE_QUEST3:
-            SetHeadsetProfile(HeadsetProfile::Quest3);
-            settingsChanged = true;
-            break;
-
-        case ID_PROFILE_INDEX:
-            SetHeadsetProfile(HeadsetProfile::ValveIndex);
-            settingsChanged = true;
-            break;
-
         case ID_IPD_0:
             SetIpdMillimeters(0);
             settingsChanged = true;
@@ -668,7 +696,10 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
             return true;
 
         default:
-            return false;
+            if (!IsHeadsetProfileCommand(cmd)) return false;
+            SetHeadsetProfile((HeadsetProfile)(cmd - ID_PROFILE_FIRST));
+            settingsChanged = true;
+            break;
     }
 
     if (needsResize && resizeCallback) {

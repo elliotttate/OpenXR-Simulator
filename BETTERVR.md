@@ -131,14 +131,15 @@ on both backends.
 
 ## Why the preview used to look stretched
 
-The FOV this runtime reports is a real headset frustum — Quest 3's is `(-52, +48,
-+53, -52)`, whose tan ranges are 2.39 wide by 2.61 tall, so it is *taller than it is
-wide*. BetterVR renders that frustum into a 2560x1440 buffer. That is not a bug: the
-buffer just has non-square pixels, each covering about twice as much angle vertically
-as horizontally. A real compositor resolves it when it maps the buffer onto the panel.
+The FOV this runtime reports is a real headset frustum — Quest 3's is `(-54, +40,
++43.98, -54.27)`, whose tan ranges are 2.22 wide by 2.36 tall, so it is *taller than
+it is wide*. BetterVR renders that frustum into a 2560x1440 buffer. That is not a bug:
+the buffer just has non-square pixels, each covering about twice as much angle
+vertically as horizontally. A real compositor resolves it when it maps the buffer onto
+the panel.
 
 The preview did not. It blitted the app's pixels 1:1, so the squeeze survived to the
-screen and everything came out about 1.94x too wide.
+screen and everything came out about 1.89x too wide.
 
 Each headset profile now carries its native per-eye panel resolution, and the preview
 maps the eyes onto *that* shape rather than the app's buffer — one stretch in the final
@@ -146,9 +147,9 @@ GDI blit, which is what turns the non-square pixels back into square ones. The a
 pixels still land in the offscreen RT 1:1, so nothing is resampled twice.
 
 Panel aspect and FOV aspect are not identical on real hardware (Quest 3: 0.935 vs
-0.917), so a world-space square still renders about 2% off. Driving the display shape
-from the FOV instead would be exact, at the cost of the window no longer being the
-panel's proportions.
+0.941), so a world-space square still renders slightly off — well under 1% on Quest 3,
+but around 7% on a PS VR2. Driving the display shape from the FOV instead would be
+exact, at the cost of the window no longer being the panel's proportions.
 
 ## Quad layer placement
 

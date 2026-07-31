@@ -427,7 +427,10 @@ static XrFovf MakeFovDeg(float angleLeft, float angleRight, float angleUp, float
 }
 
 static XrFovf GetUiFov(uint32_t eyeIndex) {
-    if (!ui::g_uiState.useAsymmetricFov) {
+    // The generic profile has no geometry of its own, so it stays symmetric even
+    // if a stale settings file asks for asymmetry.
+    if (!ui::g_uiState.useAsymmetricFov ||
+        ui::g_uiState.headsetProfile == ui::HeadsetProfile::GenericSymmetric) {
         int fovDeg = ui::g_uiState.fovDegrees;
         if (fovDeg <= 0 || fovDeg > 180) fovDeg = 90;
         float fovRadians = fovDeg * 0.5f * 3.14159265f / 180.0f;
@@ -435,24 +438,8 @@ static XrFovf GetUiFov(uint32_t eyeIndex) {
         return XrFovf{ -fovTan, fovTan, fovTan, -fovTan };
     }
 
-    switch (ui::g_uiState.headsetProfile) {
-        case ui::HeadsetProfile::Quest2:
-            return eyeIndex == 0
-                ? MakeFovDeg(-50.f, 44.f, 48.f, -52.f)
-                : MakeFovDeg(-44.f, 50.f, 48.f, -52.f);
-
-        case ui::HeadsetProfile::ValveIndex:
-            return eyeIndex == 0
-                ? MakeFovDeg(-58.f, 50.f, 52.f, -58.f)
-                : MakeFovDeg(-50.f, 58.f, 52.f, -58.f);
-
-        case ui::HeadsetProfile::Quest3:
-        case ui::HeadsetProfile::GenericSymmetric:
-        default:
-            return eyeIndex == 0
-                ? MakeFovDeg(-52.f, 48.f, 53.f, -52.f)
-                : MakeFovDeg(-48.f, 52.f, 53.f, -52.f);
-    }
+    const ui::EyeFov& e = ui::GetActiveHeadsetSpec().eye[eyeIndex == 0 ? 0 : 1];
+    return MakeFovDeg(e.angleLeft, e.angleRight, e.angleUp, e.angleDown);
 }
 
 static float GetUiIpdMeters() {
@@ -2961,41 +2948,30 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
         }
 
         // Headset profile preset: applies both FOV and IPD at once.
-        // Approximate per-eye FOV taken from public lens specs; treat as
-        // close-enough fixtures for catching projection bugs, not exact
-        // calibration data.
         mcp::HeadsetProfileCommand prof = mcp::CheckHeadsetProfileCommand();
         if (prof.valid) {
-            const float DEG2RAD = 3.14159265f / 180.0f;
+            const int idx = ui::FindHeadsetSpec(prof.name);
+            // "generic" carries no headset geometry, so it means the same as clearing.
+            const bool clear = idx == 0 ||
+                               strcmp(prof.name, "default") == 0 ||
+                               strcmp(prof.name, "clear") == 0;
             bool applied = true;
-            // Each row: { aL, aR, aU, aD } in degrees, per eye [left, right]
-            if (strcmp(prof.name, "default") == 0 || strcmp(prof.name, "clear") == 0) {
+            if (clear) {
                 rt::g_useCustomFov = false;
                 rt::g_useCustomIpd = false;
-            } else if (strcmp(prof.name, "quest2") == 0) {
+            } else if (idx > 0) {
+                const float DEG2RAD = 3.14159265f / 180.0f;
+                const ui::HeadsetSpec& spec = ui::kHeadsetSpecs[idx];
                 rt::g_useCustomFov = true;
-                rt::g_eyeFovL[0] = -50.f * DEG2RAD; rt::g_eyeFovR[0] =  44.f * DEG2RAD;
-                rt::g_eyeFovU[0] =  48.f * DEG2RAD; rt::g_eyeFovD[0] = -52.f * DEG2RAD;
-                rt::g_eyeFovL[1] = -44.f * DEG2RAD; rt::g_eyeFovR[1] =  50.f * DEG2RAD;
-                rt::g_eyeFovU[1] =  48.f * DEG2RAD; rt::g_eyeFovD[1] = -52.f * DEG2RAD;
+                for (int i = 0; i < 2; ++i) {
+                    const ui::EyeFov& e = spec.eye[i];
+                    rt::g_eyeFovL[i] = e.angleLeft  * DEG2RAD;
+                    rt::g_eyeFovR[i] = e.angleRight * DEG2RAD;
+                    rt::g_eyeFovU[i] = e.angleUp    * DEG2RAD;
+                    rt::g_eyeFovD[i] = e.angleDown  * DEG2RAD;
+                }
                 rt::g_useCustomIpd = true;
-                rt::g_customIpd = 0.064f;
-            } else if (strcmp(prof.name, "quest3") == 0) {
-                rt::g_useCustomFov = true;
-                rt::g_eyeFovL[0] = -52.f * DEG2RAD; rt::g_eyeFovR[0] =  48.f * DEG2RAD;
-                rt::g_eyeFovU[0] =  53.f * DEG2RAD; rt::g_eyeFovD[0] = -52.f * DEG2RAD;
-                rt::g_eyeFovL[1] = -48.f * DEG2RAD; rt::g_eyeFovR[1] =  52.f * DEG2RAD;
-                rt::g_eyeFovU[1] =  53.f * DEG2RAD; rt::g_eyeFovD[1] = -52.f * DEG2RAD;
-                rt::g_useCustomIpd = true;
-                rt::g_customIpd = 0.064f;
-            } else if (strcmp(prof.name, "index") == 0) {
-                rt::g_useCustomFov = true;
-                rt::g_eyeFovL[0] = -58.f * DEG2RAD; rt::g_eyeFovR[0] =  50.f * DEG2RAD;
-                rt::g_eyeFovU[0] =  52.f * DEG2RAD; rt::g_eyeFovD[0] = -58.f * DEG2RAD;
-                rt::g_eyeFovL[1] = -50.f * DEG2RAD; rt::g_eyeFovR[1] =  58.f * DEG2RAD;
-                rt::g_eyeFovU[1] =  52.f * DEG2RAD; rt::g_eyeFovD[1] = -58.f * DEG2RAD;
-                rt::g_useCustomIpd = true;
-                rt::g_customIpd = 0.063f;
+                rt::g_customIpd = spec.ipdMm * 0.001f;
             } else {
                 applied = false;
             }

@@ -742,16 +742,20 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="set_headset_profile",
-            description=("Apply a named headset preset (FOV + IPD together). "
-                         "Useful for quickly testing whether the app handles "
-                         "asymmetric Quest/Index lens profiles correctly. "
-                         "Available: quest2, quest3, index, default (revert)."),
+            description=("Apply a named headset preset (FOV + IPD together), using "
+                         "the per-eye frustum each headset's runtime actually "
+                         "reports. Useful for quickly testing whether the app "
+                         "handles asymmetric lens profiles correctly. Available: "
+                         "quest2, quest3, questpro, index, vivepro2, reverbg2, "
+                         "psvr2, pico4, beyond, generic/default (revert)."),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "enum": ["quest2", "quest3", "index", "default", "clear"],
+                        "enum": ["quest2", "quest3", "questpro", "index", "vivepro2",
+                                 "reverbg2", "psvr2", "pico4", "beyond",
+                                 "generic", "default", "clear"],
                     }
                 },
                 "required": ["name"]
