@@ -45,6 +45,8 @@ if(WIN32)
         WIN32_LEAN_AND_MEAN
         NOMINMAX
         _CRT_SECURE_NO_WARNINGS
+        UNICODE
+        _UNICODE
     )
 endif()
 

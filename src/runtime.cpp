@@ -1300,7 +1300,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         default:
             break;
     }
-    return DefWindowProc(hWnd, msg, wParam, lParam);
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
 static void ensurePreview(Session& s) {
@@ -2672,7 +2672,7 @@ static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) { rt::PushSt
 static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*, XrFrameState* s) {
     if (!s) return XR_ERROR_VALIDATION_FAILURE;
     // Message pump so the preview window stays responsive
-    MSG msg; while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
     static double periodSec = 1.0 / 90.0;
     static long long periodNs = (long long)(periodSec * 1e9);
