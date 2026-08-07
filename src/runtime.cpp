@@ -122,6 +122,18 @@ inline UINT D3D12CalcSubresource(UINT MipSlice, UINT ArraySlice, UINT PlaneSlice
 
 // Simple logging (debug output + file log)
 static FILE* g_LogFile = nullptr;
+
+// Log() is deliberately expensive: OutputDebugStringA takes a process-global lock and
+// the fflush makes every line survive a crash, which is what makes the log worth having.
+// Neither is affordable per frame -- a handful of calls in the frame loop cost more than
+// the compositing does. Anything on the frame path goes through LogV/LogVf, which cost a
+// predicted-taken branch unless SIMXR_VERBOSE is set to something other than 0.
+static const bool g_logVerbose = []() {
+    char v[16]{};
+    const DWORD n = GetEnvironmentVariableA("SIMXR_VERBOSE", v, (DWORD)sizeof(v));
+    return n > 0 && n < sizeof(v) && v[0] != '0';
+}();
+
 static void EnsureLogFile() {
     if (g_LogFile) return;
     char base[MAX_PATH]{};
@@ -144,6 +156,15 @@ static void Log(const char* msg) {
     if (g_LogFile) { fputs(msg, g_LogFile); if (msg[0] && msg[strlen(msg)-1] != '\n') fputc('\n', g_LogFile); fflush(g_LogFile);} }
 static void Log(const std::string& msg) { Log(msg.c_str()); }
 static void Logf(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    Log(buf);
+}
+static void LogV(const char* msg) { if (g_logVerbose) Log(msg); }
+static void LogVf(const char* fmt, ...) {
+    if (!g_logVerbose) return;
     char buf[2048];
     va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -3959,7 +3980,7 @@ static void blitD3D12ToPreview(rt::Session& s,
     while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 
     static int blitCount = 0;
-    if (++blitCount % 60 == 1) {
+    if (g_logVerbose && ++blitCount % 60 == 1) {
         Logf("[SimXR] blitD3D12ToPreview: GDI blit L[%u] R[%u] (%ux%u)", leftIdx, rightIdx, rtWidth, rtHeight);
     }
 }
@@ -3997,10 +4018,10 @@ static void clearPreviewToBlack(rt::Session& s) {
 }
 
 static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj, bool skipPresent = false) {
-    Log("[SimXR] ============================================");
-    Logf("[SimXR] presentProjection called: viewCount=%u, skipPresent=%d", proj.viewCount, (int)skipPresent);
-    Log("[SimXR] RENDERING FRAME TO PREVIEW WINDOW");
-    Log("[SimXR] ============================================");
+    LogV("[SimXR] ============================================");
+    LogVf("[SimXR] presentProjection called: viewCount=%u, skipPresent=%d", proj.viewCount, (int)skipPresent);
+    LogV("[SimXR] RENDERING FRAME TO PREVIEW WINDOW");
+    LogV("[SimXR] ============================================");
     if (proj.viewCount < 1) {
         Log("[SimXR] presentProjection: No views, returning");
         return;
@@ -4494,7 +4515,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
         }
 
         static int blitCount = 0;
-        if (++blitCount % 60 == 1) {  // Log every 60 frames
+        if (g_logVerbose && ++blitCount % 60 == 1) {
             Logf("[SimXR] Blitting left eye: idx=%u (lastReleased=%u, lastAcquired=%u, imageCount=%u)",
                  leftIdx, chL.lastReleased, chL.lastAcquired, chL.imageCount);
         }
@@ -4839,7 +4860,7 @@ static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
 
     if (painted) s.previewMemDirty = true;
     static int s_qlog = 0;
-    if (++s_qlog % 120 == 1) {
+    if (g_logVerbose && ++s_qlog % 120 == 1) {
         Logf("[SimXR] D3D12 quad composited: tex=%ux%u space=%s pose=(%.2f,%.2f,%.2f) size=(%.2f,%.2f) "
              "world=(%.2f,%.2f,%.2f) dst=(%d,%d,%d,%d)%s",
              qw, qh, headLocked ? "VIEW" : "WORLD",
@@ -4985,7 +5006,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     }
 
     static int quadLogCount = 0;
-    bool shouldLog = (++quadLogCount % 60 == 1);
+    bool shouldLog = g_logVerbose && (++quadLogCount % 60 == 1);
 
     if (shouldLog) {
         Logf("[SimXR] Quad swapchain: handle=%llu, lastReleased=%u, lastAcquired=%u, texIdx=%u, imageCount=%u",
@@ -5311,7 +5332,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     frameCount++;
 
     // Log every frame for first 10 frames, then every 60 frames
-    bool shouldLog = (frameCount <= 10) || (frameCount % 60 == 1);
+    bool shouldLog = g_logVerbose && ((frameCount <= 10) || (frameCount % 60 == 1));
 
     if (shouldLog) {
         Logf("[SimXR] xrEndFrame called (frame #%d)", frameCount);

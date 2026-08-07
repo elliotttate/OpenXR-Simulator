@@ -219,6 +219,8 @@ reg query "HKLM\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"
 
 ### Performance issues
 
+- Leave `SIMXR_VERBOSE` unset. Setting it makes the runtime log every frame, and each
+  line is flushed to disk — useful when diagnosing a frame, expensive as a default.
 - Reduce swapchain resolution in your application
 - Disable MSAA if enabled
 - Close other GPU-intensive applications
