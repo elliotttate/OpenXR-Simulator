@@ -5807,6 +5807,28 @@ static void clearPreviewToBlack(rt::Session& s) {
     g_presentPending = true;
 }
 
+// Frames per second in the title bar. Counted once per submitted frame, ahead of anything
+// that can skip the composite, so the rate shown is the application's and not the mirror's.
+static void updatePreviewTitle(rt::Session& s) {
+    if (!s.hwnd) return;
+    static int frames = 0;
+    static auto lastUpdate = std::chrono::high_resolution_clock::now();
+    ++frames;
+    const auto now = std::chrono::high_resolution_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastUpdate).count();
+    if (elapsed >= 500) {
+        ui::g_lastFps = (int)(frames * 1000 / elapsed);
+        frames = 0;
+        lastUpdate = now;
+    } else if (ui::g_lastScreenshotTickMs == 0) {
+        // Otherwise refresh every frame while a screenshot notice is up, so it appears
+        // immediately rather than at the next 500ms tick.
+        return;
+    }
+    ui::StatsInfo si = rt::BuildStatsInfo(s);
+    ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
+}
+
 static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj, bool skipPresent = false) {
     LogV("[SimXR] ============================================");
     LogVf("[SimXR] presentProjection called: viewCount=%u, skipPresent=%d", proj.viewCount, (int)skipPresent);
@@ -5850,6 +5872,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
     if (s.hwnd && (prevSourceW != width || prevSourceH != height)) {
         rt::FitWindowToContentAspect(s.hwnd);
     }
+    updatePreviewTitle(s);
+
     {
         std::lock_guard<std::mutex> lock(s.previewMutex);
 
@@ -6216,25 +6240,6 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 }
             }
 
-            // Update window title with FPS
-            static int glTitleFrameCount = 0;
-            static auto glLastTitleUpdate = std::chrono::high_resolution_clock::now();
-            glTitleFrameCount++;
-            auto now = std::chrono::high_resolution_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - glLastTitleUpdate).count();
-            if (elapsed >= 500) {
-                ui::g_lastFps = (int)(glTitleFrameCount * 1000 / elapsed);
-                glTitleFrameCount = 0;
-                glLastTitleUpdate = now;
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
-            } else if (ui::g_lastScreenshotTickMs != 0) {
-                // Refresh frequently while a screenshot notice is active so it
-                // appears immediately rather than at the next 500ms tick.
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
-            }
-
             // Present (may be deferred if overlays are pending)
             if (!skipPresent) {
                 MSG msg;
@@ -6388,23 +6393,6 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 }
             }
 
-            // Update window title with stats
-            static int titleFrameCount = 0;
-            static auto lastTitleUpdate = std::chrono::high_resolution_clock::now();
-            titleFrameCount++;
-            auto now = std::chrono::high_resolution_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTitleUpdate).count();
-            if (elapsed >= 500) {
-                ui::g_lastFps = (int)(titleFrameCount * 1000 / elapsed);
-                titleFrameCount = 0;
-                lastTitleUpdate = now;
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
-            } else if (ui::g_lastScreenshotTickMs != 0) {
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
-            }
-
             // MCP Integration - capture a screenshot if one was asked for. xrEndFrame
             // drains the request before it decides whether this frame is due, so a pending
             // shot is what forced the frame we are in.
@@ -6441,23 +6429,6 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             }
 
             // No Present call needed - blitD3D12ToPreview handles GDI painting directly
-
-            // Update window title with FPS stats
-            static int d3d12TitleFrameCount = 0;
-            static auto d3d12LastTitleUpdate = std::chrono::high_resolution_clock::now();
-            d3d12TitleFrameCount++;
-            auto now12 = std::chrono::high_resolution_clock::now();
-            auto elapsed12 = std::chrono::duration_cast<std::chrono::milliseconds>(now12 - d3d12LastTitleUpdate).count();
-            if (elapsed12 >= 500) {
-                ui::g_lastFps = (int)(d3d12TitleFrameCount * 1000 / elapsed12);
-                d3d12TitleFrameCount = 0;
-                d3d12LastTitleUpdate = now12;
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
-            } else if (ui::g_lastScreenshotTickMs != 0) {
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
-            }
 
             // D3D12 screenshots are taken in captureD3D12Screenshot at the end of xrEndFrame,
             // not here: the quad layers of this frame still have to go into the render target.
@@ -7293,6 +7264,19 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     }
     // Every command file has been looked at for this change notification.
     mcp::g_commandsDue = false;
+
+    // D3D11 and OpenGL capture from the preview swapchain inside presentProjection, which a
+    // frame carrying no projection layer never reaches - so on a 2D-only frame the request
+    // was drained but never served, and g_previewDueThisFrame stayed latched on it, quietly
+    // disabling Mirror Rate. Take the shot off the back buffer here instead, before the
+    // deferred Present below makes its contents undefined.
+    if (!rt::g_session.usesD3D12 && mcp::g_screenshotRequested && g_previewDueThisFrame &&
+        rt::g_session.previewSwapchain && rt::g_session.d3d11Device) {
+        mcp::CaptureScreenshot(rt::g_session.d3d11Device.Get(), rt::g_session.d3d11Context.Get(),
+                               rt::g_session.previewSwapchain.Get());
+        const std::string shotPath = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
+        ui::NotifyScreenshotSaved(std::wstring(shotPath.begin(), shotPath.end()));
+    }
 
     // Now Present after all layers are rendered (D3D11/GL only; D3D12 uses GDI in blit function)
     if (g_presentPending) {
