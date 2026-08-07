@@ -88,6 +88,10 @@ barrier, exactly as `Layer3D::RecordRender` does, which is the only way
 resource-state bugs show up at all. An earlier version only did
 acquire/wait/release and passed a runtime that was corrupting every frame.
 
+`XR_PROBE_FRAMES=<n>`, `XR_PROBE_SLEEP_MS=<ms>` and `XR_PROBE_PROJECTION_ONLY=1` hold the
+session open long enough, slowly enough and with stereo content on every frame for the MCP
+screenshot and stereo tools to observe it from outside.
+
 ## Vulkan sessions
 
 ```powershell

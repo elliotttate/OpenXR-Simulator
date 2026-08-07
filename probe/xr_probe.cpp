@@ -9,6 +9,7 @@
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <vector>
 #include <string>
 #include <array>
@@ -27,6 +28,13 @@ static void ok(const char* what) { printf("  [ ok ] %s\n", what); }
 static void fail(const char* what, XrResult r) { printf("  [FAIL] %s -> XrResult %d\n", what, (int)r); g_fail++; }
 static void warn(const char* what) { printf("  [warn] %s\n", what); g_warn++; }
 static void step(const char* what) { printf("\n== %s\n", what); }
+
+// An empty-but-set variable means off. PowerShell's `$env:X = ''` sets rather than removes,
+// so `getenv() != nullptr` silently turns every flag on for the rest of a session.
+static bool EnvOn(const char* name) {
+    const char* v = getenv(name);
+    return v && v[0] && strcmp(v, "0") != 0;
+}
 
 #define XRC(call, what) do { XrResult _r = (call); if (XR_FAILED(_r)) { fail(what, _r); return 1; } ok(what); } while (0)
 #define XRC_SOFT(call, what) do { XrResult _r = (call); if (XR_FAILED(_r)) { fail(what, _r); } else ok(what); } while (0)
@@ -280,7 +288,24 @@ int main() {
     // XR_PROBE_SUBRECT replays the shape VR mods use: render 1920x1080 into a bigger
     // square swapchain and declare the used region with subImage.imageRect. Off by
     // default so the plain BetterVR replay is unchanged.
-    const bool subRect = getenv("XR_PROBE_SUBRECT") != nullptr;
+    const bool subRect = EnvOn("XR_PROBE_SUBRECT");
+
+    // Held steady for a whole run rather than cycled per frame, so an observer taking a
+    // screenshot knows which blend mode it shows.
+    XrCompositionLayerFlags g_quadFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    const char* quadBlendName = "premultiplied";
+    if (const char* env = getenv("XR_PROBE_QUAD_BLEND")) {
+        if (_stricmp(env, "opaque") == 0) {
+            g_quadFlags = 0;
+            quadBlendName = "opaque (source alpha ignored)";
+        } else if (_stricmp(env, "straight") == 0 || _stricmp(env, "unpremultiplied") == 0) {
+            g_quadFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                          XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+            quadBlendName = "straight (unpremultiplied)";
+        }
+    }
+    printf("       quad blend mode: %s (layerFlags=0x%llX)\n",
+           quadBlendName, (unsigned long long)g_quadFlags);
     const uint32_t W = subRect ? 2048u : 1440u;   // a game-render-sized request, not the recommended size
     const uint32_t H = subRect ? 2048u : 1584u;
     const XrRect2Di viewRect = subRect ? XrRect2Di{ {64, 128}, {1920, 1080} }
@@ -353,6 +378,12 @@ int main() {
         int parsed = atoi(env);
         if (parsed > 0) totalFrames = parsed;
     }
+    // For an observer watching a long run from outside: XR_PROBE_SLEEP_MS paces the loop to
+    // something a screenshot can keep up with, and XR_PROBE_PROJECTION_ONLY drops the
+    // quad-only phase so every frame carries stereo content for validate_stereo to look at.
+    int sleepMs = 0;
+    if (const char* env = getenv("XR_PROBE_SLEEP_MS")) sleepMs = atoi(env);
+    const bool projectionOnly = EnvOn("XR_PROBE_PROJECTION_ONLY");
 
     char stepLabel[128];
     snprintf(stepLabel, sizeof(stepLabel), "frame loop x %d (waitFrame/beginFrame/locateViews/acquire/release/endFrame + syncActions)", totalFrames);
@@ -490,6 +521,26 @@ int main() {
                     // eye blit that lands in the same frame.
                     const float hud[4] = { 0.8f, 0.1f, 0.5f, 1.0f };
                     cmdList->ClearRenderTargetView(h, hud, 1, &rect);
+
+                    // A flat opaque fill looks identical under all three blend modes, so it
+                    // cannot tell a runtime that honours layerFlags from one that ignores
+                    // them. These four bands can.
+                    const LONG bandW = viewRect.extent.width / 5;
+                    const LONG bandTop = rect.top + viewRect.extent.height / 4;
+                    const LONG bandBot = rect.top + viewRect.extent.height / 2;
+                    const float bands[4][4] = {
+                        { 0.0f, 0.0f, 0.0f, 0.0f },  // invisible unless source alpha is ignored
+                        { 1.0f, 1.0f, 1.0f, 0.0f },  // invisible only under straight alpha; white
+                                                     // under premultiplied and under opaque
+                        { 1.0f, 1.0f, 1.0f, 0.5f },  // 188 if the compositor blends in linear
+                                                     // light, 128 if it blends the sRGB bytes
+                        { 1.0f, 1.0f, 1.0f, 1.0f },  // control: unchanged by any mode
+                    };
+                    for (int b = 0; b < 4; ++b) {
+                        D3D12_RECT band = { rect.left + bandW * b, bandTop,
+                                            rect.left + bandW * (b + 1), bandBot };
+                        cmdList->ClearRenderTargetView(h, bands[b], 1, &band);
+                    }
                 }
             }
             if (FAILED(cmdList->Close())) return false;
@@ -506,7 +557,10 @@ int main() {
         };
         // BetterVR gates its projection layer on IsInGame() (RND_Renderer::EndFrame),
         // so its whole boot and title sequence is quad-only frames. Replay both shapes.
-        const bool quadOnly = (f < totalFrames / 2);
+        // Alternate in blocks rather than splitting the run in half, so a long run does not
+        // make an observer wait out thousands of quad-only frames to see the mixed case.
+        const int phaseLen = (totalFrames > 200) ? 100 : (totalFrames / 2);
+        const bool quadOnly = !projectionOnly && ((phaseLen <= 0) || ((f / phaseLen) % 2) == 0);
         if (quadOnly) quadOnlyFrames++;
 
         bool cycled = cycle(quadChain, false);
@@ -541,8 +595,10 @@ int main() {
         XrCompositionLayerProjection proj = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
         proj.space = stageSpace; proj.viewCount = 2; proj.views = projViews;
 
+        const float eyeY = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
+
         XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-        quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        quad.layerFlags = g_quadFlags;
         quad.space = stageSpace;
         quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
         quad.subImage.swapchain = quadChain.handle;
@@ -550,14 +606,39 @@ int main() {
         // World-locked at eye height, 2 m ahead, like a BetterVR 2D screen. A runtime
         // that reads a STAGE pose as head-relative throws this off the top of the view.
         quad.pose = identity;
-        quad.pose.position.y = (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
+        quad.pose.position.y = eyeY;
         quad.pose.position.z = -2.0f;
         quad.size = { 1.6f, 0.9f };
 
-        const XrCompositionLayerBaseHeader* layers[2];
+        // A runtime that places quads by a screen-space bounding box draws this yawed quad as
+        // an axis-aligned rectangle; one that projects the corners draws a trapezoid, and a
+        // different one in each eye.
+        XrCompositionLayerQuad angled = quad;
+        angled.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        angled.pose.position = { -1.1f, eyeY, -1.6f };
+        angled.pose.orientation = { 0.0f, sinf(0.5f * 40.0f * 3.14159265f / 180.0f),
+                                    0.0f, cosf(0.5f * 40.0f * 3.14159265f / 180.0f) };
+        angled.size = { 0.7f, 0.7f };
+
+        // Must be absent from the left half of the preview entirely.
+        XrCompositionLayerQuad rightOnly = quad;
+        rightOnly.eyeVisibility = XR_EYE_VISIBILITY_RIGHT;
+        rightOnly.pose.position = { 1.1f, eyeY, -1.6f };
+        rightOnly.size = { 0.5f, 0.5f };
+
+        // Overlaps `quad` and is submitted after it: proves layers composite in submission
+        // order rather than in whatever order the runtime happens to walk them.
+        XrCompositionLayerQuad overlap = quad;
+        overlap.pose.position = { 0.35f, eyeY - 0.25f, -1.9f };
+        overlap.size = { 0.5f, 0.5f };
+
+        const XrCompositionLayerBaseHeader* layers[5];
         uint32_t layerCount = 0;
         if (!quadOnly) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj);
         layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
+        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&angled);
+        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&rightOnly);
+        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlap);
 
         XrFrameEndInfo fei = { XR_TYPE_FRAME_END_INFO };
         fei.displayTime = fs.predictedDisplayTime;
@@ -567,6 +648,7 @@ int main() {
         r = xrEndFrame(session, &fei);
         if (XR_FAILED(r)) { fail("xrEndFrame", r); break; }
         framesRendered++;
+        if (sleepMs > 0) Sleep((DWORD)sleepMs);
     }
     printf("       rendered %d/%d frames (%d quad-only), %d of them with state==FOCUSED\n",
            framesRendered, totalFrames, quadOnlyFrames, focusedFrames);
