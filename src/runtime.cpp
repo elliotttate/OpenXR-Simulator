@@ -332,7 +332,12 @@ static constexpr DXGI_FORMAT kPreviewRTFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
 // itself is TYPELESS to allow both views.
 static constexpr DXGI_FORMAT kPreviewRTFormatTypeless = DXGI_FORMAT_B8G8R8A8_TYPELESS;
 static constexpr DXGI_FORMAT kPreviewRTFormatSrgb = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-static constexpr UINT kPreviewSrvSlots = 8;
+// Shader-visible SRVs, ringed so a descriptor is not rewritten while a command list that
+// reads it is still in flight. A frame takes one per eye plus one per quad layer, and
+// kPreviewFrames of them can be queued at once, so this has to cover the busiest frame an
+// app submits times that. 64 is three frames of twenty layers and costs a few kilobytes;
+// an app with more layers than that in one frame only wraps within its own frame.
+static constexpr UINT kPreviewSrvSlots = 64;
 // c0..c3, tans, uvRect, opts - see kPreviewQuadHLSL.
 static constexpr UINT kQuadConstantCount = 28;
 
@@ -4781,8 +4786,7 @@ static bool ensurePreviewBlitPipeline(rt::Session& s) {
         return false;
     }
 
-    // One SRV per eye, ringed over a few frames so a descriptor is never rewritten
-    // while the command list that reads it is still in flight.
+    // See kPreviewSrvSlots for how the ring is sized against the frames in flight.
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.NumDescriptors = rt::kPreviewSrvSlots;
