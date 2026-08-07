@@ -317,6 +317,19 @@ struct Instance {
     std::vector<std::string> enabledExtensions;
 };
 
+// The D3D12 preview back buffer is always BGRA8, whatever the app submits: that is the
+// byte layout of the GDI DIB section it is copied into, so the readback needs no swizzle.
+static constexpr DXGI_FORMAT kPreviewRTFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+// The eyes are written through kPreviewRTFormat, which passes their already-encoded bytes
+// straight through. Quad layers are blended through this view of the same resource instead,
+// so the hardware decodes the destination to linear, blends, and re-encodes. The resource
+// itself is TYPELESS to allow both views.
+static constexpr DXGI_FORMAT kPreviewRTFormatTypeless = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+static constexpr DXGI_FORMAT kPreviewRTFormatSrgb = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+static constexpr UINT kPreviewSrvSlots = 8;
+// c0..c3, tans, uvRect, opts - see kPreviewQuadHLSL.
+static constexpr UINT kQuadConstantCount = 28;
+
 struct Session {
     XrSession handle{(XrSession)1};
     XrSessionState state{XR_SESSION_STATE_IDLE};
@@ -338,12 +351,6 @@ struct Session {
     ComPtr<ID3D12Resource> previewRT12;         // offscreen render target (replaces swapchain backbuffer)
     ComPtr<ID3D12Resource> previewReadback12;   // CPU-readable buffer for GDI blit
     UINT previewReadbackPitch{0};               // row pitch aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
-    // Quad-layer readback (D3D12): the quad swapchain texture is copied here so its pixels can be GDI-painted
-    // over the eye preview. Lazily (re)created to the quad texture size; pitch aligned to 256.
-    ComPtr<ID3D12Resource> quadReadback12;
-    UINT quadReadbackPitch{0};
-    uint32_t quadReadbackW{0};
-    uint32_t quadReadbackH{0};
     // Preview back buffer (D3D12/GDI): every layer paints into this memory DC, which is
     // blitted to the window once per frame. Painting layers straight to the window makes
     // the eye blit erase overlays for the length of the quad readback that follows it,
@@ -351,6 +358,8 @@ struct Session {
     HDC previewMemDC{nullptr};
     HBITMAP previewMemBitmap{nullptr};
     HGDIOBJ previewMemOldBitmap{nullptr};
+    void* previewMemBits{nullptr};
+    int previewMemStride{0};
     int previewMemW{0};
     int previewMemH{0};
     bool previewMemDirty{false};
@@ -359,6 +368,23 @@ struct Session {
     ComPtr<ID3D12Fence> previewFence;
     HANDLE previewFenceEvent{nullptr};
     UINT64 previewFenceValue{0};
+    bool previewRecording{false};               // the RT is open and this frame has layers in it
+    // Scaling pipeline for the D3D12 preview. The eyes are drawn into the RT at the size
+    // the window shows them, so the readback that follows is the window's pixel count and
+    // not the stereo render's - a 5120x1440 submission mirrored into a 1280x360 fit rect
+    // is 30MB a frame off the GPU and a CPU-side resample either way without this.
+    ComPtr<ID3D12RootSignature> previewRootSig;
+    ComPtr<ID3D12PipelineState> previewPSO;
+    // Quad layers are rasterised into the same RT through an sRGB view; one PSO per
+    // rt::LayerBlend mode.
+    ComPtr<ID3D12RootSignature> previewQuadRootSig;
+    ComPtr<ID3D12PipelineState> previewQuadPSO[3];
+    ComPtr<ID3D12DescriptorHeap> previewSrvHeap;
+    // Two RTVs over previewRT12: [0] plain, for the eye pass; [1] sRGB, for quad blending.
+    ComPtr<ID3D12DescriptorHeap> previewRtvHeap;
+    UINT previewRtvStride{0};
+    UINT previewSrvStride{0};
+    UINT previewSrvSlot{0};
 
     // Blit resources
     ComPtr<ID3D11VertexShader> blitVS;
@@ -1101,6 +1127,16 @@ static void GetPreviewClientSize(rt::Session& s, int srcW, int srcH, int& outW, 
     outH = th;
 }
 
+// Size of the D3D12 preview's offscreen RT: the window's client area. The scaling pass
+// draws the eyes straight into it, so the per-frame readback stays the window's pixel
+// count rather than the stereo render's.
+static void ComputePreviewRTSize(rt::Session& s, int& outW, int& outH) {
+    int clientW = 0, clientH = 0;
+    GetPreviewClientSize(s, 0, 0, clientW, clientH);
+    outW = (std::max)(1, clientW);
+    outH = (std::max)(1, clientH);
+}
+
 // Snap the preview window so its client aspect matches the content aspect,
 // keeping the current client width. Height is ours to derive; width is whatever
 // the user last chose. No-op when the aspect already matches. Called from
@@ -1132,15 +1168,51 @@ static void FitWindowToContentAspect(HWND hWnd) {
                  SWP_NOMOVE | SWP_NOZORDER);
 }
 
-static void ResetD3D12PreviewResources(rt::Session& s) {
+// View format for sampling a D3D12 swapchain image in the preview's scaling pass. The
+// resource can be typeless (XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT), and sRGB is dropped
+// on purpose: the pass filters the bytes in whatever encoding they are stored in and
+// writes them through unchanged, which is what the GDI stretch it replaced did.
+static DXGI_FORMAT PreviewSrvFormat(DXGI_FORMAT resourceFormat) {
+    switch (resourceFormat) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:     return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:   return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:   return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:    return DXGI_FORMAT_R10G10B10A2_UNORM;
+        default:                                  return resourceFormat;
+    }
+}
+
+// Just the resources that depend on the preview's size. The window is resizable and
+// the RT tracks its client area, so this runs on every resize step - the queue, fences
+// and command list have to survive it. Recreating the cross-queue fence in particular
+// would drop a signal the app's own queue is mid-flight on.
+static void ResetD3D12PreviewSurfaces(rt::Session& s) {
     s.previewRT12.Reset();
+    s.previewRtvHeap.Reset();
     s.previewReadback12.Reset();
     s.previewReadbackPitch = 0;
+    s.previewRecording = false;
+}
+
+static void ResetD3D12PreviewResources(rt::Session& s) {
+    ResetD3D12PreviewSurfaces(s);
     s.previewCmdAlloc.Reset();
     s.previewCmdList.Reset();
     s.previewFence.Reset();
     s.previewFenceValue = 0;
     s.previewQueue12.Reset();
+    // Device-owned, so they cannot outlive the session that created them.
+    s.previewSrvHeap.Reset();
+    s.previewPSO.Reset();
+    s.previewRootSig.Reset();
+    s.previewQuadPSO[0].Reset();
+    s.previewQuadPSO[1].Reset();
+    s.previewQuadPSO[2].Reset();
+    s.previewQuadRootSig.Reset();
+    s.previewSrvSlot = 0;
     s.crossQueueFence.Reset();
     s.crossQueueFenceValue = 0;
     if (s.previewFenceEvent) {
@@ -3322,6 +3394,338 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
     }
 }
 
+// The D3D12 preview's scaling pass. Draws one eye into a viewport, taking its
+// submitted subimage rect through uvOffset/uvScale.
+//
+// Four bilinear taps on a half-texel grid average the 4x4 source footprint that a
+// 2-4x downscale to the window covers. A single tap only reaches 2x2 of that and
+// shimmers on any high-frequency detail; anything wider costs more than the whole
+// pass is worth.
+static const char* kPreviewBlitHLSL = R"HLSL(
+cbuffer Blit : register(b0) {
+    float2 uvOffset;
+    float2 uvScale;
+    float2 uvTap;
+    float  srgbEncode;
+    float  pad;
+};
+Texture2D<float4> Src : register(t0);
+SamplerState Smp : register(s0);
+
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+
+VSOut VSMain(uint id : SV_VertexID) {
+    VSOut o;
+    float2 p = float2((id << 1) & 2, id & 2);
+    o.uv = uvOffset + p * uvScale;
+    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+    return o;
+}
+
+float4 PSMain(VSOut i) : SV_Target {
+    float3 c = Src.Sample(Smp, i.uv + float2(-uvTap.x, -uvTap.y)).rgb
+             + Src.Sample(Smp, i.uv + float2( uvTap.x, -uvTap.y)).rgb
+             + Src.Sample(Smp, i.uv + float2(-uvTap.x,  uvTap.y)).rgb
+             + Src.Sample(Smp, i.uv + float2( uvTap.x,  uvTap.y)).rgb;
+    c *= 0.25;
+    // Float swapchains hold linear light, so they need the transfer curve the 8-bit
+    // back buffer is displayed through. 8-bit sources are already encoded and are
+    // filtered in that encoding, which is what the GDI stretch this replaced did.
+    if (srgbEncode > 0.5) {
+        c = saturate(c);
+        c = (c <= 0.0031308) ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+    }
+    return float4(c, 1.0);
+}
+)HLSL";
+
+// Root signature, PSO and descriptor heaps for the scaling pass. Size-independent,
+// so this survives the RT being rebuilt on a window resize.
+// Quad layers used to be composited on the CPU: the whole layer texture was read back and
+// every destination pixel inverse-mapped through the quad's plane by hand. That cost scaled
+// with the mirror window's area - 11ms a frame at 2340x1252 with BetterVR's full-resolution
+// HUD - and it was the last real overhead the runtime imposed on the app.
+//
+// The rasteriser does the same job for free. The corners arrive already in the eye's view
+// space, so the VS only has to apply the eye's asymmetric projection; emitting a real w
+// (rather than screen-space corners) is what makes the interpolation perspective-correct,
+// and lets the clipper handle a quad that crosses behind the eye - the case the CPU version
+// had to bail out of by scanning the whole eye rect.
+//
+// Blending happens in linear light because the RT is bound through an sRGB RTV here: the
+// hardware decodes the destination, blends, and re-encodes. That is the property the CPU
+// compositor existed to provide, and the same one the D3D11 path gets from its own sRGB RTV.
+static const char* kPreviewQuadHLSL = R"HLSL(
+cbuffer Quad : register(b0) {
+    float4 c0;        // view-space corner 0 (top-left),     w unused
+    float4 c1;        // view-space corner 1 (top-right)
+    float4 c2;        // view-space corner 2 (bottom-right)
+    float4 c3;        // view-space corner 3 (bottom-left)
+    float4 tans;      // tanLeft, tanRight, tanUp, tanDown
+    float4 uvRect;    // u0, v0, u1, v1
+    float4 opts;      // x: 1 = premultiplied source, 0 = straight alpha; y: 1 = opaque
+};
+Texture2D<float4> Src : register(t0);
+SamplerState Smp : register(s0);
+
+struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };
+
+VSOut VSMain(uint id : SV_VertexID) {
+    // Two triangles over corners 0,1,2,3 wound 0-1-2, 0-2-3.
+    const uint idx[6] = { 0, 1, 2, 0, 2, 3 };
+    uint c = idx[id];
+    float3 v = (c == 0) ? c0.xyz : (c == 1) ? c1.xyz : (c == 2) ? c2.xyz : c3.xyz;
+    float2 uv01 = (c == 0) ? float2(0, 0) : (c == 1) ? float2(1, 0)
+                : (c == 2) ? float2(1, 1) : float2(0, 1);
+
+    // Asymmetric perspective at a near plane of 1, so the tangents are the plane extents.
+    float L = tans.x, R = tans.y, U = tans.z, D = tans.w;
+    VSOut o;
+    o.pos.x = (2.0 * v.x + (R + L) * v.z) / (R - L);
+    o.pos.y = (2.0 * v.y + (U + D) * v.z) / (U - D);
+    // Depth is unused (no depth buffer); 0 sits on the near plane and always survives the
+    // clip test, while w = -z lets the clipper cut anything at or behind the eye.
+    o.pos.z = 0.0;
+    o.pos.w = -v.z;
+    o.uv = lerp(uvRect.xy, uvRect.zw, uv01);
+    return o;
+}
+
+float4 PSMain(VSOut i) : SV_Target {
+    float4 c = Src.Sample(Smp, i.uv);
+    if (opts.y > 0.5) return float4(c.rgb, 1.0);          // opaque: alpha is ignored
+    if (opts.x > 0.5) return c;                           // premultiplied: blend takes it as is
+    return c;                                             // straight alpha: SRC_ALPHA in the blend
+}
+)HLSL";
+
+// SRV format for sampling a quad layer. Unlike the eye pass - which filters the stored bytes
+// in whatever encoding they are in and writes them straight through - the quad is blended, so
+// the sample has to come back as linear light. Keeping the sRGB view is what does that.
+static DXGI_FORMAT PreviewQuadSrvFormat(DXGI_FORMAT resourceFormat) {
+    switch (resourceFormat) {
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:       return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:       return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:   return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:   return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:    return DXGI_FORMAT_R10G10B10A2_UNORM;
+        default:                                  return resourceFormat;
+    }
+}
+
+static bool ensurePreviewQuadPipeline(rt::Session& s) {
+    if (s.previewQuadRootSig && s.previewQuadPSO[0]) return true;
+    if (!s.d3d12Device) return false;
+
+    D3D12_DESCRIPTOR_RANGE srvRange = {};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = 1;
+    srvRange.BaseShaderRegister = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable.NumDescriptorRanges = 1;
+    params[0].DescriptorTable.pDescriptorRanges = &srvRange;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants.ShaderRegister = 0;
+    params[1].Constants.Num32BitValues = rt::kQuadConstantCount;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
+    rsDesc.NumParameters = 2;
+    rsDesc.pParameters = params;
+    rsDesc.NumStaticSamplers = 1;
+    rsDesc.pStaticSamplers = &sampler;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> rsBlob, rsError;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                             rsBlob.GetAddressOf(), rsError.GetAddressOf());
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 quad: SerializeRootSignature failed 0x%08X (%s)", (unsigned)hr,
+             rsError ? (const char*)rsError->GetBufferPointer() : "");
+        return false;
+    }
+    hr = s.d3d12Device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+                                            IID_PPV_ARGS(s.previewQuadRootSig.GetAddressOf()));
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 quad: CreateRootSignature failed 0x%08X", (unsigned)hr);
+        return false;
+    }
+
+    ComPtr<ID3DBlob> vs, ps, err;
+    const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    hr = D3DCompile(kPreviewQuadHLSL, strlen(kPreviewQuadHLSL), "PreviewQuad", nullptr, nullptr,
+                    "VSMain", "vs_5_0", flags, 0, vs.GetAddressOf(), err.GetAddressOf());
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 quad: VS compile failed 0x%08X (%s)", (unsigned)hr,
+             err ? (const char*)err->GetBufferPointer() : "");
+        return false;
+    }
+    err.Reset();
+    hr = D3DCompile(kPreviewQuadHLSL, strlen(kPreviewQuadHLSL), "PreviewQuad", nullptr, nullptr,
+                    "PSMain", "ps_5_0", flags, 0, ps.GetAddressOf(), err.GetAddressOf());
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 quad: PS compile failed 0x%08X (%s)", (unsigned)hr,
+             err ? (const char*)err->GetBufferPointer() : "");
+        return false;
+    }
+
+    // One PSO per blend mode, indexed by rt::LayerBlend.
+    for (int mode = 0; mode < 3; ++mode) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = s.previewQuadRootSig.Get();
+        pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        D3D12_RENDER_TARGET_BLEND_DESC& rtb = pso.BlendState.RenderTarget[0];
+        rtb.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        if (mode != (int)rt::LayerBlend::Opaque) {
+            rtb.BlendEnable = TRUE;
+            rtb.SrcBlend = (mode == (int)rt::LayerBlend::Premultiplied)
+                         ? D3D12_BLEND_ONE : D3D12_BLEND_SRC_ALPHA;
+            rtb.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            rtb.BlendOp = D3D12_BLEND_OP_ADD;
+            rtb.SrcBlendAlpha = D3D12_BLEND_ONE;
+            rtb.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            rtb.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
+        pso.SampleMask = UINT_MAX;
+        pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso.RasterizerState.DepthClipEnable = TRUE;
+        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.NumRenderTargets = 1;
+        // sRGB view over the same bytes the eye pass wrote, so the blend runs in linear light.
+        pso.RTVFormats[0] = rt::kPreviewRTFormatSrgb;
+        pso.SampleDesc.Count = 1;
+        hr = s.d3d12Device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(s.previewQuadPSO[mode].GetAddressOf()));
+        if (FAILED(hr)) {
+            Logf("[SimXR] DX12 quad: CreateGraphicsPipelineState(%d) failed 0x%08X", mode, (unsigned)hr);
+            return false;
+        }
+    }
+
+    Log("[SimXR] DX12 quad: GPU compositing pipeline created");
+    return true;
+}
+
+static bool ensurePreviewBlitPipeline(rt::Session& s) {
+    if (s.previewPSO && s.previewRootSig && s.previewSrvHeap) return true;
+    if (!s.d3d12Device) return false;
+
+    D3D12_DESCRIPTOR_RANGE srvRange = {};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = 1;
+    srvRange.BaseShaderRegister = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER params[2] = {};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[0].DescriptorTable.NumDescriptorRanges = 1;
+    params[0].DescriptorTable.pDescriptorRanges = &srvRange;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[1].Constants.ShaderRegister = 0;
+    params[1].Constants.Num32BitValues = 8;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
+    rsDesc.NumParameters = 2;
+    rsDesc.pParameters = params;
+    rsDesc.NumStaticSamplers = 1;
+    rsDesc.pStaticSamplers = &sampler;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> rsBlob, rsError;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                             rsBlob.GetAddressOf(), rsError.GetAddressOf());
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 preview: SerializeRootSignature failed 0x%08X (%s)", (unsigned)hr,
+             rsError ? (const char*)rsError->GetBufferPointer() : "");
+        return false;
+    }
+    hr = s.d3d12Device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(),
+                                            IID_PPV_ARGS(s.previewRootSig.GetAddressOf()));
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 preview: CreateRootSignature failed 0x%08X", (unsigned)hr);
+        return false;
+    }
+
+    ComPtr<ID3DBlob> vs, ps, err;
+    const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    hr = D3DCompile(kPreviewBlitHLSL, strlen(kPreviewBlitHLSL), "PreviewBlit", nullptr, nullptr,
+                    "VSMain", "vs_5_0", flags, 0, vs.GetAddressOf(), err.GetAddressOf());
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 preview: VS compile failed 0x%08X (%s)", (unsigned)hr,
+             err ? (const char*)err->GetBufferPointer() : "");
+        return false;
+    }
+    err.Reset();
+    hr = D3DCompile(kPreviewBlitHLSL, strlen(kPreviewBlitHLSL), "PreviewBlit", nullptr, nullptr,
+                    "PSMain", "ps_5_0", flags, 0, ps.GetAddressOf(), err.GetAddressOf());
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 preview: PS compile failed 0x%08X (%s)", (unsigned)hr,
+             err ? (const char*)err->GetBufferPointer() : "");
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature = s.previewRootSig.Get();
+    pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso.SampleMask = UINT_MAX;
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.RasterizerState.DepthClipEnable = TRUE;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1;
+    pso.RTVFormats[0] = rt::kPreviewRTFormat;
+    pso.SampleDesc.Count = 1;
+    hr = s.d3d12Device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(s.previewPSO.GetAddressOf()));
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 preview: CreateGraphicsPipelineState failed 0x%08X", (unsigned)hr);
+        return false;
+    }
+
+    // One SRV per eye, ringed over a few frames so a descriptor is never rewritten
+    // while the command list that reads it is still in flight.
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = rt::kPreviewSrvSlots;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = s.d3d12Device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(s.previewSrvHeap.GetAddressOf()));
+    if (FAILED(hr)) {
+        Logf("[SimXR] DX12 preview: CreateDescriptorHeap(SRV) failed 0x%08X", (unsigned)hr);
+        return false;
+    }
+    s.previewSrvStride = s.d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    s.previewSrvSlot = 0;
+
+    Log("[SimXR] DX12 preview: scaling pipeline created");
+    return true;
+}
+
 // Make sure the preview backing store (D3D11 swapchain or D3D12 offscreen RT)
 // is sized to `width × height` and uses `format`. For D3D11 this means
 // ResizeBuffers (or recreate) so the backbuffer matches the window client area;
@@ -3357,7 +3761,9 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
     if (!s.usesD3D12) {
         if (s.previewSwapchain && s.previewWidth == width && s.previewHeight == height && s.previewFormat == format) return;
     } else {
-        if (s.previewRT12 && s.previewWidth == width && s.previewHeight == height && s.previewFormat == format) return;
+        // The D3D12 RT is kPreviewRTFormat whatever the app submits - the scaling pass
+        // converts - so only a size change can force a rebuild.
+        if (s.previewRT12 && s.previewWidth == width && s.previewHeight == height) return;
     }
 
     if (!s.usesD3D12) {
@@ -3415,14 +3821,17 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         return;
     } else {
         // D3D12 path: rebuild the offscreen RT/readback at the requested size
-        rt::ResetD3D12PreviewResources(s);
+        rt::ResetD3D12PreviewSurfaces(s);
         s.previewWidth = width;
         s.previewHeight = height;
-        s.previewFormat = format;
+        s.previewFormat = rt::kPreviewRTFormat;
         // DX12 preview: GDI-based rendering to avoid DXGI Present hook conflicts.
         // Steam overlay (gameoverlayrenderer64) and UEVR both hook IDXGISwapChain::Present,
-        // creating infinite recursion → EXCEPTION_STACK_OVERFLOW. Instead, we render to an
-        // offscreen RT, readback to CPU, and paint via GDI StretchDIBits.
+        // creating infinite recursion → EXCEPTION_STACK_OVERFLOW. Instead, we scale the
+        // eyes into an offscreen RT the size of the window, read that back, and copy it
+        // into the window's DIB section.
+        if (!ensurePreviewBlitPipeline(s)) return;
+        if (!ensurePreviewQuadPipeline(s)) return;
         if (!s.previewQueue12) {
             D3D12_COMMAND_QUEUE_DESC qd = {};
             qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -3443,18 +3852,43 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         rtDesc.Height = height;
         rtDesc.DepthOrArraySize = 1;
         rtDesc.MipLevels = 1;
-        rtDesc.Format = format;
+        rtDesc.Format = rt::kPreviewRTFormatTypeless;
         rtDesc.SampleDesc.Count = 1;
         rtDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        rtDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        rtDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE rtClear = {};
+        rtClear.Format = rt::kPreviewRTFormat;
+        rtClear.Color[3] = 1.0f;
         D3D12_HEAP_PROPERTIES defaultHeap = {};
         defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
         HRESULT hr = s.d3d12Device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
-            &rtDesc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(s.previewRT12.GetAddressOf()));
+            &rtDesc, D3D12_RESOURCE_STATE_COMMON, &rtClear, IID_PPV_ARGS(s.previewRT12.GetAddressOf()));
         if (FAILED(hr)) {
             Logf("[SimXR] DX12 preview: CreateCommittedResource (RT) failed 0x%08X", (unsigned)hr);
             return;
         }
+
+        D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
+        rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rtvHeapDesc.NumDescriptors = 2;
+        hr = s.d3d12Device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(s.previewRtvHeap.GetAddressOf()));
+        if (FAILED(hr)) {
+            Logf("[SimXR] DX12 preview: CreateDescriptorHeap(RTV) failed 0x%08X", (unsigned)hr);
+            s.previewRT12.Reset();
+            return;
+        }
+        s.previewRtvStride = s.d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        // [0] plain view: the eye pass writes already-encoded bytes through unchanged.
+        // [1] sRGB view: quad blending decodes/re-encodes so the blend is in linear light.
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvBase = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+        rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        rtvDesc.Format = rt::kPreviewRTFormat;
+        s.d3d12Device->CreateRenderTargetView(s.previewRT12.Get(), &rtvDesc, rtvBase);
+        rtvDesc.Format = rt::kPreviewRTFormatSrgb;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvSrgb = rtvBase;
+        rtvSrgb.ptr += s.previewRtvStride;
+        s.d3d12Device->CreateRenderTargetView(s.previewRT12.Get(), &rtvDesc, rtvSrgb);
 
         // Create readback buffer (aligned row pitch)
         UINT rowPitch = ((width * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
@@ -3479,15 +3913,21 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
             return;
         }
 
-        // Command allocator/list
-        s.d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(s.previewCmdAlloc.GetAddressOf()));
-        s.d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.previewCmdAlloc.Get(), nullptr, IID_PPV_ARGS(s.previewCmdList.GetAddressOf()));
-        s.previewCmdList->Close();
-        // Fence
-        s.d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(s.previewFence.GetAddressOf()));
-        s.previewFenceValue = 1;
-        s.previewFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-        Logf("[SimXR] DX12 preview: GDI-based rendering initialized (%ux%u, pitch=%u)", width, height, rowPitch);
+        // Command allocator, list and fence are size-independent, so a resize keeps them
+        // and the fence counter carries on where it was.
+        if (!s.previewCmdAlloc) {
+            s.d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(s.previewCmdAlloc.GetAddressOf()));
+        }
+        if (!s.previewCmdList && s.previewCmdAlloc) {
+            s.d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.previewCmdAlloc.Get(), nullptr, IID_PPV_ARGS(s.previewCmdList.GetAddressOf()));
+            s.previewCmdList->Close();
+        }
+        if (!s.previewFence) {
+            s.d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(s.previewFence.GetAddressOf()));
+            s.previewFenceValue = 0;
+            s.previewFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        }
+        Logf("[SimXR] DX12 preview: GPU-scaled readback initialized (%ux%u, pitch=%u)", width, height, rowPitch);
         return;
     }
 }
@@ -3531,7 +3971,7 @@ static void ensurePreviewWithoutProjection(rt::Session& s) {
     if (!s.usesD3D12) {
         rt::GetPreviewClientSize(s, srcW, srcH, targetW, targetH);
     } else {
-        rt::ComputeContentDims(srcW, srcH, ui::g_uiState.viewMode, ui::g_uiState.displayLayout, targetW, targetH);
+        rt::ComputePreviewRTSize(s, targetW, targetH);
     }
     const DXGI_FORMAT format = (s.previewFormat != DXGI_FORMAT_UNKNOWN) ? s.previewFormat : DXGI_FORMAT_R8G8B8A8_UNORM;
     ensurePreviewSized(s, (UINT)targetW, (UINT)targetH, format);
@@ -3787,6 +4227,8 @@ static void destroyPreviewBackBuffer(rt::Session& s) {
     s.previewMemDC = nullptr;
     s.previewMemBitmap = nullptr;
     s.previewMemOldBitmap = nullptr;
+    s.previewMemBits = nullptr;
+    s.previewMemStride = 0;
     s.previewMemW = s.previewMemH = 0;
     s.previewMemDirty = false;
 }
@@ -3798,19 +4240,48 @@ static HDC acquirePreviewBackBuffer(rt::Session& s, int clientW, int clientH) {
         HDC windowDC = GetDC(s.hwnd);
         if (!windowDC) return nullptr;
         s.previewMemDC = CreateCompatibleDC(windowDC);
-        s.previewMemBitmap = CreateCompatibleBitmap(windowDC, clientW, clientH);
+
+        // A DIB section rather than a compatible bitmap: the composited frame is copied into
+        // it by hand, and screenshots read the pixels back out of it. 32bpp BI_RGB is
+        // B,G,R,X in memory; the negative height makes it top-down.
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = clientW;
+        bmi.bmiHeader.biHeight = -clientH;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        s.previewMemBitmap = CreateDIBSection(windowDC, &bmi, DIB_RGB_COLORS, &s.previewMemBits, nullptr, 0);
+
         ReleaseDC(s.hwnd, windowDC);
-        if (!s.previewMemDC || !s.previewMemBitmap) {
+        if (!s.previewMemDC || !s.previewMemBitmap || !s.previewMemBits) {
             destroyPreviewBackBuffer(s);
             return nullptr;
         }
         s.previewMemOldBitmap = SelectObject(s.previewMemDC, s.previewMemBitmap);
+        s.previewMemStride = clientW * 4;
         s.previewMemW = clientW;
         s.previewMemH = clientH;
         RECT full{0, 0, clientW, clientH};
         FillRect(s.previewMemDC, &full, (HBRUSH)GetStockObject(BLACK_BRUSH));
     }
     return s.previewMemDC;
+}
+
+// The D3D12 preview never goes through a swapchain, so the composited frame only exists here.
+// Must run after every layer is composited, or the shot shows the eyes without the overlays.
+static void captureD3D12Screenshot(rt::Session& s) {
+    if (!mcp::g_screenshotRequested) return;
+    if (!s.previewMemBits || s.previewMemW <= 0 || s.previewMemH <= 0) return;
+
+    GdiFlush();
+    const std::string path = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
+    if (mcp::SavePixelsToBMP((const uint8_t*)s.previewMemBits, (uint32_t)s.previewMemW,
+                             (uint32_t)s.previewMemH, path.c_str(), s.previewMemStride, true)) {
+        std::wstring wp(path.begin(), path.end());
+        ui::NotifyScreenshotSaved(wp);
+    }
+    mcp::g_screenshotRequested = false;
 }
 
 static void presentPreviewBackBuffer(rt::Session& s) {
@@ -3823,13 +4294,158 @@ static void presentPreviewBackBuffer(rt::Session& s) {
     s.previewMemDirty = false;
 }
 
-// D3D12 blit function - copies swapchain textures to offscreen RT, reads back to CPU, paints via GDI.
-// Uses GDI instead of DXGI Present to avoid hook conflicts with Steam overlay / UEVR.
+// --- Preview frame compositing (D3D12) ---------------------------------------------------------
+
+// Open the render target for this frame's layers. Idempotent: whichever layer pass runs
+// first pays for the command-list reset, the transition and the clear, and the rest just
+// draw. Every layer of a frame therefore lands in one RT and comes back in one readback,
+// which is also why the mirror can no longer show the eyes for a moment without the HUD
+// over them - the two are never in the back buffer separately.
+static bool beginPreviewRT(rt::Session& s) {
+    if (s.previewRecording) return true;
+    if (!s.previewRT12 || !s.previewRtvHeap || !s.previewCmdList || !s.previewCmdAlloc) return false;
+    if (FAILED(s.previewCmdAlloc->Reset())) return false;
+    if (FAILED(s.previewCmdList->Reset(s.previewCmdAlloc.Get(), nullptr))) return false;
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = s.previewRT12.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    s.previewCmdList->ResourceBarrier(1, &barrier);
+
+    ID3D12DescriptorHeap* heaps[] = { s.previewSrvHeap.Get() };
+    s.previewCmdList->SetDescriptorHeaps(1, heaps);
+    s.previewCmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    const float clearBlack[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    s.previewCmdList->ClearRenderTargetView(rtv, clearBlack, 0, nullptr);
+
+    s.previewRecording = true;
+    return true;
+}
+
+// Copy the finished composite into the GDI back buffer. The RT was rendered at the client
+// area's size and in the DIB's own BGRA layout, so this is a straight row copy - no GDI
+// scaling, no swizzle. The centering absorbs a resize that landed after ensurePreviewSized
+// ran: the image sits in the middle of the new client area for one frame rather than being
+// torn or written out of bounds.
+static void paintPreviewComposite(rt::Session& s, UINT rtWidth, UINT rtHeight) {
+    if (!s.previewReadback12 || !s.hwnd || rtWidth == 0 || rtHeight == 0) return;
+
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * rtHeight };
+    if (FAILED(s.previewReadback12->Map(0, &readRange, &mapped)) || !mapped) return;
+
+    RECT cr{};
+    GetClientRect(s.hwnd, &cr);
+    const int clientW = cr.right - cr.left;
+    const int clientH = cr.bottom - cr.top;
+    HDC hdc = acquirePreviewBackBuffer(s, clientW, clientH);
+    if (hdc && s.previewMemBits && s.previewMemStride > 0) {
+        // acquirePreviewBackBuffer may have queued GDI work on this DC; land it
+        // before writing the same pixels by hand.
+        GdiFlush();
+
+        const int dstX = (clientW - (int)rtWidth) / 2;
+        const int dstY = (clientH - (int)rtHeight) / 2;
+        const int x0 = (std::max)(0, dstX), x1 = (std::min)(clientW, dstX + (int)rtWidth);
+        const int y0 = (std::max)(0, dstY), y1 = (std::min)(clientH, dstY + (int)rtHeight);
+        const int copyW = (std::max)(0, x1 - x0);
+
+        uint8_t* dstBase = (uint8_t*)s.previewMemBits;
+        const uint8_t* srcBase = (const uint8_t*)mapped;
+        for (int y = 0; y < clientH; ++y) {
+            uint8_t* row = dstBase + (size_t)y * s.previewMemStride;
+            if (copyW == 0 || y < y0 || y >= y1) {
+                memset(row, 0, (size_t)clientW * 4);
+                continue;
+            }
+            if (x0 > 0) memset(row, 0, (size_t)x0 * 4);
+            if (x1 < clientW) memset(row + (size_t)x1 * 4, 0, (size_t)(clientW - x1) * 4);
+            memcpy(row + (size_t)x0 * 4,
+                   srcBase + (size_t)(y - dstY) * s.previewReadbackPitch + (size_t)(x0 - dstX) * 4,
+                   (size_t)copyW * 4);
+        }
+        s.previewMemDirty = true;
+    }
+    D3D12_RANGE writeRange = { 0, 0 };
+    s.previewReadback12->Unmap(0, &writeRange);
+}
+
+// Read the composited RT back and paint it. Called once per frame, after every layer of
+// that frame has been recorded into the target.
+static void closePreviewFrame(rt::Session& s) {
+    if (!s.previewRecording) return;
+    s.previewRecording = false;
+    if (!s.previewReadback12 || !s.previewRT12) return;
+
+    const D3D12_RESOURCE_DESC rtDesc = s.previewRT12->GetDesc();
+    const UINT rtWidth = (UINT)rtDesc.Width, rtHeight = rtDesc.Height;
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = s.previewRT12.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    s.previewCmdList->ResourceBarrier(1, &barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = s.previewReadback12.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint.Format = rt::kPreviewRTFormat;
+    dst.PlacedFootprint.Footprint.Width = rtWidth;
+    dst.PlacedFootprint.Footprint.Height = rtHeight;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = s.previewReadbackPitch;
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = s.previewRT12.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    s.previewCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    s.previewCmdList->ResourceBarrier(1, &barrier);
+    s.previewCmdList->Close();
+
+    // Order the read of the app's swapchain images after the app's own frame work. One
+    // signal per frame now that every layer shares a submission, where the eye pass and
+    // each quad layer used to raise their own.
+    if (s.crossQueueFence && s.d3d12Queue) {
+        s.crossQueueFenceValue++;
+        s.d3d12Queue->Signal(s.crossQueueFence.Get(), s.crossQueueFenceValue);
+        s.previewQueue12->Wait(s.crossQueueFence.Get(), s.crossQueueFenceValue);
+    }
+
+    ID3D12CommandList* lists[] = { s.previewCmdList.Get() };
+    s.previewQueue12->ExecuteCommandLists(1, lists);
+    const UINT64 value = ++s.previewFenceValue;
+    s.previewQueue12->Signal(s.previewFence.Get(), value);
+    if (s.previewFence->GetCompletedValue() < value) {
+        s.previewFence->SetEventOnCompletion(value, s.previewFenceEvent);
+        WaitForSingleObject(s.previewFenceEvent, 1000);
+    }
+
+    paintPreviewComposite(s, rtWidth, rtHeight);
+}
+
+// Draws the eye swapchains, scaled, into the offscreen RT, reads that back and copies it
+// into the preview back buffer. Never touches DXGI Present, which the Steam overlay and
+// UEVR both hook - calling it from inside the app's own Present recurses until the stack
+// gives out. Scaling on the GPU keeps the readback at the window's size: the alternative,
+// reading back the full stereo render and resampling it with StretchDIBits, cost 25ms a
+// frame on a 5120x1440 submission.
 static void blitD3D12ToPreview(rt::Session& s,
                                 rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice, const rt::SubImageRect& rectL,
                                 rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice, const rt::SubImageRect& rectR,
                                 ui::DisplayLayout layout, ui::ViewMode viewMode) {
-    if (!s.previewRT12 || !s.previewReadback12 || !s.previewCmdList || !s.previewCmdAlloc) {
+    if (!s.previewRT12 || !s.previewCmdList ||
+        !s.previewRtvHeap || !s.previewSrvHeap || !s.previewRootSig || !s.previewPSO) {
         Log("[SimXR] blitD3D12ToPreview: Missing D3D12 preview resources");
         return;
     }
@@ -3843,34 +4459,12 @@ static void blitD3D12ToPreview(rt::Session& s,
         return;
     }
 
-    // Wait for previous frame to finish
-    if (s.previewFence->GetCompletedValue() < s.previewFenceValue - 1) {
-        s.previewFence->SetEventOnCompletion(s.previewFenceValue - 1, s.previewFenceEvent);
-        WaitForSingleObject(s.previewFenceEvent, 1000);
-    }
+    // The RT is the size the window shows, so this pass is also the downscale: each eye
+    // is drawn into its half of it, filtered, instead of copied at full resolution and
+    // resampled on the CPU afterwards.
+    if (!beginPreviewRT(s)) return;
 
     ID3D12Resource* renderTarget = s.previewRT12.Get();
-
-    // Reset command allocator and list
-    HRESULT hr = s.previewCmdAlloc->Reset();
-    if (FAILED(hr)) {
-        Logf("[SimXR] blitD3D12ToPreview: CmdAlloc Reset failed 0x%08X", hr);
-        return;
-    }
-    hr = s.previewCmdList->Reset(s.previewCmdAlloc.Get(), nullptr);
-    if (FAILED(hr)) {
-        Logf("[SimXR] blitD3D12ToPreview: CmdList Reset failed 0x%08X", hr);
-        return;
-    }
-
-    // Transition offscreen RT to copy dest (COMMON → COPY_DEST via implicit promotion)
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = renderTarget;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    s.previewCmdList->ResourceBarrier(1, &barrier);
 
     auto transition = [&](ID3D12Resource* res, D3D12_RESOURCE_STATES& state, D3D12_RESOURCE_STATES newState) {
         if (!res || state == newState) return;
@@ -3884,63 +4478,94 @@ static void blitD3D12ToPreview(rt::Session& s,
         state = newState;
     };
 
-    auto calcSubresource = [](const rt::Swapchain& chain, uint32_t slice, const char* label) -> UINT {
-        uint32_t arraySize = chain.arraySize ? chain.arraySize : 1;
-        uint32_t mipLevels = chain.mipCount ? chain.mipCount : 1;
-        if (slice >= arraySize) {
-            Logf("[SimXR] blitD3D12ToPreview: %s slice %u out of range (arraySize=%u)", label, slice, arraySize);
-            return UINT_MAX;
-        }
-        return D3D12CalcSubresource(0, slice, 0, mipLevels, arraySize);
-    };
-
-    // Get render target dimensions for clipping (CopyTextureRegion doesn't scale)
     D3D12_RESOURCE_DESC rtDesc = renderTarget->GetDesc();
     UINT rtWidth = (UINT)rtDesc.Width;
     UINT rtHeight = rtDesc.Height;
 
-    auto copyEye = [&](rt::Swapchain& chain, uint32_t idx, uint32_t slice, const rt::SubImageRect& rect,
-                       UINT dstX, UINT dstY, const char* label) -> bool {
+    // Plain (non-sRGB) view: the eye pass writes the source bytes through in the encoding
+    // they are stored in, so nothing must convert them on the way out.
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    s.previewCmdList->SetGraphicsRootSignature(s.previewRootSig.Get());
+    s.previewCmdList->SetPipelineState(s.previewPSO.Get());
+    s.previewCmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+
+    auto drawEye = [&](rt::Swapchain& chain, uint32_t idx, uint32_t slice, const rt::SubImageRect& rect,
+                       int dstX, int dstY, int dstW, int dstH, const char* label) -> bool {
         if (idx >= chain.images12.size() || !chain.images12[idx]) return false;
         if (chain.imageStates12.size() <= idx) {
             Logf("[SimXR] blitD3D12ToPreview: %s missing state tracking", label);
             return false;
         }
-        UINT subresource = calcSubresource(chain, slice, label);
-        if (subresource == UINT_MAX) return false;
+        const uint32_t arraySize = chain.arraySize ? chain.arraySize : 1;
+        if (slice >= arraySize) {
+            Logf("[SimXR] blitD3D12ToPreview: %s slice %u out of range (arraySize=%u)", label, slice, arraySize);
+            return false;
+        }
+        if (dstW <= 0 || dstH <= 0 || rect.w == 0 || rect.h == 0) return false;
+        // Entirely outside the RT: nothing to draw, and bailing here keeps the swapchain
+        // image out of a transition it would never be moved back from.
+        if (dstX + dstW <= 0 || dstY + dstH <= 0 ||
+            dstX >= (int)rtWidth || dstY >= (int)rtHeight) return false;
 
         ID3D12Resource* srcTex = chain.images12[idx].Get();
-        // Transition from COMMON (reset on release) to COPY_SOURCE
-        // D3D12 supports implicit promotion from COMMON, but explicit barrier is safer
-        transition(srcTex, chain.imageStates12[idx], D3D12_RESOURCE_STATE_COPY_SOURCE);
+        const D3D12_RESOURCE_DESC sd = srcTex->GetDesc();
+        if (sd.SampleDesc.Count > 1) {
+            static int msaaLog = 0;
+            if (++msaaLog % 120 == 1) {
+                Logf("[SimXR] blitD3D12ToPreview: %s is %ux MSAA; preview needs a resolve first, skipping",
+                     label, sd.SampleDesc.Count);
+            }
+            return false;
+        }
 
-        D3D12_TEXTURE_COPY_LOCATION dst = {};
-        dst.pResource = renderTarget;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.SubresourceIndex = 0;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = rt::PreviewSrvFormat(sd.Format);
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (sd.DepthOrArraySize > 1) {
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            srvDesc.Texture2DArray.FirstArraySlice = slice;
+            srvDesc.Texture2DArray.ArraySize = 1;
+            srvDesc.Texture2DArray.MipLevels = 1;
+        } else {
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+        }
 
-        D3D12_TEXTURE_COPY_LOCATION src = {};
-        src.pResource = srcTex;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = subresource;
+        const UINT slot = s.previewSrvSlot;
+        s.previewSrvSlot = (s.previewSrvSlot + 1) % rt::kPreviewSrvSlots;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.previewSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = s.previewSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        cpu.ptr += (SIZE_T)slot * s.previewSrvStride;
+        gpu.ptr += (UINT64)slot * s.previewSrvStride;
+        s.d3d12Device->CreateShaderResourceView(srcTex, &srvDesc, cpu);
 
-        // Clip source box to fit within render target (CopyTextureRegion is 1:1 pixel copy, no scaling)
-        UINT copyW = rect.w;
-        UINT copyH = rect.h;
-        if (dstX + copyW > rtWidth)  copyW = (dstX < rtWidth)  ? rtWidth  - dstX : 0;
-        if (dstY + copyH > rtHeight) copyH = (dstY < rtHeight) ? rtHeight - dstY : 0;
-        if (copyW == 0 || copyH == 0) return false;
+        transition(srcTex, chain.imageStates12[idx], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-        D3D12_BOX srcBox = {};
-        srcBox.left = rect.x;
-        srcBox.top = rect.y;
-        srcBox.front = 0;
-        srcBox.right = rect.x + copyW;
-        srcBox.bottom = rect.y + copyH;
-        srcBox.back = 1;
+        const float texW = (float)sd.Width, texH = (float)sd.Height;
+        const float uvScaleX = (float)rect.w / texW, uvScaleY = (float)rect.h / texH;
+        const float constants[8] = {
+            (float)rect.x / texW, (float)rect.y / texH,
+            uvScaleX, uvScaleY,
+            0.25f * uvScaleX / (float)dstW, 0.25f * uvScaleY / (float)dstH,
+            (srvDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+             srvDesc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 1.0f : 0.0f,
+            0.0f,
+        };
+        s.previewCmdList->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
+        s.previewCmdList->SetGraphicsRootDescriptorTable(0, gpu);
 
-        s.previewCmdList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, &srcBox);
-        // Transition back to COMMON so the app can use implicit promotion next frame
+        // The scissor stays inside the RT while the viewport may run past it: the
+        // rasterizer drops the overflow and the cleared black shows through anywhere the
+        // image does not reach.
+        D3D12_VIEWPORT vp = { (float)dstX, (float)dstY, (float)dstW, (float)dstH, 0.0f, 1.0f };
+        D3D12_RECT scissor = { (std::max)(0, dstX), (std::max)(0, dstY),
+                               (std::min)((int)rtWidth, dstX + dstW),
+                               (std::min)((int)rtHeight, dstY + dstH) };
+        s.previewCmdList->RSSetViewports(1, &vp);
+        s.previewCmdList->RSSetScissorRects(1, &scissor);
+        s.previewCmdList->DrawInstanced(3, 1, 0, 0);
+
+        // Back to the state the app released it in, so its own barriers still line up.
         transition(srcTex, chain.imageStates12[idx], chain.releaseState12);
         return true;
     };
@@ -3963,180 +4588,44 @@ static void blitD3D12ToPreview(rt::Session& s,
     const bool hasLeft = leftIdx < chainL.images12.size() && chainL.images12[leftIdx];
     const bool hasRight = chainR && rightIdx < chainR->images12.size() && chainR->images12[rightIdx];
 
-    // Single-eye mode: render selected eye full-screen
+    // The RT is the client area, so the eyes go in the largest content-aspect rect that
+    // fits inside it. Taking the shape from the panel and not from the render target is
+    // what turns the app's non-square pixels back into square ones.
+    int displayW = 0, displayH = 0;
+    rt::ComputeDisplayDims(displayW, displayH);
+    const rt::FitRect present = rt::ComputeFitRect(displayW, displayH, (int)rtWidth, (int)rtHeight);
+    const int presentX = (int)lroundf(present.x);
+    const int presentY = (int)lroundf(present.y);
+    const int presentW = (std::max)(1, (int)lroundf(present.w));
+    const int presentH = (std::max)(1, (int)lroundf(present.h));
+
     if (singleEye || forceSingleEye) {
         if (viewMode == ui::ViewMode::RightEyeOnly && hasRight) {
-            copyEye(*chainR, rightIdx, rightSlice, rectR, 0, 0, "R");
+            drawEye(*chainR, rightIdx, rightSlice, rectR, presentX, presentY, presentW, presentH, "R");
         } else if (hasLeft) {
-            copyEye(chainL, leftIdx, leftSlice, rectL, 0, 0, "L");
+            drawEye(chainL, leftIdx, leftSlice, rectL, presentX, presentY, presentW, presentH, "L");
         } else if (hasRight) {
-            copyEye(*chainR, rightIdx, rightSlice, rectR, 0, 0, "R");
+            drawEye(*chainR, rightIdx, rightSlice, rectR, presentX, presentY, presentW, presentH, "R");
         }
     } else {
-        UINT rightX = (effectiveLayout == ui::DisplayLayout::OverUnder) ? 0 : (UINT)(s.previewWidth / 2);
-        UINT rightY = (effectiveLayout == ui::DisplayLayout::OverUnder) ? (UINT)(s.previewHeight / 2) : 0;
+        const bool overUnder = (effectiveLayout == ui::DisplayLayout::OverUnder);
+        const int halfW = overUnder ? presentW : presentW / 2;
+        const int halfH = overUnder ? presentH / 2 : presentH;
+        const int rightX = overUnder ? presentX : presentX + halfW;
+        const int rightY = overUnder ? presentY + halfH : presentY;
 
         if (hasLeft) {
-            copyEye(chainL, leftIdx, leftSlice, rectL, 0, 0, "L");
+            drawEye(chainL, leftIdx, leftSlice, rectL, presentX, presentY, halfW, halfH, "L");
         }
         if (hasRight) {
-            copyEye(*chainR, rightIdx, rightSlice, rectR, rightX, rightY, "R");
+            drawEye(*chainR, rightIdx, rightSlice, rectR, rightX, rightY, halfW, halfH, "R");
         } else if (hasLeft) {
-            copyEye(chainL, leftIdx, leftSlice, rectL, rightX, rightY, "L");
+            drawEye(chainL, leftIdx, leftSlice, rectL, rightX, rightY, halfW, halfH, "L");
         }
     }
 
-    // Transition RT: COPY_DEST → COPY_SOURCE for readback
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    s.previewCmdList->ResourceBarrier(1, &barrier);
-
-    // Copy render target to readback buffer
-    D3D12_TEXTURE_COPY_LOCATION readbackDst = {};
-    readbackDst.pResource = s.previewReadback12.Get();
-    readbackDst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    readbackDst.PlacedFootprint.Offset = 0;
-    readbackDst.PlacedFootprint.Footprint.Format = rtDesc.Format;
-    readbackDst.PlacedFootprint.Footprint.Width = rtWidth;
-    readbackDst.PlacedFootprint.Footprint.Height = rtHeight;
-    readbackDst.PlacedFootprint.Footprint.Depth = 1;
-    readbackDst.PlacedFootprint.Footprint.RowPitch = s.previewReadbackPitch;
-
-    D3D12_TEXTURE_COPY_LOCATION readbackSrc = {};
-    readbackSrc.pResource = renderTarget;
-    readbackSrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    readbackSrc.SubresourceIndex = 0;
-
-    s.previewCmdList->CopyTextureRegion(&readbackDst, 0, 0, 0, &readbackSrc, nullptr);
-
-    // Transition RT back to COMMON for next frame
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-    s.previewCmdList->ResourceBarrier(1, &barrier);
-
-    // Execute and wait for completion (we need the readback data immediately)
-    s.previewCmdList->Close();
-    ID3D12CommandList* cmdLists[] = { s.previewCmdList.Get() };
-    s.previewQueue12->ExecuteCommandLists(1, cmdLists);
-    s.previewQueue12->Signal(s.previewFence.Get(), s.previewFenceValue);
-    if (s.previewFence->GetCompletedValue() < s.previewFenceValue) {
-        s.previewFence->SetEventOnCompletion(s.previewFenceValue, s.previewFenceEvent);
-        WaitForSingleObject(s.previewFenceEvent, 1000);
-    }
-    s.previewFenceValue++;
-
-    // Map readback buffer and paint to window via GDI (bypasses all DXGI Present hooks).
-    // The RT here is at the natural content size; StretchDIBits scales it into the
-    // letterbox fit rect inside the current window client area, so resizing the
-    // window scales the stereo image (with black bars) instead of cropping it.
-    void* mapped = nullptr;
-    D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * rtHeight };
-    hr = s.previewReadback12->Map(0, &readRange, &mapped);
-    if (SUCCEEDED(hr) && mapped && s.hwnd) {
-        // Get current client area (live, in case a resize is mid-flight)
-        RECT cr{};
-        GetClientRect(s.hwnd, &cr);
-        int clientW = cr.right - cr.left;
-        int clientH = cr.bottom - cr.top;
-        HDC hdc = acquirePreviewBackBuffer(s, clientW, clientH);
-        if (hdc) {
-            {
-                // Fit to the panel's shape, not the render target's: this stretch is
-                // what converts the app's non-square pixels back into square ones.
-                int displayW = 0, displayH = 0;
-                rt::ComputeDisplayDims(displayW, displayH);
-                rt::FitRect fit = rt::ComputeFitRect(displayW, displayH, clientW, clientH);
-                int dstX = (int)fit.x;
-                int dstY = (int)fit.y;
-                int dstW = (int)fit.w;
-                int dstH = (int)fit.h;
-                if (dstW < 1) dstW = 1;
-                if (dstH < 1) dstH = 1;
-
-                // GDI 32bpp BI_RGB DIBs are interpreted as BGRA byte order. The
-                // readback buffer holds bytes in the channel order of the offscreen
-                // RT (rtDesc.Format / s.previewFormat), which mirrors the submitted
-                // swapchain's channel layout (see displayFormat selection in the
-                // present path). If the source is RGBA (R8G8B8A8) the readback bytes
-                // are R,G,B,A — GDI would swap R<->B and show pink as purple. Use
-                // BI_BITFIELDS with explicit RGBA masks so GDI reads the existing
-                // byte order correctly, with zero per-pixel cost. Genuinely-BGRA
-                // sources (B8G8R8A8) already match GDI's BGRA expectation, so they
-                // keep BI_RGB and are not double-swapped.
-                const bool srcIsRGBA =
-                    (rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                     rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                     rtDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS);
-
-                // BITMAPINFO only reserves one RGBQUAD; BI_BITFIELDS needs three
-                // DWORD masks immediately after the header, so use a wrapper struct.
-                struct { BITMAPINFOHEADER hdr; DWORD masks[3]; } bmiBF = {};
-                BITMAPINFO bmiRGB = {};
-                BITMAPINFO* pbmi = srcIsRGBA ? (BITMAPINFO*)&bmiBF : &bmiRGB;
-                BITMAPINFOHEADER& hdr = srcIsRGBA ? bmiBF.hdr : bmiRGB.bmiHeader;
-
-                hdr.biSize = sizeof(BITMAPINFOHEADER);
-                hdr.biWidth = (LONG)rtWidth;
-                hdr.biHeight = -(LONG)rtHeight;  // top-down
-                hdr.biPlanes = 1;
-                hdr.biBitCount = 32;
-                if (srcIsRGBA) {
-                    // RGBA byte order in memory -> little-endian DWORD 0xAABBGGRR
-                    hdr.biCompression = BI_BITFIELDS;
-                    bmiBF.masks[0] = 0x000000FF;  // Red   (byte 0)
-                    bmiBF.masks[1] = 0x0000FF00;  // Green (byte 1)
-                    bmiBF.masks[2] = 0x00FF0000;  // Blue  (byte 2)
-                } else {
-                    hdr.biCompression = BI_RGB;    // BGRA byte order matches GDI default
-                }
-
-                // Bilinear scaling for the StretchDIBits downscale path
-                SetStretchBltMode(hdc, HALFTONE);
-                SetBrushOrgEx(hdc, 0, 0, nullptr);
-
-                // Paint the letterbox borders black so resizing doesn't leave
-                // stale pixels around the scaled stereo image.
-                HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
-                if (dstY > 0) {
-                    RECT top{0, 0, clientW, dstY};
-                    FillRect(hdc, &top, black);
-                }
-                if (dstY + dstH < clientH) {
-                    RECT bot{0, dstY + dstH, clientW, clientH};
-                    FillRect(hdc, &bot, black);
-                }
-                if (dstX > 0) {
-                    RECT left{0, dstY, dstX, dstY + dstH};
-                    FillRect(hdc, &left, black);
-                }
-                if (dstX + dstW < clientW) {
-                    RECT right{dstX + dstW, dstY, clientW, dstY + dstH};
-                    FillRect(hdc, &right, black);
-                }
-
-                // Handle aligned row pitch: if pitch matches width*4, blit directly; otherwise copy rows
-                UINT expectedPitch = rtWidth * 4;
-                if (s.previewReadbackPitch == expectedPitch) {
-                    StretchDIBits(hdc, dstX, dstY, dstW, dstH,
-                                  0, 0, rtWidth, rtHeight,
-                                  mapped, pbmi, DIB_RGB_COLORS, SRCCOPY);
-                } else {
-                    // Copy rows with correct pitch to a contiguous buffer
-                    std::vector<uint8_t> pixels(expectedPitch * rtHeight);
-                    const uint8_t* src = (const uint8_t*)mapped;
-                    for (UINT row = 0; row < rtHeight; ++row) {
-                        memcpy(pixels.data() + row * expectedPitch, src + row * s.previewReadbackPitch, expectedPitch);
-                    }
-                    StretchDIBits(hdc, dstX, dstY, dstW, dstH,
-                                  0, 0, rtWidth, rtHeight,
-                                  pixels.data(), pbmi, DIB_RGB_COLORS, SRCCOPY);
-                }
-            }
-            s.previewMemDirty = true;
-        }
-        D3D12_RANGE writeRange = { 0, 0 };
-        s.previewReadback12->Unmap(0, &writeRange);
-    }
+    // The RT stays open: quad layers of this frame draw into it next, and closePreviewSlot
+    // does the single readback once every layer is in.
 
     // Process window messages
     MSG msg;
@@ -4144,7 +4633,8 @@ static void blitD3D12ToPreview(rt::Session& s,
 
     static int blitCount = 0;
     if (g_logVerbose && ++blitCount % 60 == 1) {
-        Logf("[SimXR] blitD3D12ToPreview: GDI blit L[%u] R[%u] (%ux%u)", leftIdx, rightIdx, rtWidth, rtHeight);
+        Logf("[SimXR] blitD3D12ToPreview: L[%u] R[%u] into a %ux%u target",
+             leftIdx, rightIdx, rtWidth, rtHeight);
     }
 }
 
@@ -4627,31 +5117,10 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
         }
 
         // Use UNORM format for swapchain (SRGB not valid for FLIP_DISCARD)
-        // We create SRGB RTVs for proper gamma when rendering
-        DXGI_FORMAT displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-
-        // For D3D12: CopyTextureRegion requires format compatibility, so the preview
-        // swapchain must use the same channel layout as the source XR swapchain.
-        // Strip sRGB (not valid for FLIP_DISCARD) but keep the channel order.
-        if (s.usesD3D12) {
-            switch (chL.format) {
-                case DXGI_FORMAT_B8G8R8A8_UNORM:
-                case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-                case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-                    displayFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
-                    break;
-                case DXGI_FORMAT_R16G16B16A16_FLOAT:
-                case DXGI_FORMAT_R16G16B16A16_UNORM:
-                    displayFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
-                    break;
-                case DXGI_FORMAT_R10G10B10A2_UNORM:
-                    displayFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
-                    break;
-                default:
-                    displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-                    break;
-            }
-        }
+        // We create SRGB RTVs for proper gamma when rendering. Ignored on D3D12,
+        // where the preview RT is always kPreviewRTFormat and the scaling pass
+        // converts whatever the app submitted into it.
+        const DXGI_FORMAT displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
         const auto viewMode = ui::g_uiState.viewMode;
         const auto layout = ui::g_uiState.displayLayout;
@@ -4662,9 +5131,10 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // get letterboxed into it (no DXGI scaling = no aspect squish).
             rt::GetPreviewClientSize(s, (int)width, (int)height, targetWidth, targetHeight);
         } else {
-            // D3D12 (GDI path): keep the offscreen RT at the natural content
-            // size — StretchDIBits stretches it to the window's fit rect.
-            rt::ComputeContentDims((int)width, (int)height, viewMode, layout, targetWidth, targetHeight);
+            // D3D12 (GDI path): the offscreen RT is the client area and the eyes are
+            // drawn into their fit rect inside it, so the scaling pass does the resample
+            // on the GPU and the readback after it is the window's pixel count.
+            rt::ComputePreviewRTSize(s, targetWidth, targetHeight);
         }
         ensurePreviewSized(s, (UINT)targetWidth, (UINT)targetHeight, displayFormat);
         const bool singleEye = (viewMode != ui::ViewMode::BothEyes);
@@ -4805,13 +5275,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // ===== D3D12 PATH (GDI-based presentation) =====
             if (!s.previewRT12) return;
 
-            // Cross-queue sync: make preview queue wait for game queue to finish
-            // rendering to the source textures before we copy from them
-            if (s.crossQueueFence && s.previewQueue12) {
-                s.crossQueueFenceValue++;
-                s.d3d12Queue->Signal(s.crossQueueFence.Get(), s.crossQueueFenceValue);
-                s.previewQueue12->Wait(s.crossQueueFence.Get(), s.crossQueueFenceValue);
-            }
+            // The cross-queue sync that orders this read after the app's own frame work
+            // is raised once for the whole frame, in closePreviewFrame.
 
             // Blit using D3D12 copy commands → readback → GDI (no DXGI Present, no hook conflicts)
             if (proj.viewCount > 1) {
@@ -4850,141 +5315,9 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
             }
 
-            // MCP Integration - check for screenshot requests and capture (D3D12)
-            // Screenshots use the readback buffer that was just filled by blitD3D12ToPreview
-            if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
-            if (mcp::g_screenshotRequested && s.previewRT12 && s.previewCmdAlloc && s.previewCmdList) {
-                mcp::CaptureScreenshotD3D12(s.d3d12Device.Get(), s.previewQueue12.Get(),
-                                             s.previewRT12.Get(),
-                                             s.previewCmdAlloc.Get(), s.previewCmdList.Get(),
-                                             s.previewFence.Get(), s.previewFenceEvent,
-                                             s.previewFenceValue);
-                std::string p = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
-                std::wstring wp(p.begin(), p.end());
-                ui::NotifyScreenshotSaved(wp);
-            }
+            // D3D12 screenshots are taken in captureD3D12Screenshot at the end of xrEndFrame,
+            // not here: the quad layers of this frame still have to go into the render target.
         }
-    }
-}
-
-// Render a quad layer as 2D overlay (supports both D3D11 and OpenGL)
-// GDI-paint a quad's RGBA pixels (top-down, qw x qh) over the already-painted eye preview, for the D3D12
-// path. Opaque (StretchDIBits) for now; per-pixel alpha is a TODO (needs Msimg32/AlphaBlend or a CPU
-// read-blend of the window).
-static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
-                             const uint8_t* rgba, uint32_t qw, uint32_t qh) {
-    if (!s.hwnd || !rgba || qw == 0 || qh == 0) return;
-
-    RECT cr{}; GetClientRect(s.hwnd, &cr);
-    const int clientW = cr.right - cr.left, clientH = cr.bottom - cr.top;
-    if (clientW <= 0 || clientH <= 0) return;
-
-    // Paints over the eyes the frame already put in the back buffer, not over the window.
-    HDC hdc = acquirePreviewBackBuffer(s, clientW, clientH);
-    if (!hdc) return;
-
-    // Mirror blitD3D12ToPreview's letterbox so the quad lands in the same client coords as the eyes.
-    int displayW = 0, displayH = 0;
-    rt::ComputeDisplayDims(displayW, displayH);
-    rt::FitRect fit = rt::ComputeFitRect(displayW, displayH, clientW, clientH);
-
-    // Must match how blitD3D12ToPreview packs the eyes into the offscreen RT, down to
-    // its anaglyph-degrades-to-left-eye fallback.
-    struct EyeRect { uint32_t eye; int x, y, w, h; };
-    EyeRect eyes[2];
-    int eyeCount = 0;
-    const ui::ViewMode mode = ui::g_uiState.viewMode;
-    const ui::DisplayLayout layout = ui::g_uiState.displayLayout;
-    if (mode != ui::ViewMode::BothEyes || layout == ui::DisplayLayout::Anaglyph) {
-        const uint32_t eye = (mode == ui::ViewMode::RightEyeOnly) ? 1u : 0u;
-        eyes[eyeCount++] = { eye, (int)fit.x, (int)fit.y, (int)fit.w, (int)fit.h };
-    } else if (layout == ui::DisplayLayout::OverUnder) {
-        const int h = (int)fit.h / 2;
-        eyes[eyeCount++] = { 0u, (int)fit.x, (int)fit.y,     (int)fit.w, h };
-        eyes[eyeCount++] = { 1u, (int)fit.x, (int)fit.y + h, (int)fit.w, h };
-    } else {
-        const int w = (int)fit.w / 2;
-        eyes[eyeCount++] = { 0u, (int)fit.x,     (int)fit.y, w, (int)fit.h };
-        eyes[eyeCount++] = { 1u, (int)fit.x + w, (int)fit.y, w, (int)fit.h };
-    }
-
-    float yaw, pitch, roll;
-    rt::GetEffectiveHeadAngles(yaw, pitch, roll);
-
-    bool headLocked = false;
-    XrVector3f worldCorners[4];
-    rt::QuadWorldCorners(*quad, yaw, pitch, roll, worldCorners, &headLocked);
-
-    // RGBA top-down DIB; BI_BITFIELDS so GDI reads R,G,B byte order (matches the eye-path masks).
-    struct { BITMAPINFOHEADER hdr; DWORD masks[3]; } bmi = {};
-    bmi.hdr.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.hdr.biWidth = (LONG)qw;
-    bmi.hdr.biHeight = -(LONG)qh;     // top-down
-    bmi.hdr.biPlanes = 1;
-    bmi.hdr.biBitCount = 32;
-    bmi.hdr.biCompression = BI_BITFIELDS;
-    bmi.masks[0] = 0x000000FF; bmi.masks[1] = 0x0000FF00; bmi.masks[2] = 0x00FF0000;
-
-    SetStretchBltMode(hdc, HALFTONE);
-    SetBrushOrgEx(hdc, 0, 0, nullptr);
-
-    int dbgX = 0, dbgY = 0, dbgW = 0, dbgH = 0;
-    bool painted = false;
-    for (int e = 0; e < eyeCount; ++e) {
-        const EyeRect& er = eyes[e];
-        if (er.w < 2 || er.h < 2) continue;
-
-        if (!rt::QuadVisibleInEye(quad->eyeVisibility, er.eye)) continue;
-
-        const XrPosef view = rt::ViewPoseFromAngles(er.eye, yaw, pitch, roll);
-        const XrFovf fov = rt::GetViewFov(er.eye);
-        const float tanL = tanf(fov.angleLeft),  tanR = tanf(fov.angleRight);
-        const float tanU = tanf(fov.angleUp),    tanD = tanf(fov.angleDown);
-        if (tanR - tanL < 1e-6f || tanU - tanD < 1e-6f) continue;
-
-        // GDI only places axis-aligned rects, so an oriented quad becomes the
-        // screen-space bounding box of its corners.
-        float minX = 0, minY = 0, maxX = 0, maxY = 0;
-        bool inFront = true;
-        for (int i = 0; i < 4; ++i) {
-            const XrVector3f v = rt::WorldToView(worldCorners[i], view);
-            if (v.z > -0.01f) { inFront = false; break; }   // crosses the near plane; no sane rect for it
-            const float u = (v.x / -v.z - tanL) / (tanR - tanL);
-            const float w = (tanU - v.y / -v.z) / (tanU - tanD);
-            const float px = (float)er.x + u * (float)er.w;
-            const float py = (float)er.y + w * (float)er.h;
-            if (i == 0) { minX = maxX = px; minY = maxY = py; continue; }
-            minX = (std::min)(minX, px); maxX = (std::max)(maxX, px);
-            minY = (std::min)(minY, py); maxY = (std::max)(maxY, py);
-        }
-        if (!inFront) continue;
-
-        const int dstX = (int)floorf(minX), dstY = (int)floorf(minY);
-        const int dstW = (int)ceilf(maxX) - dstX, dstH = (int)ceilf(maxY) - dstY;
-        if (dstW < 1 || dstH < 1) continue;
-        if (dstX >= er.x + er.w || dstY >= er.y + er.h ||
-            dstX + dstW <= er.x || dstY + dstH <= er.y) continue;
-
-        HRGN clip = CreateRectRgn(er.x, er.y, er.x + er.w, er.y + er.h);
-        SelectClipRgn(hdc, clip);
-        StretchDIBits(hdc, dstX, dstY, dstW, dstH, 0, 0, (int)qw, (int)qh,
-                      rgba, (BITMAPINFO*)&bmi, DIB_RGB_COLORS, SRCCOPY);
-        SelectClipRgn(hdc, nullptr);
-        DeleteObject(clip);
-
-        painted = true;
-        dbgX = dstX; dbgY = dstY; dbgW = dstW; dbgH = dstH;
-    }
-
-    if (painted) s.previewMemDirty = true;
-    static int s_qlog = 0;
-    if (g_logVerbose && ++s_qlog % 120 == 1) {
-        Logf("[SimXR] D3D12 quad composited: tex=%ux%u space=%s pose=(%.2f,%.2f,%.2f) size=(%.2f,%.2f) "
-             "dst=(%d,%d,%d,%d)%s",
-             qw, qh, headLocked ? "VIEW" : "WORLD",
-             quad->pose.position.x, quad->pose.position.y, quad->pose.position.z,
-             quad->size.width, quad->size.height,
-             dbgX, dbgY, dbgW, dbgH, painted ? "" : " (off-view)");
     }
 }
 
@@ -5009,116 +5342,163 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
                       (chain.lastAcquired != UINT32_MAX) ? chain.lastAcquired : 0;
 
     // --- D3D12 quad compositing -----------------------------------------------------------------------
-    // The D3D12 preview is GDI-painted (eyes already on the window via blitD3D12ToPreview). Read the quad
-    // swapchain texture to CPU (reusing the idle preview cmd list/queue/fence), then GDI-paint it over the
-    // eyes at the quad's projected rect, in each eye half. Opaque (StretchDIBits) when the quad has no
-    // source-alpha flag; per-pixel AlphaBlend otherwise (for the real UI texture). Self-contained: does not
-    // touch the eye composite path.
+    // Rasterised into the same render target the eyes were just drawn into, once per eye
+    // half, and read back with them as one image. The corners are projected into each eye's
+    // view space here; the vertex shader applies that eye's asymmetric projection so the
+    // interpolation is perspective-correct and a quad crossing behind the eye is clipped
+    // rather than mis-drawn.
     if (s.usesD3D12) {
         if (texIdx >= chain.images12.size() || !chain.images12[texIdx]) return;
         if (chain.imageStates12.size() <= texIdx) return;
-        if (!s.previewCmdList || !s.previewCmdAlloc || !s.previewQueue12 || !s.previewFence || !s.hwnd) return;
-
-        // Read back only the region the app declared valid, so the packed buffer the
-        // compositor stretches into the quad is exactly the submitted image.
-        const rt::SubImageRect qrect = rt::ResolveSubImageRect(quad->subImage.imageRect, chain.width, chain.height, "quad");
-        const uint32_t qw = qrect.w, qh = qrect.h;
-        const UINT qpitch = (qw * 4 + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+        if (!s.previewCmdList || !s.previewQueue12 || !s.previewFence || !s.hwnd) return;
+        if (!s.previewQuadRootSig || !s.previewQuadPSO[0]) return;
 
         const uint32_t qArraySize = chain.arraySize ? chain.arraySize : 1;
-        const uint32_t qMipLevels = chain.mipCount ? chain.mipCount : 1;
         if (quad->subImage.imageArrayIndex >= qArraySize) {
             static int badSlice = 0;
-            if (++badSlice % 60 == 1) {
+            if (++badSlice % 120 == 1) {
                 Logf("[SimXR] quad: imageArrayIndex %u out of range (arraySize=%u)",
                      quad->subImage.imageArrayIndex, qArraySize);
             }
             return;
         }
 
-        // Lazily (re)create the quad readback buffer.
-        if (!s.quadReadback12 || s.quadReadbackW != qw || s.quadReadbackH != qh) {
-            D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
-            D3D12_RESOURCE_DESC bd = {};
-            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            bd.Width = (UINT64)qpitch * qh;
-            bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
-            bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            s.quadReadback12.Reset();
-            if (FAILED(s.d3d12Device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
-                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(s.quadReadback12.GetAddressOf())))) {
-                Log("[SimXR] quad: readback CreateCommittedResource failed");
-                return;
-            }
-            s.quadReadbackPitch = qpitch; s.quadReadbackW = qw; s.quadReadbackH = qh;
-        }
-
-        // Copy quad texture -> readback (reusing the preview cmd list; it is idle after blitD3D12ToPreview).
-        if (s.previewFence->GetCompletedValue() < s.previewFenceValue - 1) {
-            s.previewFence->SetEventOnCompletion(s.previewFenceValue - 1, s.previewFenceEvent);
-            WaitForSingleObject(s.previewFenceEvent, 1000);
-        }
-        if (FAILED(s.previewCmdAlloc->Reset())) return;
-        if (FAILED(s.previewCmdList->Reset(s.previewCmdAlloc.Get(), nullptr))) return;
-
         ID3D12Resource* quadTex = chain.images12[texIdx].Get();
+        const D3D12_RESOURCE_DESC qd = quadTex->GetDesc();
+        if (qd.SampleDesc.Count > 1) return;      // needs a resolve first; not worth it for a mirror
+
+        // Share this frame's open render target with the eye pass. On a quad-only frame
+        // nothing has opened it yet, so this is what clears it - which is also what
+        // replaces the old "wipe the back buffer to black" step.
+        if (!beginPreviewRT(s)) return;
+
+        const D3D12_RESOURCE_DESC rtDesc = s.previewRT12->GetDesc();
+        const int rtWidth = (int)rtDesc.Width, rtHeight = (int)rtDesc.Height;
+
+        // Only the region the app declared valid is sampled.
+        const rt::SubImageRect qrect = rt::ResolveSubImageRect(quad->subImage.imageRect, chain.width, chain.height, "quad");
+        const float texW = (float)qd.Width, texH = (float)qd.Height;
+        if (texW <= 0.0f || texH <= 0.0f) return;
+        const float uvRect[4] = { (float)qrect.x / texW, (float)qrect.y / texH,
+                                  (float)(qrect.x + qrect.w) / texW, (float)(qrect.y + qrect.h) / texH };
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = PreviewQuadSrvFormat(qd.Format);
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (qd.DepthOrArraySize > 1) {
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            srvDesc.Texture2DArray.FirstArraySlice = quad->subImage.imageArrayIndex;
+            srvDesc.Texture2DArray.ArraySize = 1;
+            srvDesc.Texture2DArray.MipLevels = 1;
+        } else {
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Texture2D.MipLevels = 1;
+        }
+        const UINT slot2 = s.previewSrvSlot;
+        s.previewSrvSlot = (s.previewSrvSlot + 1) % rt::kPreviewSrvSlots;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.previewSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = s.previewSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        cpu.ptr += (SIZE_T)slot2 * s.previewSrvStride;
+        gpu.ptr += (UINT64)slot2 * s.previewSrvStride;
+        s.d3d12Device->CreateShaderResourceView(quadTex, &srvDesc, cpu);
+
         auto& quadState = chain.imageStates12[texIdx];
-        auto barrier12 = [&](ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        auto barrier12 = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+            if (before == after) return;
             D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition.pResource = res; b.Transition.StateBefore = before; b.Transition.StateAfter = after;
+            b.Transition.pResource = quadTex; b.Transition.StateBefore = before; b.Transition.StateAfter = after;
             b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             s.previewCmdList->ResourceBarrier(1, &b);
         };
         const D3D12_RESOURCE_STATES qstate = quadState;
-        if (qstate != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier12(quadTex, qstate, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier12(qstate, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-        D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = s.quadReadback12.Get();
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint.Footprint.Format = (chain.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) ? DXGI_FORMAT_R8G8B8A8_UNORM : chain.format;
-        dst.PlacedFootprint.Footprint.Width = qw; dst.PlacedFootprint.Footprint.Height = qh;
-        dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = qpitch;
-        D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = quadTex;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = D3D12CalcSubresource(0, quad->subImage.imageArrayIndex, 0, qMipLevels, qArraySize);
-        D3D12_BOX qbox = {};
-        qbox.left = qrect.x; qbox.top = qrect.y; qbox.front = 0;
-        qbox.right = qrect.x + qw; qbox.bottom = qrect.y + qh; qbox.back = 1;
-        s.previewCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, &qbox);
+        float yaw, pitch, roll;
+        rt::GetEffectiveHeadAngles(yaw, pitch, roll);
+        bool headLocked = false;
+        XrVector3f worldCorners[4];
+        rt::QuadWorldCorners(*quad, yaw, pitch, roll, worldCorners, &headLocked);
 
-        if (qstate != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier12(quadTex, D3D12_RESOURCE_STATE_COPY_SOURCE, qstate);
-        s.previewCmdList->Close();
+        // The sRGB view: blending decodes the destination to linear and re-encodes it.
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvSrgb = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtvSrgb.ptr += s.previewRtvStride;
+        const rt::LayerBlend blendMode = rt::BlendForLayerFlags(quad->layerFlags);
+        s.previewCmdList->SetGraphicsRootSignature(s.previewQuadRootSig.Get());
+        s.previewCmdList->SetPipelineState(s.previewQuadPSO[(int)blendMode].Get());
+        s.previewCmdList->OMSetRenderTargets(1, &rtvSrgb, FALSE, nullptr);
+        s.previewCmdList->SetGraphicsRootDescriptorTable(0, gpu);
 
-        // Same cross-queue sync presentProjection does before it copies the eyes. On a
-        // quad-only frame presentProjection never runs, so without this the copy races
-        // the app still rendering into the texture.
-        if (s.crossQueueFence && s.d3d12Queue) {
-            s.crossQueueFenceValue++;
-            s.d3d12Queue->Signal(s.crossQueueFence.Get(), s.crossQueueFenceValue);
-            s.previewQueue12->Wait(s.crossQueueFence.Get(), s.crossQueueFenceValue);
+        // Same split of the RT the eye pass used, so the quad lands over the right eye.
+        int displayW = 0, displayH = 0;
+        rt::ComputeDisplayDims(displayW, displayH);
+        const rt::FitRect present = rt::ComputeFitRect(displayW, displayH, rtWidth, rtHeight);
+        const int presentX = (int)lroundf(present.x), presentY = (int)lroundf(present.y);
+        const int presentW = (std::max)(1, (int)lroundf(present.w));
+        const int presentH = (std::max)(1, (int)lroundf(present.h));
+        const ui::ViewMode viewMode = ui::g_uiState.viewMode;
+        const ui::DisplayLayout layout = ui::g_uiState.displayLayout;
+
+        struct EyeRect { uint32_t eye; int x, y, w, h; };
+        EyeRect eyes[2];
+        int eyeCount = 0;
+        if (viewMode != ui::ViewMode::BothEyes || layout == ui::DisplayLayout::Anaglyph) {
+            const uint32_t eye = (viewMode == ui::ViewMode::RightEyeOnly) ? 1u : 0u;
+            eyes[eyeCount++] = { eye, presentX, presentY, presentW, presentH };
+        } else if (layout == ui::DisplayLayout::OverUnder) {
+            const int h = presentH / 2;
+            eyes[eyeCount++] = { 0u, presentX, presentY,     presentW, h };
+            eyes[eyeCount++] = { 1u, presentX, presentY + h, presentW, h };
+        } else {
+            const int w = presentW / 2;
+            eyes[eyeCount++] = { 0u, presentX,     presentY, w, presentH };
+            eyes[eyeCount++] = { 1u, presentX + w, presentY, w, presentH };
         }
 
-        ID3D12CommandList* lists[] = { s.previewCmdList.Get() };
-        s.previewQueue12->ExecuteCommandLists(1, lists);
-        s.previewQueue12->Signal(s.previewFence.Get(), s.previewFenceValue);
-        if (s.previewFence->GetCompletedValue() < s.previewFenceValue) {
-            s.previewFence->SetEventOnCompletion(s.previewFenceValue, s.previewFenceEvent);
-            WaitForSingleObject(s.previewFenceEvent, 1000);
+        for (int e = 0; e < eyeCount; ++e) {
+            const EyeRect& er = eyes[e];
+            if (er.w < 1 || er.h < 1) continue;
+            if (!rt::QuadVisibleInEye(quad->eyeVisibility, er.eye)) continue;
+
+            const XrPosef view = rt::ViewPoseFromAngles(er.eye, yaw, pitch, roll);
+            const XrFovf fov = rt::GetViewFov(er.eye);
+
+            float consts[rt::kQuadConstantCount] = {};
+            for (int i = 0; i < 4; ++i) {
+                const XrVector3f v = rt::WorldToView(worldCorners[i], view);
+                consts[i * 4 + 0] = v.x;
+                consts[i * 4 + 1] = v.y;
+                consts[i * 4 + 2] = v.z;
+                consts[i * 4 + 3] = 0.0f;
+            }
+            consts[16] = tanf(fov.angleLeft);
+            consts[17] = tanf(fov.angleRight);
+            consts[18] = tanf(fov.angleUp);
+            consts[19] = tanf(fov.angleDown);
+            if (consts[17] - consts[16] < 1e-6f || consts[18] - consts[19] < 1e-6f) continue;
+            consts[20] = uvRect[0]; consts[21] = uvRect[1];
+            consts[22] = uvRect[2]; consts[23] = uvRect[3];
+            consts[24] = (blendMode == rt::LayerBlend::Premultiplied) ? 1.0f : 0.0f;
+            consts[25] = (blendMode == rt::LayerBlend::Opaque) ? 1.0f : 0.0f;
+            s.previewCmdList->SetGraphicsRoot32BitConstants(1, rt::kQuadConstantCount, consts, 0);
+
+            const D3D12_VIEWPORT vp = { (float)er.x, (float)er.y, (float)er.w, (float)er.h, 0.0f, 1.0f };
+            const D3D12_RECT scissor = { (std::max)(0, er.x), (std::max)(0, er.y),
+                                         (std::min)(rtWidth, er.x + er.w),
+                                         (std::min)(rtHeight, er.y + er.h) };
+            s.previewCmdList->RSSetViewports(1, &vp);
+            s.previewCmdList->RSSetScissorRects(1, &scissor);
+            s.previewCmdList->DrawInstanced(6, 1, 0, 0);
         }
-        s.previewFenceValue++;
 
-        void* qmapped = nullptr;
-        D3D12_RANGE rr = { 0, (SIZE_T)qpitch * qh };
-        if (FAILED(s.quadReadback12->Map(0, &rr, &qmapped)) || !qmapped) return;
+        // Back to the state the app released it in, so its own barriers still line up.
+        barrier12(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, qstate);
 
-        // Pack the quad pixels into a contiguous top-down RGBA buffer for GDI.
-        std::vector<uint8_t> qpix((size_t)qw * qh * 4);
-        for (uint32_t y = 0; y < qh; ++y) {
-            memcpy(qpix.data() + (size_t)y * qw * 4, (const uint8_t*)qmapped + (size_t)y * qpitch, (size_t)qw * 4);
+        static int s_qlog = 0;
+        if (g_logVerbose && ++s_qlog % 120 == 1) {
+            Logf("[SimXR] D3D12 quad drawn: tex=%ux%u blend=%d space=%s eyeVis=%d size=(%.2f,%.2f)",
+                 qrect.w, qrect.h, (int)blendMode, headLocked ? "VIEW" : "WORLD",
+                 (int)quad->eyeVisibility, quad->size.width, quad->size.height);
         }
-        D3D12_RANGE noWrite = { 0, 0 };
-        s.quadReadback12->Unmap(0, &noWrite);
-
-        compositeQuadGDI(s, quad, qpix.data(), qw, qh);
         return;
     }
 
@@ -5635,7 +6015,15 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     // !previewSwapchain && !previewRT12 guard.
     if (projectionCount == 0) {
         ensurePreviewWithoutProjection(rt::g_session);
-        clearPreviewToBlack(rt::g_session);
+        if (!rt::g_session.usesD3D12) {
+            clearPreviewToBlack(rt::g_session);
+        } else if (!hasOverlays) {
+            // D3D12 normally clears as part of opening the render target, which whichever
+            // layer pass runs first does - so the black and the layers over it reach the
+            // window in one repaint. A frame carrying no layers at all has no such pass,
+            // so open the target here to wipe the last 3D frame off the mirror.
+            beginPreviewRT(rt::g_session);
+        }
     }
 
     // Third pass: render overlay layers (quad, cylinder) on top of the projection
@@ -5658,8 +6046,14 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         }
     }
 
-    // Every layer of this frame has now been composited, so show it in one blit.
-    if (rt::g_session.usesD3D12) presentPreviewBackBuffer(rt::g_session);
+    // Every layer of this frame has now been recorded, so read the composite back and
+    // show it in one blit.
+    if (rt::g_session.usesD3D12) {
+        closePreviewFrame(rt::g_session);
+        if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
+        captureD3D12Screenshot(rt::g_session);
+        presentPreviewBackBuffer(rt::g_session);
+    }
 
     // MCP Integration - write frame status BEFORE Present (Present may block on D3D12)
     mcp::WriteFrameStatus(frameCount, rt::g_session.previewWidth, rt::g_session.previewHeight,

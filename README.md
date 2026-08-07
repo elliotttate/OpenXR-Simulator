@@ -91,7 +91,7 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 
 - **Instance & Session Management** - Handles OpenXR instance creation and session lifecycle
 - **Swapchain Rendering** - Creates swapchains for D3D11, D3D12, and OpenGL that applications render into
-- **View Composition** - Blits stereo views to a desktop window (D3D11: DXGI swapchain, D3D12: GDI-based readback, OpenGL: pixel buffer readback)
+- **View Composition** - Blits stereo views to a desktop window (D3D11: DXGI swapchain, D3D12: GPU downscale to window size then readback, OpenGL: pixel buffer readback)
 - **Input Simulation** - Converts mouse/keyboard input to head pose and controller data
 
 ### Supported Features
