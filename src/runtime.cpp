@@ -3088,7 +3088,12 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
         }
     }
     if (previewWindowFocused) {
-        const float moveSpeed = 3.0f;  // meters per second
+        // Shift is the sprint modifier; both it and the base speed are set from
+        // Tools > Movement Speed. GetAsyncKeyState rather than the WM_KEYDOWN
+        // path because this reads a held state, and the host window may be the
+        // one with focus (see above).
+        const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        const float moveSpeed = ui::GetMoveSpeed(shiftHeld);  // meters per second
         float deltaTime = (float)periodSec;
 
         XrQuaternionf headQ = rt::QuatFromYawPitch(rt::g_headYaw, rt::g_headPitch);

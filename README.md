@@ -51,7 +51,8 @@ Once registered, any OpenXR application will automatically use the simulator:
    - **Mouse**: Look around (hold right-click)
    - **WASD**: Move forward/backward/strafe
    - **Q/E**: Move up/down
-   - **Shift**: Move faster
+   - **Shift**: Hold to move faster
+   - **, / .**: Slower/faster movement
    - **ESC**: Release mouse capture
 
 ### Uninstallation
@@ -131,6 +132,12 @@ IPD. The values are measured ones from the
 appending a row to `ui::kHeadsetSpecs` in
 [ui_enhancements.h](src/ui_enhancements.h); the enum, menu and settings keys
 follow from the table.
+
+### Movement Speed
+
+WASD/QE move the head at 3 m/s by default, and holding **Shift** multiplies that
+by 4. Both numbers are set from **Tools → Movement Speed**: presets from 0.5 to
+10 m/s, `,` and `.` to step off them, and a submenu for the Shift multiplier.
 
 ### Mirror Rate
 

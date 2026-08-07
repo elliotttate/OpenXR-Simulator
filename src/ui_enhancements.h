@@ -7,6 +7,7 @@
 #include <string>
 #include <functional>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -68,6 +69,15 @@ enum MenuCommand {
     // One id per kHeadsetSpecs entry, in table order.
     ID_PROFILE_FIRST = 1600,
     ID_PROFILE_LAST = 1663,
+
+    // Movement speed. The two blocks hold one id per kMoveSpeedPresets /
+    // kMoveBoostPresets entry, in table order.
+    ID_MOVE_SLOWER = 1701,
+    ID_MOVE_FASTER = 1702,
+    ID_MOVE_SPEED_FIRST = 1710,
+    ID_MOVE_SPEED_LAST = 1725,
+    ID_MOVE_BOOST_FIRST = 1730,
+    ID_MOVE_BOOST_LAST = 1745,
 
     // One id per kPreviewRatePresets entry, in table order.
     ID_PREVIEW_RATE_FIRST = 1750,
@@ -131,6 +141,11 @@ struct UIState {
 
     // Render options
     bool showFullRender = false;  // If true, show full swapchain instead of imageRect crop
+
+    // Head movement (WASD/QE) in meters per second, and what holding Shift
+    // multiplies it by.
+    float moveSpeed = 3.0f;
+    float moveBoost = 4.0f;
 
     // How often the mirror window is allowed to update, in Hz. Mirroring is not free -
     // it composites the eyes, reads them back and repaints the window - and none of that
@@ -278,6 +293,65 @@ inline bool IsIpdSettingsCommand(int cmd) {
 }
 
 // ---------------------------------------------------------------------------
+// Head movement speed
+// ---------------------------------------------------------------------------
+
+struct MoveSpeedPreset { float mps;    const wchar_t* label; };
+struct MoveBoostPreset { float factor; const wchar_t* label; };
+
+inline constexpr MoveSpeedPreset kMoveSpeedPresets[] = {
+    {  0.5f, L"0.&5 m/s (Inspect)" },
+    {  1.0f, L"&1 m/s (Walk)" },
+    {  3.0f, L"&3 m/s (Default)" },
+    {  5.0f, L"&5 m/s (Brisk)" },
+    { 10.0f, L"1&0 m/s (Room-scale sweep)" },
+};
+
+inline constexpr MoveBoostPreset kMoveBoostPresets[] = {
+    {  2.0f, L"&2\x00D7" },
+    {  4.0f, L"&4\x00D7" },
+    { 10.0f, L"1&0\x00D7" },
+};
+
+inline constexpr int kMoveSpeedPresetCount =
+    (int)(sizeof(kMoveSpeedPresets) / sizeof(kMoveSpeedPresets[0]));
+inline constexpr int kMoveBoostPresetCount =
+    (int)(sizeof(kMoveBoostPresets) / sizeof(kMoveBoostPresets[0]));
+
+static_assert(kMoveSpeedPresetCount <= ID_MOVE_SPEED_LAST - ID_MOVE_SPEED_FIRST + 1,
+              "kMoveSpeedPresets outgrew the reserved menu id block");
+static_assert(kMoveBoostPresetCount <= ID_MOVE_BOOST_LAST - ID_MOVE_BOOST_FIRST + 1,
+              "kMoveBoostPresets outgrew the reserved menu id block");
+
+// Wide enough to cover a slow crawl around a controller model and a dash across
+// a large play space, without letting a stuck key throw the head to infinity.
+constexpr float kMinMoveSpeed = 0.05f;
+constexpr float kMaxMoveSpeed = 50.0f;
+
+inline void SetMoveSpeed(float mps) {
+    g_uiState.moveSpeed = (std::max)(kMinMoveSpeed, (std::min)(kMaxMoveSpeed, mps));
+}
+
+// The , and . keys scale rather than add, so a notch feels the same at 0.5 m/s
+// as it does at 10.
+inline void ScaleMoveSpeed(float factor) {
+    SetMoveSpeed(g_uiState.moveSpeed * factor);
+}
+
+// Meters per second for this frame. `boosted` is the Shift key.
+inline float GetMoveSpeed(bool boosted) {
+    return boosted ? g_uiState.moveSpeed * g_uiState.moveBoost : g_uiState.moveSpeed;
+}
+
+inline bool IsMoveSpeedCommand(int cmd) {
+    return cmd >= ID_MOVE_SPEED_FIRST && cmd < ID_MOVE_SPEED_FIRST + kMoveSpeedPresetCount;
+}
+
+inline bool IsMoveBoostCommand(int cmd) {
+    return cmd >= ID_MOVE_BOOST_FIRST && cmd < ID_MOVE_BOOST_FIRST + kMoveBoostPresetCount;
+}
+
+// ---------------------------------------------------------------------------
 // Mirror rate
 // ---------------------------------------------------------------------------
 
@@ -420,6 +494,8 @@ inline std::string SerializeSettings() {
         "  \"window_height\": %d,\n"
         "  \"full_render\": %s,\n"
         "  \"show_stats\": %s,\n"
+        "  \"move_speed\": %.2f,\n"
+        "  \"move_boost\": %.2f,\n"
         "  \"preview_fps\": %d\n"
         "}\n",
         ViewModeName(g_uiState.viewMode),
@@ -434,6 +510,8 @@ inline std::string SerializeSettings() {
         g_uiState.windowHeight,
         g_uiState.showFullRender ? "true" : "false",
         g_uiState.showStats ? "true" : "false",
+        g_uiState.moveSpeed,
+        g_uiState.moveBoost,
         g_uiState.previewFps);
     return buf;
 }
@@ -483,6 +561,10 @@ inline void ApplySettingsJson(const char* text) {
     g_uiState.windowHeight = (std::max)(0, o.number("window_height", g_uiState.windowHeight));
     g_uiState.showFullRender = o.boolean("full_render", g_uiState.showFullRender);
     g_uiState.showStats = o.boolean("show_stats", g_uiState.showStats);
+
+    SetMoveSpeed(o.number("move_speed", g_uiState.moveSpeed));
+    g_uiState.moveBoost = (std::max)(1.0f, (std::min)(50.0f,
+        o.number("move_boost", g_uiState.moveBoost)));
 
     g_uiState.previewFps = (std::max)(0, (std::min)(kPreviewRateEveryFrame,
         (int)o.number("preview_fps", g_uiState.previewFps)));
@@ -607,6 +689,23 @@ inline HMENU CreateAppMenu() {
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_TOGGLE_STATS, L"Show &Statistics\tF3");
     AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
 
+    HMENU moveMenu = CreatePopupMenu();
+    AppendMenuW(moveMenu, MF_STRING, ID_MOVE_SLOWER, L"Slo&wer\t,");
+    AppendMenuW(moveMenu, MF_STRING, ID_MOVE_FASTER, L"&Faster\t.");
+    AppendMenuW(moveMenu, MF_SEPARATOR, 0, nullptr);
+    for (int i = 0; i < kMoveSpeedPresetCount; ++i) {
+        AppendMenuW(moveMenu, MF_STRING, ID_MOVE_SPEED_FIRST + i, kMoveSpeedPresets[i].label);
+    }
+    AppendMenuW(moveMenu, MF_SEPARATOR, 0, nullptr);
+
+    HMENU boostMenu = CreatePopupMenu();
+    for (int i = 0; i < kMoveBoostPresetCount; ++i) {
+        AppendMenuW(boostMenu, MF_STRING, ID_MOVE_BOOST_FIRST + i, kMoveBoostPresets[i].label);
+    }
+    AppendMenuW(moveMenu, MF_POPUP, (UINT_PTR)boostMenu, L"S&hift Multiplier");
+
+    AppendMenuW(toolsMenu, MF_POPUP, (UINT_PTR)moveMenu, L"&Movement Speed");
+
     HMENU rateMenu = CreatePopupMenu();
     for (int i = 0; i < kPreviewRatePresetCount; ++i) {
         AppendMenuW(rateMenu, MF_STRING, ID_PREVIEW_RATE_FIRST + i, kPreviewRatePresets[i].label);
@@ -682,6 +781,19 @@ inline void UpdateMenuState(HMENU menu) {
     // Full render toggle
     CheckMenuItem(menu, ID_VIEW_FULL_RENDER,
         g_uiState.showFullRender ? MF_CHECKED : MF_UNCHECKED);
+
+    // Movement speed checks. Nothing is checked once , or . has walked the
+    // speed off a preset, which is the honest answer.
+    for (int i = 0; i < kMoveSpeedPresetCount; ++i) {
+        CheckMenuItem(menu, ID_MOVE_SPEED_FIRST + i,
+            fabsf(g_uiState.moveSpeed - kMoveSpeedPresets[i].mps) < 0.005f
+                ? MF_CHECKED : MF_UNCHECKED);
+    }
+    for (int i = 0; i < kMoveBoostPresetCount; ++i) {
+        CheckMenuItem(menu, ID_MOVE_BOOST_FIRST + i,
+            fabsf(g_uiState.moveBoost - kMoveBoostPresets[i].factor) < 0.005f
+                ? MF_CHECKED : MF_UNCHECKED);
+    }
 }
 
 // Show controls help dialog
@@ -695,7 +807,10 @@ inline void ShowControlsDialog(HWND parent) {
         L"Movement (WASD):\n"
         L"  W/S - Forward/Backward\n"
         L"  A/D - Strafe Left/Right\n"
-        L"  Q/E - Up/Down\n\n"
+        L"  Q/E - Up/Down\n"
+        L"  Shift - Hold to move faster\n"
+        L"  , / . - Slower/Faster\n"
+        L"  Tools \x2192 Movement Speed - Presets and Shift multiplier\n\n"
         L"View Controls:\n"
         L"  B - Both eyes\n"
         L"  L - Left eye only\n"
@@ -1033,7 +1148,24 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
             ShowAboutDialog(hwnd);
             return true;
 
+        // Movement speed
+        case ID_MOVE_SLOWER:
+            ScaleMoveSpeed(1.0f / 1.25f);
+            break;
+
+        case ID_MOVE_FASTER:
+            ScaleMoveSpeed(1.25f);
+            break;
+
         default:
+            if (IsMoveSpeedCommand(cmd)) {
+                SetMoveSpeed(kMoveSpeedPresets[cmd - ID_MOVE_SPEED_FIRST].mps);
+                break;
+            }
+            if (IsMoveBoostCommand(cmd)) {
+                g_uiState.moveBoost = kMoveBoostPresets[cmd - ID_MOVE_BOOST_FIRST].factor;
+                break;
+            }
             if (IsPreviewRateCommand(cmd)) {
                 g_uiState.previewFps = kPreviewRatePresets[cmd - ID_PREVIEW_RATE_FIRST].fps;
                 break;
@@ -1107,6 +1239,10 @@ inline bool HandleKeyboardShortcut(HWND hwnd, WPARAM vk,
             return HandleMenuCommand(hwnd, ID_IPD_DECREASE, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_OEM_6:
             return HandleMenuCommand(hwnd, ID_IPD_INCREASE, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
+        case VK_OEM_COMMA:
+            return HandleMenuCommand(hwnd, ID_MOVE_SLOWER, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
+        case VK_OEM_PERIOD:
+            return HandleMenuCommand(hwnd, ID_MOVE_FASTER, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_F1:
             ShowControlsDialog(hwnd);
             return true;
@@ -1198,8 +1334,9 @@ inline void UpdateWindowTitle(HWND hwnd, int fps = 0, int frameCount = 0,
     wchar_t statsSuffix[256] = L"";
     if (g_uiState.showStats && stats) {
         swprintf_s(statsSuffix,
-            L"  |  Src %dx%d  Win %dx%d  Head (%.2f,%.2f,%.2f) Yaw %.0f° Pitch %.0f°",
+            L"  |  Src %dx%d  Win %dx%d  Spd %.2g m/s  Head (%.2f,%.2f,%.2f) Yaw %.0f° Pitch %.0f°",
             stats->sourceW, stats->sourceH, stats->clientW, stats->clientH,
+            g_uiState.moveSpeed,
             stats->headX, stats->headY, stats->headZ,
             stats->yawDeg, stats->pitchDeg);
     }
