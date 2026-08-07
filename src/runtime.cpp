@@ -367,7 +367,12 @@ struct Session {
     ComPtr<ID3D11RasterizerState> noCullRS;  // Rasterizer state with culling disabled
     ComPtr<ID3D11BlendState> anaglyphRedBS;
     ComPtr<ID3D11BlendState> anaglyphCyanBS;
-    ComPtr<ID3D11BlendState> alphaBlendBS;
+    // Quad layers are positioned by their four projected corners rather than by the
+    // viewport, so they need their own VS and a constant buffer to carry the corners.
+    ComPtr<ID3D11VertexShader> quadVS;
+    ComPtr<ID3D11Buffer> quadCB;
+    // Keyed by (mode << 8) | writeMask; see GetLayerBlendState.
+    std::unordered_map<uint32_t, ComPtr<ID3D11BlendState>> layerBlendStates;
 
     // Desktop preview window (no thread - handled on main thread)
     HWND hwnd{nullptr};
@@ -673,10 +678,101 @@ static XrFovf GetViewFov(uint32_t eye) {
     return GetUiFov(eye);
 }
 
+// --- Composition layer blending -------------------------------------------------------------------
+// OpenXR 1.0, XrCompositionLayerFlagBits: the layer's alpha channel is only live when
+// BLEND_TEXTURE_SOURCE_ALPHA is set, and is premultiplied into the colour channels unless
+// UNPREMULTIPLIED_ALPHA says otherwise. CORRECT_CHROMATIC_ABERRATION is a legitimate no-op
+// here - the preview draws no distortion mesh to correct.
+enum class LayerBlend { Opaque, Premultiplied, Unpremultiplied };
+
+static inline LayerBlend BlendForLayerFlags(XrCompositionLayerFlags flags) {
+    if (!(flags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT)) return LayerBlend::Opaque;
+    return (flags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) ? LayerBlend::Unpremultiplied
+                                                                    : LayerBlend::Premultiplied;
+}
+
+// The preview swapchain is created UNORM because FLIP_DISCARD rejects _SRGB, so every render
+// target view over it has to opt back into the gamma encode by hand. Without this the GPU
+// blends linear values into a buffer the display reads as sRGB and the layer comes out dark.
+static inline DXGI_FORMAT SrgbRtvFormat(DXGI_FORMAT backbufferFormat) {
+    if (backbufferFormat == DXGI_FORMAT_R8G8B8A8_UNORM) return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if (backbufferFormat == DXGI_FORMAT_B8G8R8A8_UNORM) return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    return backbufferFormat;
+}
+
+static bool CreatePreviewRtv(Session& s, ID3D11Texture2D* backbuffer,
+                             ComPtr<ID3D11RenderTargetView>& out) {
+    D3D11_RENDER_TARGET_VIEW_DESC desc = {};
+    desc.Format = SrgbRtvFormat(s.previewFormat);
+    desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    desc.Texture2D.MipSlice = 0;
+    if (SUCCEEDED(s.d3d11Device->CreateRenderTargetView(backbuffer, &desc, out.ReleaseAndGetAddressOf()))) {
+        return true;
+    }
+    Log("[SimXR] Explicit sRGB RTV failed, falling back to auto format");
+    return SUCCEEDED(s.d3d11Device->CreateRenderTargetView(backbuffer, nullptr, out.ReleaseAndGetAddressOf()));
+}
+
+// --- Quad layer geometry --------------------------------------------------------------------------
+// LOCAL and STAGE are the same world here, VIEW is head-locked, and an unknown handle falls
+// back to LOCAL the way xrLocateSpace does.
+static XrPosef QuadWorldPose(const XrCompositionLayerQuad& quad, float yaw, float pitch, float roll,
+                             bool* outHeadLocked = nullptr) {
+    XrPosef spaceOrigin{};
+    spaceOrigin.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
+    spaceOrigin.position = { 0.0f, 0.0f, 0.0f };
+    bool headLocked = false;
+    auto spaceIt = g_referenceSpaces.find(quad.space);
+    if (spaceIt != g_referenceSpaces.end()) {
+        headLocked = (spaceIt->second.type == XR_REFERENCE_SPACE_TYPE_VIEW);
+        spaceOrigin = spaceIt->second.poseInRef;
+    }
+    if (headLocked) {
+        XrPosef head{};
+        head.orientation = QuatFromYawPitchRoll(yaw, pitch, roll);
+        head.position = g_headPos;
+        spaceOrigin = ComposePose(head, spaceOrigin);
+    }
+    if (outHeadLocked) *outHeadLocked = headLocked;
+    return ComposePose(spaceOrigin, quad.pose);
+}
+
+// Corners come back in fan order: top-left, top-right, bottom-right, bottom-left. A triangle
+// strip wants TL, TR, BL, BR instead, so it has to walk these as {0, 1, 3, 2}.
+static void QuadWorldCorners(const XrCompositionLayerQuad& quad, float yaw, float pitch, float roll,
+                             XrVector3f outCorners[4], bool* outHeadLocked) {
+    const XrPosef quadWorld = QuadWorldPose(quad, yaw, pitch, roll, outHeadLocked);
+
+    const float halfW = quad.size.width * 0.5f;
+    const float halfH = quad.size.height * 0.5f;
+    const XrVector3f localCorners[4] = {
+        { -halfW,  halfH, 0.0f }, {  halfW,  halfH, 0.0f },
+        {  halfW, -halfH, 0.0f }, { -halfW, -halfH, 0.0f },
+    };
+    for (int i = 0; i < 4; ++i) {
+        const XrVector3f r = RotateVectorByQuaternion(quadWorld.orientation, localCorners[i]);
+        outCorners[i] = { quadWorld.position.x + r.x, quadWorld.position.y + r.y, quadWorld.position.z + r.z };
+    }
+}
+
+// View space matches xrLocateViews: -Z forward, so a visible point has z < 0.
+static inline XrVector3f WorldToView(const XrVector3f& world, const XrPosef& view) {
+    const XrVector3f d{ world.x - view.position.x, world.y - view.position.y, world.z - view.position.z };
+    const XrQuaternionf toView{ -view.orientation.x, -view.orientation.y,
+                                -view.orientation.z,  view.orientation.w };
+    return RotateVectorByQuaternion(toView, d);
+}
+
+static inline bool QuadVisibleInEye(XrEyeVisibility visibility, uint32_t eye) {
+    if (visibility == XR_EYE_VISIBILITY_LEFT)  return eye == 0;
+    if (visibility == XR_EYE_VISIBILITY_RIGHT) return eye == 1;
+    return true;
+}
+
 // Initialize shader resources for blitting
 bool InitBlitResources(Session& s) {
-    if (s.blitVS && s.blitPS && s.samplerState && s.noCullRS &&
-        s.anaglyphRedBS && s.anaglyphCyanBS && s.alphaBlendBS) {
+    if (s.blitVS && s.blitPS && s.quadVS && s.quadCB && s.samplerState && s.noCullRS &&
+        s.anaglyphRedBS && s.anaglyphCyanBS) {
         return true;
     }
 
@@ -704,6 +800,20 @@ bool InitBlitResources(Session& s) {
             // Normalized UVs (0-1 range, not 0-2)
             output.Tex = xy * 0.5;
 
+            return output;
+        }
+
+        // Corners arrive in clip space rather than NDC so that w survives to the rasterizer:
+        // that is what keeps texture interpolation perspective-correct on an angled quad, and
+        // what lets the GPU clip a quad straddling the near plane instead of dropping it.
+        cbuffer QuadCB : register(b0) {
+            float4 gCorners[4];
+        };
+
+        VS_OUTPUT QuadVSMain(uint vertexId : SV_VertexID) {
+            VS_OUTPUT output;
+            output.Pos = gCorners[vertexId];
+            output.Tex = float2(vertexId & 1, (vertexId >> 1) & 1);
             return output;
         }
 
@@ -735,9 +845,30 @@ bool InitBlitResources(Session& s) {
         Logf("[SimXR] Failed to compile PS: %s", errorBlob ? (char*)errorBlob->GetBufferPointer() : "Unknown error");
         return false;
     }
-    hr = s.d3d11Device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), 
+    hr = s.d3d11Device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(),
                                           nullptr, s.blitPS.GetAddressOf());
     if (FAILED(hr)) { Logf("[SimXR] Failed to create PS: 0x%08X", hr); return false; }
+
+    // Compile the quad VS. It shares the source (and so the PS) with the blit path but is a
+    // separate shader because it reads a constant buffer, and the blit call sites bind none.
+    ComPtr<ID3DBlob> quadVsBlob;
+    hr = D3DCompile(shaderSource, strlen(shaderSource), "BlitShader", nullptr, nullptr,
+                    "QuadVSMain", "vs_5_0", compileFlags, 0, quadVsBlob.GetAddressOf(), errorBlob.ReleaseAndGetAddressOf());
+    if (FAILED(hr)) {
+        Logf("[SimXR] Failed to compile quad VS: %s", errorBlob ? (char*)errorBlob->GetBufferPointer() : "Unknown error");
+        return false;
+    }
+    hr = s.d3d11Device->CreateVertexShader(quadVsBlob->GetBufferPointer(), quadVsBlob->GetBufferSize(),
+                                           nullptr, s.quadVS.GetAddressOf());
+    if (FAILED(hr)) { Logf("[SimXR] Failed to create quad VS: 0x%08X", hr); return false; }
+
+    D3D11_BUFFER_DESC cbDesc{};
+    cbDesc.ByteWidth = sizeof(float) * 4 * 4;   // float4 gCorners[4]
+    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = s.d3d11Device->CreateBuffer(&cbDesc, nullptr, s.quadCB.GetAddressOf());
+    if (FAILED(hr)) { Logf("[SimXR] Failed to create quad constant buffer: 0x%08X", hr); return false; }
 
     // Create Sampler State
     D3D11_SAMPLER_DESC sampDesc = {};
@@ -777,23 +908,47 @@ bool InitBlitResources(Session& s) {
     hr = s.d3d11Device->CreateBlendState(&blendDesc, s.anaglyphCyanBS.GetAddressOf());
     if (FAILED(hr)) { Logf("[SimXR] Failed to create anaglyph cyan blend state: 0x%08X", hr); return false; }
 
-    // Create alpha blend state for quad layer overlay
-    D3D11_BLEND_DESC alphaBlendDesc{};
-    alphaBlendDesc.AlphaToCoverageEnable = FALSE;
-    alphaBlendDesc.IndependentBlendEnable = FALSE;
-    alphaBlendDesc.RenderTarget[0].BlendEnable = TRUE;
-    alphaBlendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
-    alphaBlendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-    alphaBlendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-    alphaBlendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    alphaBlendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-    alphaBlendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-    alphaBlendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    hr = s.d3d11Device->CreateBlendState(&alphaBlendDesc, s.alphaBlendBS.GetAddressOf());
-    if (FAILED(hr)) { Logf("[SimXR] Failed to create alpha blend state: 0x%08X", hr); return false; }
-
     Log("[SimXR] Blit resources initialized successfully.");
     return true;
+}
+
+// Three spec blend modes times three anaglyph channel masks is more combinations than are
+// worth naming, and an app only ever reaches a couple, so they are built on demand and cached.
+static ID3D11BlendState* GetLayerBlendState(Session& s, LayerBlend mode, UINT8 writeMask) {
+    const uint32_t key = ((uint32_t)mode << 8) | writeMask;
+    auto it = s.layerBlendStates.find(key);
+    if (it != s.layerBlendStates.end()) return it->second.Get();
+
+    D3D11_BLEND_DESC desc{};
+    desc.AlphaToCoverageEnable = FALSE;
+    desc.IndependentBlendEnable = FALSE;
+    auto& target = desc.RenderTarget[0];
+    target.BlendOp = D3D11_BLEND_OP_ADD;
+    target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    target.RenderTargetWriteMask = writeMask;
+    if (mode == LayerBlend::Opaque) {
+        // Source alpha is ignored rather than written: dropping it from the write mask leaves
+        // the destination at the 1.0 the black clear put there, which is what an OPAQUE
+        // environment blend mode expects of the composited result.
+        target.BlendEnable = FALSE;
+        target.RenderTargetWriteMask &= (UINT8)(D3D11_COLOR_WRITE_ENABLE_RED |
+                                                D3D11_COLOR_WRITE_ENABLE_GREEN |
+                                                D3D11_COLOR_WRITE_ENABLE_BLUE);
+    } else {
+        target.BlendEnable = TRUE;
+        // Premultiplied content already carries the src.rgb * src.a term.
+        target.SrcBlend = (mode == LayerBlend::Unpremultiplied) ? D3D11_BLEND_SRC_ALPHA : D3D11_BLEND_ONE;
+        target.DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        target.SrcBlendAlpha = D3D11_BLEND_ONE;
+        target.DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    }
+
+    ComPtr<ID3D11BlendState> state;
+    if (FAILED(s.d3d11Device->CreateBlendState(&desc, state.GetAddressOf()))) {
+        Logf("[SimXR] Failed to create layer blend state (mode=%d, mask=0x%02X)", (int)mode, writeMask);
+        return nullptr;
+    }
+    return s.layerBlendStates.emplace(key, state).first->second.Get();
 }
 
 // Compute the natural canvas size for the current stereo layout, expressed in
@@ -2530,6 +2685,7 @@ struct D3D11StateBackup {
         ctx_->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, ps_srvs);
         vs_num_class_instances = 256;  // Initialize to array capacity
         ctx_->VSGetShader(&vs_shader, vs_class_instances, &vs_num_class_instances);
+        ctx_->VSGetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, vs_cbuffers);
     }
 
     ~D3D11StateBackup() {
@@ -2546,6 +2702,7 @@ struct D3D11StateBackup {
         ctx_->PSSetSamplers(0, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT, ps_samplers);
         ctx_->PSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, ps_srvs);
         ctx_->VSSetShader(vs_shader, vs_class_instances, vs_num_class_instances);
+        ctx_->VSSetConstantBuffers(0, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT, vs_cbuffers);
 
         // Release COM references
         if (ia_input_layout) ia_input_layout->Release();
@@ -2560,6 +2717,7 @@ struct D3D11StateBackup {
         for (UINT i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++i) if (ps_srvs[i]) ps_srvs[i]->Release();
         if (vs_shader) vs_shader->Release();
         for (UINT i = 0; i < vs_num_class_instances; ++i) if (vs_class_instances[i]) vs_class_instances[i]->Release();
+        for (UINT i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++i) if (vs_cbuffers[i]) vs_cbuffers[i]->Release();
     }
 
 private:
@@ -2586,10 +2744,12 @@ private:
     UINT ps_num_class_instances = 0;
     ID3D11SamplerState* ps_samplers[D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT] = { nullptr };
     ID3D11ShaderResourceView* ps_srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = { nullptr };
-    // VS State
+    // VS State. Constant buffers are here because the quad layer binds b0 on what is, for a
+    // D3D11 session, the app's own immediate context.
     ID3D11VertexShader* vs_shader = nullptr;
     ID3D11ClassInstance* vs_class_instances[256] = { nullptr };
     UINT vs_num_class_instances = 0;
+    ID3D11Buffer* vs_cbuffers[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = { nullptr };
 };
 
 namespace rt {
@@ -4241,11 +4401,13 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 // Force shader recompilation by resetting blit resources
                 s.blitVS.Reset();
                 s.blitPS.Reset();
+                s.quadVS.Reset();
+                s.quadCB.Reset();
                 s.samplerState.Reset();
                 s.noCullRS.Reset();
                 s.anaglyphRedBS.Reset();
                 s.anaglyphCyanBS.Reset();
-                s.alphaBlendBS.Reset();
+                s.layerBlendStates.clear();
                 Log("[SimXR] Reset blit resources for fresh shader compilation");
             }
 
@@ -4537,25 +4699,11 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 return;
             }
 
-            // Create explicit sRGB RTV for proper gamma encoding
-            DXGI_FORMAT bbFmt = s.previewFormat;
-            DXGI_FORMAT rtvFmt = bbFmt;
-            if (bbFmt == DXGI_FORMAT_R8G8B8A8_UNORM)       rtvFmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-            else if (bbFmt == DXGI_FORMAT_B8G8R8A8_UNORM)  rtvFmt = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-
-            D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
-            rtvDesc.Format = rtvFmt;
-            rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-            rtvDesc.Texture2D.MipSlice = 0;
-
+            // Explicit sRGB RTV for proper gamma encoding
             ComPtr<ID3D11RenderTargetView> rtv;
-            HRESULT hr = s.d3d11Device->CreateRenderTargetView(bb.Get(), &rtvDesc, rtv.GetAddressOf());
-            if (FAILED(hr)) {
-                Logf("[SimXR] Explicit sRGB RTV failed (0x%08X), falling back to auto format", hr);
-                if (FAILED(s.d3d11Device->CreateRenderTargetView(bb.Get(), nullptr, rtv.GetAddressOf()))) {
-                    Log("[SimXR] Failed to create RTV for preview.");
-                    return;
-                }
+            if (!rt::CreatePreviewRtv(s, bb.Get(), rtv)) {
+                Log("[SimXR] Failed to create RTV for preview.");
+                return;
             }
 
             // Bind RTV and clear the full backbuffer (= client area) to black
@@ -4760,39 +4908,12 @@ static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
         eyes[eyeCount++] = { 1u, (int)fit.x + w, (int)fit.y, w, (int)fit.h };
     }
 
-    // LOCAL and STAGE are the same world here, and an unknown handle falls back to it
-    // the way xrLocateSpace does.
     float yaw, pitch, roll;
     rt::GetEffectiveHeadAngles(yaw, pitch, roll);
 
-    XrPosef spaceOrigin{};
-    spaceOrigin.orientation = { 0.0f, 0.0f, 0.0f, 1.0f };
-    spaceOrigin.position = { 0.0f, 0.0f, 0.0f };
     bool headLocked = false;
-    auto spaceIt = rt::g_referenceSpaces.find(quad->space);
-    if (spaceIt != rt::g_referenceSpaces.end()) {
-        headLocked = (spaceIt->second.type == XR_REFERENCE_SPACE_TYPE_VIEW);
-        spaceOrigin = spaceIt->second.poseInRef;
-    }
-    if (headLocked) {
-        XrPosef head{};
-        head.orientation = rt::QuatFromYawPitchRoll(yaw, pitch, roll);
-        head.position = rt::g_headPos;
-        spaceOrigin = rt::ComposePose(head, spaceOrigin);
-    }
-    const XrPosef quadWorld = rt::ComposePose(spaceOrigin, quad->pose);
-
-    const float halfW = quad->size.width * 0.5f;
-    const float halfH = quad->size.height * 0.5f;
-    const XrVector3f localCorners[4] = {
-        { -halfW,  halfH, 0.0f }, {  halfW,  halfH, 0.0f },
-        {  halfW, -halfH, 0.0f }, { -halfW, -halfH, 0.0f },
-    };
     XrVector3f worldCorners[4];
-    for (int i = 0; i < 4; ++i) {
-        const XrVector3f r = rt::RotateVectorByQuaternion(quadWorld.orientation, localCorners[i]);
-        worldCorners[i] = { quadWorld.position.x + r.x, quadWorld.position.y + r.y, quadWorld.position.z + r.z };
-    }
+    rt::QuadWorldCorners(*quad, yaw, pitch, roll, worldCorners, &headLocked);
 
     // RGBA top-down DIB; BI_BITFIELDS so GDI reads R,G,B byte order (matches the eye-path masks).
     struct { BITMAPINFOHEADER hdr; DWORD masks[3]; } bmi = {};
@@ -4813,12 +4934,9 @@ static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
         const EyeRect& er = eyes[e];
         if (er.w < 2 || er.h < 2) continue;
 
-        if ((quad->eyeVisibility == XR_EYE_VISIBILITY_LEFT  && er.eye != 0) ||
-            (quad->eyeVisibility == XR_EYE_VISIBILITY_RIGHT && er.eye != 1)) continue;
+        if (!rt::QuadVisibleInEye(quad->eyeVisibility, er.eye)) continue;
 
         const XrPosef view = rt::ViewPoseFromAngles(er.eye, yaw, pitch, roll);
-        const XrQuaternionf toView{ -view.orientation.x, -view.orientation.y,
-                                    -view.orientation.z,  view.orientation.w };
         const XrFovf fov = rt::GetViewFov(er.eye);
         const float tanL = tanf(fov.angleLeft),  tanR = tanf(fov.angleRight);
         const float tanU = tanf(fov.angleUp),    tanD = tanf(fov.angleDown);
@@ -4829,10 +4947,7 @@ static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
         float minX = 0, minY = 0, maxX = 0, maxY = 0;
         bool inFront = true;
         for (int i = 0; i < 4; ++i) {
-            const XrVector3f d{ worldCorners[i].x - view.position.x,
-                                worldCorners[i].y - view.position.y,
-                                worldCorners[i].z - view.position.z };
-            const XrVector3f v = rt::RotateVectorByQuaternion(toView, d);
+            const XrVector3f v = rt::WorldToView(worldCorners[i], view);
             if (v.z > -0.01f) { inFront = false; break; }   // crosses the near plane; no sane rect for it
             const float u = (v.x / -v.z - tanL) / (tanR - tanL);
             const float w = (tanU - v.y / -v.z) / (tanU - tanD);
@@ -4865,11 +4980,10 @@ static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
     static int s_qlog = 0;
     if (g_logVerbose && ++s_qlog % 120 == 1) {
         Logf("[SimXR] D3D12 quad composited: tex=%ux%u space=%s pose=(%.2f,%.2f,%.2f) size=(%.2f,%.2f) "
-             "world=(%.2f,%.2f,%.2f) dst=(%d,%d,%d,%d)%s",
+             "dst=(%d,%d,%d,%d)%s",
              qw, qh, headLocked ? "VIEW" : "WORLD",
              quad->pose.position.x, quad->pose.position.y, quad->pose.position.z,
              quad->size.width, quad->size.height,
-             quadWorld.position.x, quadWorld.position.y, quadWorld.position.z,
              dbgX, dbgY, dbgW, dbgH, painted ? "" : " (off-view)");
     }
 }
@@ -5120,13 +5234,16 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         // Restore GL context
         if (savedRC) wglMakeCurrent(savedDC, savedRC);
 
-        // Create D3D11 texture from pixel data
+        // Create D3D11 texture from pixel data. A GL_SRGB8_ALPHA8 quad holds sRGB-encoded
+        // bytes, so it needs the _SRGB view to decode to linear before the blend - otherwise
+        // it is blended as if it were linear and comes out wrong against the eyes.
         D3D11_TEXTURE2D_DESC texDesc = {};
         texDesc.Width = texWidth;
         texDesc.Height = texHeight;
         texDesc.MipLevels = 1;
         texDesc.ArraySize = 1;
-        texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texDesc.Format = (chain.glInternalFormat == GL_SRGB8_ALPHA8) ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                                                                     : DXGI_FORMAT_R8G8B8A8_UNORM;
         texDesc.SampleDesc.Count = 1;
         texDesc.Usage = D3D11_USAGE_DEFAULT;
         texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -5190,39 +5307,81 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
                 break; // Already typed or unknown
         }
 
-        // Create temp texture for the quad content with typed format
+        const uint32_t arraySize = chain.arraySize ? chain.arraySize : 1;
+        const uint32_t arraySlice = quad->subImage.imageArrayIndex;
+        if (arraySlice >= arraySize) {
+            if (shouldLog) {
+                Logf("[SimXR] quad: imageArrayIndex %u out of range (arraySize=%u)", arraySlice, arraySize);
+            }
+            return;
+        }
+
+        // Clamp the app's rect the way the eye path does, and size the temp texture to the
+        // rect rather than the whole image - the copy lands at (0,0), so a full-size temp
+        // would leave the sub-rect shrunk into the corner of the sampled UV range.
+        const rt::SubImageRect rect = rt::ResolveSubImageRect(quad->subImage.imageRect,
+                                                              srcDesc.Width, srcDesc.Height, "quad");
+
         D3D11_TEXTURE2D_DESC tempDesc = srcDesc;
+        tempDesc.Width = rect.w;
+        tempDesc.Height = rect.h;
         tempDesc.Format = typedFormat;  // Use typed format for the temp texture
         tempDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         tempDesc.MiscFlags = 0;
         tempDesc.SampleDesc.Count = 1;
+        tempDesc.SampleDesc.Quality = 0;
+        tempDesc.ArraySize = 1;   // one slice; a null-desc SRV over an array binds as Texture2DArray
+        tempDesc.MipLevels = 1;
 
         if (FAILED(s.d3d11Device->CreateTexture2D(&tempDesc, nullptr, quadTex.GetAddressOf()))) return;
 
-        // Copy the quad texture (handle array index if needed)
-        const auto& rect = quad->subImage.imageRect;
-        uint32_t arraySlice = quad->subImage.imageArrayIndex;
-        D3D11_BOX box = { (UINT)rect.offset.x, (UINT)rect.offset.y, 0,
-                          (UINT)(rect.offset.x + rect.extent.width), (UINT)(rect.offset.y + rect.extent.height), 1 };
-        uint32_t srcSubresource = D3D11CalcSubresource(0, arraySlice, 1);
-        s.d3d11Context->CopySubresourceRegion(quadTex.Get(), 0, 0, 0, 0, chain.images[texIdx].Get(), srcSubresource, &box);
+        const uint32_t srcSubresource = D3D11CalcSubresource(0, arraySlice, chain.mipCount ? chain.mipCount : 1);
+        ID3D11Texture2D* copySrc = chain.images[texIdx].Get();
+        uint32_t copySubresource = srcSubresource;
+
+        // CopySubresourceRegion cannot resolve MSAA, and ResolveSubresource cannot crop, so a
+        // multisampled quad needs a full-size resolve target in between.
+        ComPtr<ID3D11Texture2D> resolved;
+        if (srcDesc.SampleDesc.Count > 1) {
+            D3D11_TEXTURE2D_DESC resolveDesc = tempDesc;
+            resolveDesc.Width = srcDesc.Width;
+            resolveDesc.Height = srcDesc.Height;
+            if (FAILED(s.d3d11Device->CreateTexture2D(&resolveDesc, nullptr, resolved.GetAddressOf()))) return;
+            s.d3d11Context->ResolveSubresource(resolved.Get(), 0, copySrc, srcSubresource, typedFormat);
+            copySrc = resolved.Get();
+            copySubresource = 0;
+        }
+
+        D3D11_BOX box = { rect.x, rect.y, 0, rect.x + rect.w, rect.y + rect.h, 1 };
+        s.d3d11Context->CopySubresourceRegion(quadTex.Get(), 0, 0, 0, 0, copySrc, copySubresource, &box);
+
+        texWidth = rect.w;
+        texHeight = rect.h;
 
         if (shouldLog) {
-            Logf("[SimXR] Rendering quad layer (D3D11): size=%.2fx%.2f, texSize=%ux%u, typedFmt=%d, srcFmt=%d, arraySlice=%u",
-                 quad->size.width, quad->size.height, srcDesc.Width, srcDesc.Height, typedFormat, srcDesc.Format, arraySlice);
+            Logf("[SimXR] Rendering quad layer (D3D11): size=%.2fx%.2f, rect=%u,%u %ux%u, typedFmt=%d, srcFmt=%d, arraySlice=%u",
+                 quad->size.width, quad->size.height, rect.x, rect.y, rect.w, rect.h,
+                 typedFormat, srcDesc.Format, arraySlice);
         }
     } else {
         if (shouldLog) Log("[SimXR] renderQuadLayer: No valid images in swapchain");
         return;
     }
 
-    // Get backbuffer
+    // A quad-only frame never runs the projection path, so this is the only chance to compile.
+    if (!rt::InitBlitResources(s)) return;
+
+    // For a D3D11 session this is the app's own immediate context; leave it as we found it.
+    D3D11StateBackup stateBackup(s.d3d11Context.Get());
+
+    // The guard at the top of the function only proves one of the two preview targets exists,
+    // and the D3D12 one has already returned by here.
+    if (!s.previewSwapchain) return;
     ComPtr<ID3D11Texture2D> bb;
     if (FAILED(s.previewSwapchain->GetBuffer(0, IID_PPV_ARGS(bb.GetAddressOf())))) return;
 
-    // Create RTV
     ComPtr<ID3D11RenderTargetView> rtv;
-    if (FAILED(s.d3d11Device->CreateRenderTargetView(bb.Get(), nullptr, rtv.GetAddressOf()))) return;
+    if (!rt::CreatePreviewRtv(s, bb.Get(), rtv)) return;
 
     // Create SRV
     ComPtr<ID3D11ShaderResourceView> srv;
@@ -5231,10 +5390,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     // Calculate viewports matching the projection layer layout (letterboxed)
     const auto layout = ui::g_uiState.displayLayout;
     const auto viewMode = ui::g_uiState.viewMode;
-
-    bool showLeft = (viewMode == ui::ViewMode::BothEyes || viewMode == ui::ViewMode::LeftEyeOnly);
-    bool showRight = (viewMode == ui::ViewMode::BothEyes || viewMode == ui::ViewMode::RightEyeOnly);
-    bool singleEye = (viewMode != ui::ViewMode::BothEyes);
+    const bool singleEye = (viewMode != ui::ViewMode::BothEyes);
 
     // Use the per-eye source dims (cached by presentProjection) to mirror the
     // letterbox math used for the projection layer.
@@ -5261,25 +5417,37 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         }
     }
 
-    // Calculate quad display rect within a given viewport
-    float quadAspect = quad->size.width / quad->size.height;
-    auto calcQuadVp = [&](const D3D11_VIEWPORT& eyeVp) -> D3D11_VIEWPORT {
-        float vpW = eyeVp.Width;
-        float vpH = eyeVp.Height;
-        float displayW = vpW * 0.9f;
-        float displayH = displayW / quadAspect;
-        if (displayH > vpH * 0.9f) {
-            displayH = vpH * 0.9f;
-            displayW = displayH * quadAspect;
-        }
-        float displayX = eyeVp.TopLeftX + (vpW - displayW) / 2.0f;
-        float displayY = eyeVp.TopLeftY + (vpH - displayH) / 2.0f;
-        return { displayX, displayY, displayW, displayH, 0.0f, 1.0f };
-    };
+    // The quad is placed by its projected corners, not by the viewport, so each eye gets the
+    // whole eye rect and clip-space positioning does the rest. D3D11 clips to the frustum,
+    // which the viewport transform maps onto exactly this rect, so a quad that overhangs the
+    // eye cannot bleed into the other half.
+    struct EyeDraw { uint32_t eye; const D3D11_VIEWPORT* vp; };
+    EyeDraw eyes[2];
+    int eyeCount = 0;
+    if (viewMode == ui::ViewMode::RightEyeOnly) {
+        eyes[eyeCount++] = { 1u, &rightVp };
+    } else if (viewMode == ui::ViewMode::LeftEyeOnly) {
+        eyes[eyeCount++] = { 0u, &leftVp };
+    } else {
+        eyes[eyeCount++] = { 0u, &leftVp };
+        eyes[eyeCount++] = { 1u, &rightVp };
+    }
+
+    float yaw, pitch, roll;
+    rt::GetEffectiveHeadAngles(yaw, pitch, roll);
+
+    bool headLocked = false;
+    XrVector3f worldCorners[4];
+    rt::QuadWorldCorners(*quad, yaw, pitch, roll, worldCorners, &headLocked);
+
+    const rt::LayerBlend blendMode = rt::BlendForLayerFlags(quad->layerFlags);
 
     // Set up shared render state
-    s.d3d11Context->VSSetShader(s.blitVS.Get(), nullptr, 0);
+    s.d3d11Context->VSSetShader(s.quadVS.Get(), nullptr, 0);
     s.d3d11Context->PSSetShader(s.blitPS.Get(), nullptr, 0);
+
+    ID3D11Buffer* cbs[] = { s.quadCB.Get() };
+    s.d3d11Context->VSSetConstantBuffers(0, 1, cbs);
 
     ID3D11ShaderResourceView* srvs[] = { srv.Get() };
     s.d3d11Context->PSSetShaderResources(0, 1, srvs);
@@ -5289,26 +5457,68 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     s.d3d11Context->IASetInputLayout(nullptr);
     s.d3d11Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-    // Use alpha blending for transparent overlay
-    s.d3d11Context->OMSetBlendState(s.alphaBlendBS.Get(), nullptr, 0xFFFFFFFF);
     s.d3d11Context->OMSetDepthStencilState(nullptr, 0);
     s.d3d11Context->RSSetState(s.noCullRS.Get());
 
     ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
     s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
 
-    // Draw quad into left eye viewport
-    if (showLeft) {
-        D3D11_VIEWPORT quadVp = calcQuadVp(leftVp);
-        s.d3d11Context->RSSetViewports(1, &quadVp);
+    const bool anaglyph = (!singleEye && layout == ui::DisplayLayout::Anaglyph);
+
+    for (int e = 0; e < eyeCount; ++e) {
+        const uint32_t eye = eyes[e].eye;
+        if (!rt::QuadVisibleInEye(quad->eyeVisibility, eye)) continue;
+
+        const XrPosef view = rt::ViewPoseFromAngles(eye, yaw, pitch, roll);
+        const XrFovf fov = rt::GetViewFov(eye);
+        const float tanL = tanf(fov.angleLeft), tanR = tanf(fov.angleRight);
+        const float tanU = tanf(fov.angleUp),   tanD = tanf(fov.angleDown);
+        if (tanR - tanL < 1e-6f || tanU - tanD < 1e-6f) continue;
+
+        // Projection, written without dividing by view depth so that it stays finite for a
+        // corner at or behind the eye. Multiplying an NDC value back up by w would be NaN
+        // exactly there, and the near plane is the case the GPU clipper is here to handle.
+        const float ax = 2.0f / (tanR - tanL), bx = (tanR + tanL) / (tanR - tanL);
+        const float ay = 2.0f / (tanU - tanD), by = (tanU + tanD) / (tanU - tanD);
+
+        float clip[4][4];
+        static const int kStripOrder[4] = { 0, 1, 3, 2 };   // fan order -> TL, TR, BL, BR
+        for (int i = 0; i < 4; ++i) {
+            const XrVector3f v = rt::WorldToView(worldCorners[kStripOrder[i]], view);
+            const float w = -v.z;
+            clip[i][0] = ax * v.x + bx * v.z;
+            clip[i][1] = ay * v.y + by * v.z;
+            clip[i][2] = 0.5f * w;   // mid-range: 0 <= z <= w reduces to w >= 0, the near clip
+            clip[i][3] = w;
+        }
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(s.d3d11Context->Map(s.quadCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) continue;
+        memcpy(mapped.pData, clip, sizeof(clip));
+        s.d3d11Context->Unmap(s.quadCB.Get(), 0);
+
+        // Anaglyph fuses the eyes by channel; the two eyes' quads land at genuinely different
+        // places, so without the mask they would ghost instead.
+        UINT8 mask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+        if (anaglyph) {
+            mask = (eye == 0) ? (UINT8)D3D11_COLOR_WRITE_ENABLE_RED
+                              : (UINT8)(D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE);
+        }
+        ID3D11BlendState* blend = rt::GetLayerBlendState(s, blendMode, mask);
+        if (!blend) continue;
+        s.d3d11Context->OMSetBlendState(blend, nullptr, 0xFFFFFFFF);
+
+        s.d3d11Context->RSSetViewports(1, eyes[e].vp);
         s.d3d11Context->Draw(4, 0);
     }
 
-    // Draw quad into right eye viewport
-    if (showRight) {
-        D3D11_VIEWPORT quadVp = calcQuadVp(rightVp);
-        s.d3d11Context->RSSetViewports(1, &quadVp);
-        s.d3d11Context->Draw(4, 0);
+    if (shouldLog) {
+        Logf("[SimXR] Quad layer: blend=%s space=%s eyeVis=%d pose=(%.2f,%.2f,%.2f) size=(%.2f,%.2f)",
+             blendMode == rt::LayerBlend::Opaque ? "opaque" :
+             blendMode == rt::LayerBlend::Premultiplied ? "premultiplied" : "unpremultiplied",
+             headLocked ? "VIEW" : "WORLD", (int)quad->eyeVisibility,
+             quad->pose.position.x, quad->pose.position.y, quad->pose.position.z,
+             quad->size.width, quad->size.height);
     }
 
     // Cleanup
