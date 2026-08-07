@@ -105,10 +105,20 @@ struct UIState {
     DisplayLayout displayLayout = DisplayLayout::SideBySide;
     HeadsetProfile headsetProfile = HeadsetProfile::Quest3;
     bool showStats = false;
-    float zoomLevel = 1.0f;  // 0.25 = 25%, 0.5 = 50%, 1.0 = 100%, etc.
-    bool fitToWindow = false; // If true, auto-fit zoom to window size
-    int windowWidth = 1280;
-    int windowHeight = 720;
+
+    // Zoom scales the image inside the window; it never resizes the window. zoomLevel is
+    // an absolute content scale (1.0 = one panel pixel per screen pixel) and pan offsets
+    // the scaled image from centred, in client pixels. With fitToWindow set the scale
+    // comes from the window instead and pan is pinned to 0.
+    float zoomLevel = 1.0f;
+    bool fitToWindow = true;
+    float panX = 0.0f;
+    float panY = 0.0f;
+
+    // Client size the preview window was last left at. 0 until the window has existed
+    // once, which is what makes the first run fall back to the panel's shape.
+    int windowWidth = 0;
+    int windowHeight = 0;
 
     // FOV settings
     int fovDegrees = 90;     // FOV in degrees for generic symmetric mode
@@ -258,6 +268,32 @@ inline bool IsIpdSettingsCommand(int cmd) {
 }
 
 // ---------------------------------------------------------------------------
+// Zoom and pan
+//
+// Both are properties of the image, not of the window: zooming in scales the eyes
+// inside whatever size the user dragged the window to and lets the window clip the
+// overflow, the way an image viewer does.
+// ---------------------------------------------------------------------------
+
+// What the preview is currently showing, as the render path last measured it. Zoom and
+// pan are expressed against these, so the input handlers need them as much as the blit
+// does -- the runtime republishes them before acting on a wheel or a drag.
+struct PreviewGeometry {
+    int clientW = 0, clientH = 0;    // preview window client area
+    int contentW = 0, contentH = 0;  // the eyes' layout at 1:1
+};
+
+inline PreviewGeometry g_previewGeom;
+
+// Where the content lands in the client area, in client pixels.
+struct PreviewRect { float x, y, w, h; };
+
+// Anything below a tenth stops being a preview; anything above 8x is past the point
+// where one panel pixel covers a screen tile.
+constexpr float kMinZoom = 0.1f;
+constexpr float kMaxZoom = 8.0f;
+
+// ---------------------------------------------------------------------------
 // Settings persistence
 //
 // The runtime is a DLL with no dependable shutdown hook -- the preview window
@@ -321,8 +357,10 @@ inline std::string SerializeSettings() {
         "  \"asymmetric_fov\": %s,\n"
         "  \"fov_degrees\": %d,\n"
         "  \"ipd_mm\": %d,\n"
-        "  \"zoom\": %.2f,\n"
-        "  \"fit_to_window\": %s,\n"
+        "  \"zoom_mode\": \"%s\",\n"
+        "  \"zoom_scale\": %.3f,\n"
+        "  \"window_width\": %d,\n"
+        "  \"window_height\": %d,\n"
         "  \"full_render\": %s,\n"
         "  \"show_stats\": %s\n"
         "}\n",
@@ -332,8 +370,10 @@ inline std::string SerializeSettings() {
         g_uiState.useAsymmetricFov ? "true" : "false",
         g_uiState.fovDegrees,
         GetIpdMillimeters(),
+        g_uiState.fitToWindow ? "fit" : "scale",
         g_uiState.zoomLevel,
-        g_uiState.fitToWindow ? "true" : "false",
+        g_uiState.windowWidth,
+        g_uiState.windowHeight,
         g_uiState.showFullRender ? "true" : "false",
         g_uiState.showStats ? "true" : "false");
     return buf;
@@ -372,9 +412,16 @@ inline void ApplySettingsJson(const char* text) {
         o.number("fov_degrees", g_uiState.fovDegrees)));
     SetIpdMillimeters(o.number("ipd_mm", GetIpdMillimeters()));
 
-    g_uiState.zoomLevel = (std::max)(0.1f, (std::min)(2.0f,
-        o.number("zoom", g_uiState.zoomLevel)));
-    g_uiState.fitToWindow = o.boolean("fit_to_window", g_uiState.fitToWindow);
+    // Renamed from "zoom"/"fit_to_window", which meant a window size rather than an
+    // image scale. A file written by that build falls back to the defaults here.
+    g_uiState.fitToWindow = (o.string("zoom_mode", "fit") != "scale");
+    g_uiState.zoomLevel = (std::max)(kMinZoom, (std::min)(kMaxZoom,
+        o.number("zoom_scale", g_uiState.zoomLevel)));
+
+    // Left unclamped: the desktop this was saved on may not be the one it reopens on,
+    // so the caller fits it to the current work area instead.
+    g_uiState.windowWidth = (std::max)(0, o.number("window_width", g_uiState.windowWidth));
+    g_uiState.windowHeight = (std::max)(0, o.number("window_height", g_uiState.windowHeight));
     g_uiState.showFullRender = o.boolean("full_render", g_uiState.showFullRender);
     g_uiState.showStats = o.boolean("show_stats", g_uiState.showStats);
 }
@@ -578,11 +625,12 @@ inline void ShowControlsDialog(HWND parent) {
         L"  B - Both eyes\n"
         L"  L - Left eye only\n"
         L"  R - Right eye only\n\n"
-        L"Zoom:\n"
+        L"Zoom (scales the image, not the window):\n"
         L"  F - Fit to window\n"
-        L"  1-4 - Zoom presets (25%-100%)\n"
+        L"  1-4 - Zoom presets (25%-100% of panel resolution)\n"
         L"  +/- - Zoom in/out\n"
-        L"  Mouse wheel - Zoom\n\n"
+        L"  Mouse wheel - Zoom at the cursor\n"
+        L"  Middle-drag - Pan while zoomed in\n\n"
         L"FOV:\n"
         L"  5 - 70\x00B0 (Narrow)\n"
         L"  6 - 90\x00B0 (Normal)\n"
@@ -596,7 +644,7 @@ inline void ShowControlsDialog(HWND parent) {
         L"Other:\n"
         L"  F12 - Screenshot\n"
         L"  F3 - Toggle stats\n"
-        L"  Home - Reset view";
+        L"  Home - Reset view (head pose, zoom and pan)";
 
     MessageBoxW(parent, helpText, L"Controls", MB_OK | MB_ICONINFORMATION);
 }
@@ -617,31 +665,30 @@ inline void ShowAboutDialog(HWND parent) {
     MessageBoxW(parent, aboutText, L"About OpenXR Simulator", MB_OK | MB_ICONINFORMATION);
 }
 
-// Calculate the preview window size based on source size and zoom
-// NOTE: srcWidth and srcHeight are the dimensions of a SINGLE EYE swapchain
+// The client size to open the preview window at, from a SINGLE EYE source laid out for
+// the current view mode. Only ever the starting shape: zoom scales the image inside the
+// window, so nothing resizes the window afterwards except a layout change.
 inline void CalculateWindowSize(int srcWidth, int srcHeight, int& outWidth, int& outHeight) {
-    float zoom = g_uiState.fitToWindow ? 0.5f : g_uiState.zoomLevel;
-
     switch (g_uiState.viewMode) {
         case ViewMode::BothEyes:
             if (g_uiState.displayLayout == DisplayLayout::SideBySide) {
                 // Two eyes side by side: double the width
-                outWidth = (int)(srcWidth * 2 * zoom);
-                outHeight = (int)(srcHeight * zoom);
+                outWidth = srcWidth * 2;
+                outHeight = srcHeight;
             } else if (g_uiState.displayLayout == DisplayLayout::OverUnder) {
                 // Two eyes stacked: double the height
-                outWidth = (int)(srcWidth * zoom);
-                outHeight = (int)(srcHeight * 2 * zoom);
+                outWidth = srcWidth;
+                outHeight = srcHeight * 2;
             } else { // Anaglyph - both eyes overlap in same frame
-                outWidth = (int)(srcWidth * zoom);
-                outHeight = (int)(srcHeight * zoom);
+                outWidth = srcWidth;
+                outHeight = srcHeight;
             }
             break;
         case ViewMode::LeftEyeOnly:
         case ViewMode::RightEyeOnly:
             // Single eye: just use the single eye dimensions
-            outWidth = (int)(srcWidth * zoom);
-            outHeight = (int)(srcHeight * zoom);
+            outWidth = srcWidth;
+            outHeight = srcHeight;
             break;
     }
 
@@ -650,10 +697,93 @@ inline void CalculateWindowSize(int srcWidth, int srcHeight, int& outWidth, int&
     outHeight = (std::max)(outHeight, 240);
 }
 
-// Adjust zoom level
-inline void AdjustZoom(float delta) {
+// Scale at which the whole image just fits the window.
+inline float FitScale() {
+    const PreviewGeometry& g = g_previewGeom;
+    if (g.contentW <= 0 || g.contentH <= 0 || g.clientW <= 0 || g.clientH <= 0) return 1.0f;
+    return (std::min)((float)g.clientW / (float)g.contentW,
+                      (float)g.clientH / (float)g.contentH);
+}
+
+// D3D viewport coordinates are bounded to +-32768, and on a headset whose panel pair is
+// already 5120 wide the image's own size crosses that well before kMaxZoom does. Cap the
+// scale rather than hand the rasterizer a rect it cannot address.
+inline float MaxZoom() {
+    const int span = (std::max)(g_previewGeom.contentW, g_previewGeom.contentH);
+    if (span <= 0) return kMaxZoom;
+    return (std::min)(kMaxZoom, 32000.0f / (float)span);
+}
+
+// The scale the preview is drawn at, whichever mode is active.
+inline float EffectiveScale() {
+    return g_uiState.fitToWindow ? FitScale()
+                                 : (std::min)(g_uiState.zoomLevel, MaxZoom());
+}
+
+// Keep the image covering the window: there is nothing to pan while it is smaller than
+// the client area, and once it is larger its edges may not come inside it.
+inline void ClampPan() {
+    const PreviewGeometry& g = g_previewGeom;
+    const float scale = EffectiveScale();
+    const float maxX = (std::max)(0.0f, ((float)g.contentW * scale - (float)g.clientW) * 0.5f);
+    const float maxY = (std::max)(0.0f, ((float)g.contentH * scale - (float)g.clientH) * 0.5f);
+    g_uiState.panX = (std::max)(-maxX, (std::min)(maxX, g_uiState.panX));
+    g_uiState.panY = (std::max)(-maxY, (std::min)(maxY, g_uiState.panY));
+}
+
+inline PreviewRect ComputePreviewRect() {
+    const PreviewGeometry& g = g_previewGeom;
+    if (g.contentW <= 0 || g.contentH <= 0 || g.clientW <= 0 || g.clientH <= 0) {
+        return { 0.0f, 0.0f, (float)(std::max)(g.clientW, 1), (float)(std::max)(g.clientH, 1) };
+    }
+
+    if (g_uiState.fitToWindow) {
+        g_uiState.panX = g_uiState.panY = 0.0f;
+    } else {
+        ClampPan();
+    }
+
+    const float scale = EffectiveScale();
+    PreviewRect r;
+    r.w = (float)g.contentW * scale;
+    r.h = (float)g.contentH * scale;
+    r.x = ((float)g.clientW - r.w) * 0.5f + g_uiState.panX;
+    r.y = ((float)g.clientH - r.h) * 0.5f + g_uiState.panY;
+    return r;
+}
+
+// Move to an absolute scale, keeping whatever sits under (anchorX, anchorY) in the client
+// area where it is. Leaving "fit to window" therefore starts from the scale the window was
+// already showing, so the first step is one notch rather than a jump.
+inline void ZoomAbout(float scale, float anchorX, float anchorY) {
+    const PreviewRect before = ComputePreviewRect();
+    const float u = before.w > 0.0f ? (anchorX - before.x) / before.w : 0.5f;
+    const float v = before.h > 0.0f ? (anchorY - before.y) / before.h : 0.5f;
+
     g_uiState.fitToWindow = false;
-    g_uiState.zoomLevel = (std::max)(0.1f, (std::min)(2.0f, g_uiState.zoomLevel + delta));
+    g_uiState.zoomLevel = (std::max)(kMinZoom, (std::min)(MaxZoom(), scale));
+
+    const PreviewGeometry& g = g_previewGeom;
+    const float w = (float)g.contentW * g_uiState.zoomLevel;
+    const float h = (float)g.contentH * g_uiState.zoomLevel;
+    g_uiState.panX = (anchorX - u * w) - ((float)g.clientW - w) * 0.5f;
+    g_uiState.panY = (anchorY - v * h) - ((float)g.clientH - h) * 0.5f;
+    ClampPan();
+}
+
+// Zoom about the middle of the window, for the menu items and the keyboard.
+inline void SetZoom(float scale) {
+    ZoomAbout(scale, (float)g_previewGeom.clientW * 0.5f, (float)g_previewGeom.clientH * 0.5f);
+}
+
+// Steps scale rather than add, so a notch feels the same at 25% as it does at 400%.
+inline void ZoomBy(float factor) {
+    SetZoom(EffectiveScale() * factor);
+}
+
+inline void SetFitToWindow() {
+    g_uiState.fitToWindow = true;
+    g_uiState.panX = g_uiState.panY = 0.0f;
 }
 
 // Handle menu commands - returns true if handled
@@ -700,44 +830,33 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
             needsResize = true;
             break;
 
-        // Zoom presets
+        // Zoom presets. These scale the image, so the window is left alone.
         case ID_ZOOM_FIT:
-            g_uiState.fitToWindow = true;
-            needsResize = true;
+            SetFitToWindow();
             break;
 
         case ID_ZOOM_25:
-            g_uiState.fitToWindow = false;
-            g_uiState.zoomLevel = 0.25f;
-            needsResize = true;
+            SetZoom(0.25f);
             break;
 
         case ID_ZOOM_50:
-            g_uiState.fitToWindow = false;
-            g_uiState.zoomLevel = 0.50f;
-            needsResize = true;
+            SetZoom(0.50f);
             break;
 
         case ID_ZOOM_75:
-            g_uiState.fitToWindow = false;
-            g_uiState.zoomLevel = 0.75f;
-            needsResize = true;
+            SetZoom(0.75f);
             break;
 
         case ID_ZOOM_100:
-            g_uiState.fitToWindow = false;
-            g_uiState.zoomLevel = 1.0f;
-            needsResize = true;
+            SetZoom(1.0f);
             break;
 
         case ID_ZOOM_IN:
-            AdjustZoom(0.1f);
-            needsResize = true;
+            ZoomBy(1.25f);
             break;
 
         case ID_ZOOM_OUT:
-            AdjustZoom(-0.1f);
-            needsResize = true;
+            ZoomBy(1.0f / 1.25f);
             break;
 
         // FOV options
@@ -924,15 +1043,12 @@ inline bool HandleKeyboardShortcut(HWND hwnd, WPARAM vk,
     return false;
 }
 
-// Handle mouse wheel for zoom
-inline bool HandleMouseWheel(HWND hwnd, short delta,
-    std::function<void()> resizeCallback = nullptr) {
-
-    float zoomDelta = (delta > 0) ? 0.05f : -0.05f;
-    AdjustZoom(zoomDelta);
+// Handle mouse wheel for zoom. Anchored on the cursor, so scrolling over a detail walks
+// into it instead of into the middle of the image. `anchor` is in client pixels; the
+// caller is responsible for having published the current geometry.
+inline bool HandleMouseWheel(HWND hwnd, short delta, float anchorX, float anchorY) {
+    ZoomAbout(EffectiveScale() * (delta > 0 ? 1.1f : 1.0f / 1.1f), anchorX, anchorY);
     SaveSettings();
-
-    if (resizeCallback) resizeCallback();
 
     HMENU menu = GetMenu(hwnd);
     if (menu) UpdateMenuState(menu);
@@ -983,11 +1099,12 @@ inline void UpdateWindowTitle(HWND hwnd, int fps = 0, int frameCount = 0,
     if (g_uiState.viewMode == ViewMode::LeftEyeOnly) viewModeStr = L"Left Eye";
     else if (g_uiState.viewMode == ViewMode::RightEyeOnly) viewModeStr = L"Right Eye";
 
+    // "Fit" still carries the scale it settled on: it is what +/- steps away from.
     wchar_t zoomStr[32];
     if (g_uiState.fitToWindow) {
-        wcscpy_s(zoomStr, L"Fit");
+        swprintf_s(zoomStr, L"Fit (%d%%)", (int)(FitScale() * 100.0f + 0.5f));
     } else {
-        swprintf_s(zoomStr, L"%d%%", (int)(g_uiState.zoomLevel * 100));
+        swprintf_s(zoomStr, L"%d%%", (int)(g_uiState.zoomLevel * 100.0f + 0.5f));
     }
 
     wchar_t base[512];

@@ -9,6 +9,7 @@
 #define XR_USE_GRAPHICS_API_OPENGL
 
 #include <windows.h>
+#include <windowsx.h>
 #include <wrl/client.h>
 #include <d3d11.h>
 #include <d3d12.h>
@@ -548,6 +549,14 @@ static float g_poseSweepRollAmp  = 0.3f;   // radians (~17 deg)
 static float g_poseSweepFreq     = 0.25f;  // Hz
 static bool g_mouseCapture = false;
 static POINT g_lastMousePos = {0, 0};
+
+// Middle-button drag panning the zoomed preview, in client coordinates.
+static bool g_panDrag = false;
+static POINT g_panLastPos = {0, 0};
+
+// Inside a WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE pair: the user is dragging the window's
+// frame, and every step of it would otherwise rewrite settings.json.
+static bool g_sizingDrag = false;
 
 // Controller tracking state for motion controller emulation
 // Positions are relative to head position, orientation follows head by default
@@ -1143,15 +1152,43 @@ static void GetPreviewClientSize(rt::Session& s, int srcW, int srcH, int& outW, 
         return;
     }
     // Initial fallback (first frame, before WM_SIZE has fired)
-    int tw = srcW, th = srcH;
-    ui::CalculateWindowSize(srcW, srcH, tw, th);
+    uint32_t panelW = 0, panelH = 0;
+    ui::GetHeadsetPanelResolution(panelW, panelH);
+    int tw = 0, th = 0;
+    ui::CalculateWindowSize((int)panelW, (int)panelH, tw, th);
+    ClampToWorkArea(tw, th);
     outW = tw;
     outH = th;
 }
 
+// Publish what zoom and pan are measured against: the window's client area and the shape
+// the eyes are laid out in. The render path refreshes this every frame; the input
+// handlers refresh it before acting, so a wheel notch still lands on a stalled app.
+static void RefreshPreviewGeometry(int clientW, int clientH) {
+    int contentW = 0, contentH = 0;
+    ComputeDisplayDims(contentW, contentH);
+    ui::g_previewGeom = { clientW, clientH, contentW, contentH };
+}
+
+static void RefreshPreviewGeometry(HWND hWnd) {
+    RECT cr{};
+    if (!hWnd || !GetClientRect(hWnd, &cr)) return;
+    RefreshPreviewGeometry(cr.right - cr.left, cr.bottom - cr.top);
+}
+
+// Where the stereo image lands inside a dstW x dstH target, in that target's pixels.
+// "Fit to Window" gives the letterboxed rect; any other zoom is an absolute content
+// scale placed by the pan offset, which the target then clips.
+static FitRect ComputePresentRect(int dstW, int dstH) {
+    RefreshPreviewGeometry(dstW, dstH);
+    const ui::PreviewRect r = ui::ComputePreviewRect();
+    return FitRect{ r.x, r.y, r.w, r.h };
+}
+
+
 // Size of the D3D12 preview's offscreen RT: the window's client area. The scaling pass
 // draws the eyes straight into it, so the per-frame readback stays the window's pixel
-// count rather than the stereo render's.
+// count rather than the stereo render's, and a zoomed-in image is clipped on the GPU.
 static void ComputePreviewRTSize(rt::Session& s, int& outW, int& outH) {
     int clientW = 0, clientH = 0;
     GetPreviewClientSize(s, 0, 0, clientW, clientH);
@@ -1244,6 +1281,34 @@ static void ResetD3D12PreviewSurfaces(rt::Session& s) {
     s.previewReadbackPitch = 0;
 }
 
+// Re-shape the window for a new content aspect -- a view mode or layout change, which
+// turns a side-by-side pair into a single eye and back. Zoom no longer touches the
+// window, so this is the only thing that resizes it, and it keeps the client area the
+// user had rather than jumping back to a panel-derived size every time.
+static void ResizeWindowForContent(HWND hWnd) {
+    if (!hWnd) return;
+
+    int contentW = 0, contentH = 0;
+    ComputeDisplayDims(contentW, contentH);
+    if (contentW <= 0 || contentH <= 0) return;
+    const double aspect = (double)contentW / (double)contentH;
+
+    RECT cr{};
+    if (!GetClientRect(hWnd, &cr)) return;
+    const double area = (double)(cr.right - cr.left) * (double)(cr.bottom - cr.top);
+    if (area < 1.0) return;
+
+    int targetW = (int)(sqrt(area * aspect) + 0.5);
+    int targetH = (int)(sqrt(area / aspect) + 0.5);
+    ClampToWorkArea(targetW, targetH);
+
+    RECT rc{0, 0, targetW, targetH};
+    AdjustWindowRectEx(&rc, (DWORD)GetWindowLongW(hWnd, GWL_STYLE), GetMenu(hWnd) != nullptr,
+                       (DWORD)GetWindowLongW(hWnd, GWL_EXSTYLE));
+    SetWindowPos(hWnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+                 SWP_NOMOVE | SWP_NOZORDER);
+}
+
 static void ResetD3D12PreviewResources(rt::Session& s) {
     ResetD3D12PreviewSurfaces(s);
     for (UINT i = 0; i < rt::kPreviewFrames; ++i) {
@@ -1299,6 +1364,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 rt::g_session.isFocused = false;
                 Log("[SimXR] WndProc: WM_ACTIVATE -> unfocused");
                 rt::g_mouseCapture = false;  // Release mouse capture when window loses focus
+                rt::g_panDrag = false;
                 ReleaseCapture();
                 // Push VISIBLE state if we were FOCUSED
                 if (rt::g_session.state == XR_SESSION_STATE_FOCUSED) {
@@ -1323,18 +1389,31 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ShowCursor(TRUE);
             }
             return 0;
+        case WM_MBUTTONDOWN:
+            // Middle drag pans the zoomed image. Left is already mouse look, and this
+            // way panning stays available while the head is being aimed.
+            rt::g_panDrag = true;
+            rt::g_panLastPos = POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            SetCapture(hWnd);
+            return 0;
+        case WM_MBUTTONUP:
+            if (rt::g_panDrag) {
+                rt::g_panDrag = false;
+                ReleaseCapture();
+            }
+            return 0;
+        case WM_ENTERSIZEMOVE:
+            rt::g_sizingDrag = true;
+            return 0;
+        case WM_EXITSIZEMOVE:
+            rt::g_sizingDrag = false;
+            ui::SaveSettings();
+            return 0;
         case WM_SIZING: {
             // Constrain interactive resize to the current content aspect ratio
             // so the window itself follows the stereo layout (no letterbox).
-            UINT srcW = rt::g_sourceWidth.load();
-            UINT srcH = rt::g_sourceHeight.load();
-            if (srcW == 0 || srcH == 0) break;
-
             int contentW = 0, contentH = 0;
-            rt::ComputeContentDims((int)srcW, (int)srcH,
-                                   ui::g_uiState.viewMode,
-                                   ui::g_uiState.displayLayout,
-                                   contentW, contentH);
+            rt::ComputeDisplayDims(contentW, contentH);
             if (contentW <= 0 || contentH <= 0) break;
             double aspect = (double)contentW / (double)contentH;
 
@@ -1433,6 +1512,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             rt::g_session.clientWidth.store(cw);
             rt::g_session.clientHeight.store(ch);
 
+            // Remember the size for the next run. Recorded ahead of the aspect snap
+            // below, which resizes again and lands here a second time -- so the
+            // corrected size is what the last write leaves in the file. Skipped while
+            // a drag is in progress; WM_EXITSIZEMOVE writes once at the end of it.
+            ui::g_uiState.windowWidth = (int)cw;
+            ui::g_uiState.windowHeight = (int)ch;
+            if (!rt::g_sizingDrag) ui::SaveSettings();
+
             // WM_SIZING constrains interactive drags, but maximize, snap, and
             // programmatic resizes bypass it. If the resulting client aspect
             // doesn't match content aspect, snap the window so we never need
@@ -1440,15 +1527,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             static thread_local bool inFix = false;
             if (inFix) return 0;
 
-            UINT srcW = rt::g_sourceWidth.load();
-            UINT srcH = rt::g_sourceHeight.load();
-            if (srcW == 0 || srcH == 0) return 0;
-
             int contentW = 0, contentH = 0;
-            rt::ComputeContentDims((int)srcW, (int)srcH,
-                                   ui::g_uiState.viewMode,
-                                   ui::g_uiState.displayLayout,
-                                   contentW, contentH);
+            rt::ComputeDisplayDims(contentW, contentH);
             if (contentW <= 0 || contentH <= 0) return 0;
             double contentAspect = (double)contentW / (double)contentH;
             double clientAspect  = (double)cw / (double)ch;
@@ -1507,6 +1587,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // erase prevents flicker behind the D3D12 GDI blit during resize.
             return 1;
         case WM_MOUSEMOVE:
+            if (rt::g_panDrag) {
+                const POINT pos{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                ui::g_uiState.panX += (float)(pos.x - rt::g_panLastPos.x);
+                ui::g_uiState.panY += (float)(pos.y - rt::g_panLastPos.y);
+                rt::g_panLastPos = pos;
+                rt::RefreshPreviewGeometry(hWnd);
+                ui::ClampPan();
+                return 0;
+            }
             if (rt::g_mouseCapture) {
                 POINT currentPos;
                 GetCursorPos(&currentPos);
@@ -1536,26 +1625,17 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             return 0;
         case WM_COMMAND:
+            // The zoom items anchor on the middle of the window, so they need the
+            // geometry to be current even if no frame has been presented since a resize.
+            rt::RefreshPreviewGeometry(hWnd);
             if (ui::HandleMenuCommand(hWnd, wParam,
-                []() {
-                    // Apply zoom/layout change to the window outer size. "Fit
-                    // to Window" leaves the user's chosen size alone and lets
-                    // the render path letterbox into it.
-                    if (ui::g_uiState.fitToWindow) return;
-                    UINT sw = rt::g_sourceWidth.load();
-                    UINT sh = rt::g_sourceHeight.load();
-                    if (sw == 0 || sh == 0 || !rt::g_session.hwnd) return;
-                    int targetW = (int)sw, targetH = (int)sh;
-                    ui::CalculateWindowSize((int)sw, (int)sh, targetW, targetH);
-                    RECT rc = { 0, 0, targetW, targetH };
-                    BOOL hasMenu = GetMenu(rt::g_session.hwnd) != nullptr;
-                    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, hasMenu);
-                    SetWindowPos(rt::g_session.hwnd, nullptr, 0, 0,
-                                 rc.right - rc.left, rc.bottom - rc.top,
-                                 SWP_NOMOVE | SWP_NOZORDER);
-                },
+                []() { rt::ResizeWindowForContent(rt::g_session.hwnd); },
                 []() { mcp::g_screenshotRequested = true; },
-                []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; },
+                []() {
+                    rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0;
+                    ui::SetFitToWindow();
+                    ui::SaveSettings();
+                },
                 [](int cmd) { rt::HandleUiSettingsCommand(cmd); }
             )) {
                 rt::RefreshTitleNow(hWnd);
@@ -1564,26 +1644,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case WM_KEYDOWN:
             if (!rt::g_mouseCapture) {
+                rt::RefreshPreviewGeometry(hWnd);
                 if (ui::HandleKeyboardShortcut(hWnd, wParam,
-                    []() {
-                    // Apply zoom/layout change to the window outer size. "Fit
-                    // to Window" leaves the user's chosen size alone and lets
-                    // the render path letterbox into it.
-                    if (ui::g_uiState.fitToWindow) return;
-                    UINT sw = rt::g_sourceWidth.load();
-                    UINT sh = rt::g_sourceHeight.load();
-                    if (sw == 0 || sh == 0 || !rt::g_session.hwnd) return;
-                    int targetW = (int)sw, targetH = (int)sh;
-                    ui::CalculateWindowSize((int)sw, (int)sh, targetW, targetH);
-                    RECT rc = { 0, 0, targetW, targetH };
-                    BOOL hasMenu = GetMenu(rt::g_session.hwnd) != nullptr;
-                    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, hasMenu);
-                    SetWindowPos(rt::g_session.hwnd, nullptr, 0, 0,
-                                 rc.right - rc.left, rc.bottom - rc.top,
-                                 SWP_NOMOVE | SWP_NOZORDER);
-                },
+                    []() { rt::ResizeWindowForContent(rt::g_session.hwnd); },
                     []() { mcp::g_screenshotRequested = true; },
-                    []() { rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0; },
+                    []() {
+                        rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0;
+                        ui::SetFitToWindow();
+                        ui::SaveSettings();
+                    },
                     [](int cmd) { rt::HandleUiSettingsCommand(cmd); }
                 )) {
                     rt::RefreshTitleNow(hWnd);
@@ -1591,11 +1660,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 }
             }
             break;
-        case WM_MOUSEWHEEL:
-            if (ui::HandleMouseWheel(hWnd, GET_WHEEL_DELTA_WPARAM(wParam), nullptr)) {
-                return 0;
-            }
-            break;
+        case WM_MOUSEWHEEL: {
+            // Wheel coordinates are on the screen, unlike every other mouse message.
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hWnd, &pt);
+            rt::RefreshPreviewGeometry(hWnd);
+            ui::HandleMouseWheel(hWnd, GET_WHEEL_DELTA_WPARAM(wParam), (float)pt.x, (float)pt.y);
+            rt::RefreshTitleNow(hWnd);
+            return 0;
+        }
         default:
             break;
     }
@@ -1872,9 +1945,13 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
     if (!s_settingsLoaded) {
         s_settingsLoaded = true;
         ui::LoadSettings(mcp::GetSimulatorDataPath());
-        Logf("[SimXR] Settings restored: profile=%ls ipd=%dmm asymmetric=%d zoom=%d%%",
+        char zoomDesc[32] = "fit";
+        if (!ui::g_uiState.fitToWindow) {
+            snprintf(zoomDesc, sizeof(zoomDesc), "%d%%", (int)(ui::g_uiState.zoomLevel * 100));
+        }
+        Logf("[SimXR] Settings restored: profile=%ls ipd=%dmm asymmetric=%d zoom=%s",
              ui::GetHeadsetProfileShortName(), ui::GetIpdMillimeters(),
-             (int)ui::g_uiState.useAsymmetricFov, (int)(ui::g_uiState.zoomLevel * 100));
+             (int)ui::g_uiState.useAsymmetricFov, zoomDesc);
     }
 
     // Validate that all requested extensions are supported
@@ -4009,15 +4086,20 @@ static void ensurePreviewWithoutProjection(rt::Session& s) {
         rt::g_sourceHeight.store((uint32_t)srcH);
     }
 
-    // Open at the panel's shape so the first frame is already the right proportions,
-    // clamped to the desktop: two 2064x2208 eyes side by side is wider than any monitor.
-    int windowW = 0, windowH = 0;
-    {
+    // Reopen at the size the window was last left at. With nothing saved -- first run, or
+    // a settings file from before this was persisted -- fall back to the panel's shape so
+    // the first frame is already the right proportions. Either way clamp to the desktop:
+    // two 2064x2208 eyes side by side is wider than any monitor, and the saved size may
+    // have come from a larger one. A profile or layout change since makes the restored
+    // aspect wrong, which the snap on the first WM_SIZE corrects.
+    int windowW = ui::g_uiState.windowWidth;
+    int windowH = ui::g_uiState.windowHeight;
+    if (windowW <= 0 || windowH <= 0) {
         uint32_t panelW = 0, panelH = 0;
         ui::GetHeadsetPanelResolution(panelW, panelH);
         ui::CalculateWindowSize((int)panelW, (int)panelH, windowW, windowH);
-        rt::ClampToWorkArea(windowW, windowH);
     }
+    rt::ClampToWorkArea(windowW, windowH);
     ensurePreviewWindow(s, (UINT)windowW, (UINT)windowH);
     if (!s.hwnd) return;
 
@@ -4586,8 +4668,8 @@ static void blitD3D12ToPreview(rt::Session& s,
             return false;
         }
         if (dstW <= 0 || dstH <= 0 || rect.w == 0 || rect.h == 0) return false;
-        // Entirely outside the RT: nothing to draw, and bailing here keeps the swapchain
-        // image out of a transition it would never be moved back from.
+        // Panned entirely out of the RT: nothing to draw, and bailing here keeps the
+        // swapchain image out of a transition it would never be moved back from.
         if (dstX + dstW <= 0 || dstY + dstH <= 0 ||
             dstX >= (int)rtWidth || dstY >= (int)rtHeight) return false;
 
@@ -4638,9 +4720,9 @@ static void blitD3D12ToPreview(rt::Session& s,
         s.previewCmdList->SetGraphicsRoot32BitConstants(1, 8, constants, 0);
         s.previewCmdList->SetGraphicsRootDescriptorTable(0, gpu);
 
-        // The scissor stays inside the RT while the viewport may run past it: the
-        // rasterizer drops the overflow and the cleared black shows through anywhere the
-        // image does not reach.
+        // A zoomed-in eye is larger than the RT and starts off the left/top of it, so the
+        // viewport runs outside while the scissor stays inside: the rasterizer drops the
+        // overflow and the cleared black shows through anywhere the image doesn't reach.
         D3D12_VIEWPORT vp = { (float)dstX, (float)dstY, (float)dstW, (float)dstH, 0.0f, 1.0f };
         D3D12_RECT scissor = { (std::max)(0, dstX), (std::max)(0, dstY),
                                (std::min)((int)rtWidth, dstX + dstW),
@@ -4672,12 +4754,8 @@ static void blitD3D12ToPreview(rt::Session& s,
     const bool hasLeft = leftIdx < chainL.images12.size() && chainL.images12[leftIdx];
     const bool hasRight = chainR && rightIdx < chainR->images12.size() && chainR->images12[rightIdx];
 
-    // The RT is the client area, so the eyes go in the largest content-aspect rect that
-    // fits inside it. Taking the shape from the panel and not from the render target is
-    // what turns the app's non-square pixels back into square ones.
-    int displayW = 0, displayH = 0;
-    rt::ComputeDisplayDims(displayW, displayH);
-    const rt::FitRect present = rt::ComputeFitRect(displayW, displayH, (int)rtWidth, (int)rtHeight);
+    // The RT is the client area, so zoom and pan decide where inside it the eyes go.
+    const rt::FitRect present = rt::ComputePresentRect((int)rtWidth, (int)rtHeight);
     const int presentX = (int)lroundf(present.x);
     const int presentY = (int)lroundf(present.y);
     const int presentW = (std::max)(1, (int)lroundf(present.w));
@@ -5080,13 +5158,10 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
 
-            // Compute letterboxed fit rect: largest aspect-correct rect that
-            // fits in the current backbuffer (= client area). This way a
-            // small window shows the full stereo image scaled, not cropped.
-            int contentW = 0, contentH = 0;
-            rt::ComputeContentDims((int)width, (int)height, viewMode, layout, contentW, contentH);
-            rt::FitRect fit = rt::ComputeFitRect(contentW, contentH,
-                                                  (int)s.previewWidth, (int)s.previewHeight);
+            // Where the eyes land in the backbuffer (= client area). "Fit to Window"
+            // scales the whole stereo image into it rather than cropping; any other
+            // zoom scales the panel and lets the rasterizer clip what overhangs.
+            rt::FitRect fit = rt::ComputePresentRect((int)s.previewWidth, (int)s.previewHeight);
 
             D3D11_VIEWPORT fullVp = { fit.x, fit.y, fit.w, fit.h, 0.0f, 1.0f };
             D3D11_VIEWPORT leftVp = fullVp;
@@ -5267,13 +5342,10 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
 
-            // Letterbox: pick the largest content-aspect rect inside the
-            // backbuffer (= client area). Single eye uses it whole; SBS /
-            // OverUnder split it; Anaglyph overlays both eyes into it.
-            int contentW = 0, contentH = 0;
-            rt::ComputeContentDims((int)width, (int)height, viewMode, layout, contentW, contentH);
-            rt::FitRect fit = rt::ComputeFitRect(contentW, contentH,
-                                                  (int)s.previewWidth, (int)s.previewHeight);
+            // Where the eyes land in the backbuffer (= client area), after zoom and pan.
+            // Single eye uses the rect whole; SBS / OverUnder split it; Anaglyph
+            // overlays both eyes into it.
+            rt::FitRect fit = rt::ComputePresentRect((int)s.previewWidth, (int)s.previewHeight);
 
             D3D11_VIEWPORT fullVp = { fit.x, fit.y, fit.w, fit.h, 0.0f, 1.0f };
             D3D11_VIEWPORT leftVp = fullVp;
@@ -5515,9 +5587,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         s.previewCmdList->SetGraphicsRootDescriptorTable(0, gpu);
 
         // Same split of the RT the eye pass used, so the quad lands over the right eye.
-        int displayW = 0, displayH = 0;
-        rt::ComputeDisplayDims(displayW, displayH);
-        const rt::FitRect present = rt::ComputeFitRect(displayW, displayH, rtWidth, rtHeight);
+        const rt::FitRect present = rt::ComputePresentRect(rtWidth, rtHeight);
         const int presentX = (int)lroundf(present.x), presentY = (int)lroundf(present.y);
         const int presentW = (std::max)(1, (int)lroundf(present.w));
         const int presentH = (std::max)(1, (int)lroundf(present.h));
@@ -5858,16 +5928,8 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     const auto viewMode = ui::g_uiState.viewMode;
     const bool singleEye = (viewMode != ui::ViewMode::BothEyes);
 
-    // Use the per-eye source dims (cached by presentProjection) to mirror the
-    // letterbox math used for the projection layer.
-    int qSrcW = (int)rt::g_sourceWidth.load();
-    int qSrcH = (int)rt::g_sourceHeight.load();
-    if (qSrcW <= 0) qSrcW = (int)texWidth;
-    if (qSrcH <= 0) qSrcH = (int)texHeight;
-    int qContentW = 0, qContentH = 0;
-    rt::ComputeContentDims(qSrcW, qSrcH, viewMode, layout, qContentW, qContentH);
-    rt::FitRect qFit = rt::ComputeFitRect(qContentW, qContentH,
-                                           (int)s.previewWidth, (int)s.previewHeight);
+    // Mirror the rect the projection layer lands in, zoom and pan included.
+    rt::FitRect qFit = rt::ComputePresentRect((int)s.previewWidth, (int)s.previewHeight);
 
     D3D11_VIEWPORT leftVp  = { qFit.x, qFit.y, qFit.w, qFit.h, 0.0f, 1.0f };
     D3D11_VIEWPORT rightVp = leftVp;

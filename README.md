@@ -118,55 +118,19 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 
 ## 🎮 Configuration
 
-### Saved Settings
-
-View mode, display layout, headset profile, FOV, IPD, zoom, full-render and the
-stats toggle survive a restart. Every change is written straight to
-`%LOCALAPPDATA%\OpenXR-Simulator\settings.json`, and it is read back at
-`xrCreateInstance` — before the app asks for view configurations, so a saved
-headset profile decides the recommended per-eye resolution the app renders at.
-
-Delete the file to go back to defaults. Unknown or out-of-range values fall back
-to the default for that field rather than failing the load.
-
-MCP overrides (`set_fov`, `set_ipd`, `set_headset_profile`) are not persisted —
-they are per-session test fixtures.
+Settings are changed from the menu bar and persist across restarts in
+`%LOCALAPPDATA%\OpenXR-Simulator\settings.json`. Delete the file to go back to
+defaults.
 
 ### Headset Profiles
 
-A profile presets the per-eye frustum, the native panel resolution reported to
-`xrEnumerateViewConfigurationViews`, and a nominal IPD. Pick one from
-**FOV → Headset Profile**, or over MCP with `set_headset_profile`.
-
-| Profile | MCP name | Per-eye panel | Left eye (L, R, U, D) | Right eye (L, R, U, D) |
-|---|---|---|---|---|
-| Generic Symmetric | `generic` | 1440x1440 | symmetric, from the FOV menu | — |
-| Meta Quest 2 | `quest2` | 1832x1920 | -52.00, 45.00, 48.00, -50.00 | -45.00, 52.00, 48.00, -50.00 |
-| Meta Quest 3 | `quest3` | 2064x2208 | -54.00, 40.00, 43.98, -54.27 | -40.00, 54.00, 43.98, -54.27 |
-| Meta Quest Pro | `questpro` | 1800x1920 | -54.00, 39.86, 42.00, -53.57 | -39.86, 54.00, 42.00, -53.57 |
-| Valve Index | `index` | 1440x1600 | -54.00, 42.98, 54.63, -54.52 | -42.95, 54.06, 54.66, -54.50 |
-| HTC Vive Pro 2 | `vivepro2` | 2448x2448 | -58.26, 39.94, 48.21, -48.11 | -39.89, 58.26, 48.44, -48.20 |
-| HP Reverb G2 | `reverbg2` | 2160x2160 | -49.37, 42.14, 45.53, -45.35 | -42.17, 49.48, 45.78, -45.05 |
-| Sony PS VR2 | `psvr2` | 2000x2040 | -61.50, 43.45, 53.04, -53.04 | -43.45, 61.50, 53.04, -53.04 |
-| PICO 4 | `pico4` | 2160x2160 | -52.00, 52.00, 52.00, -52.00 | -52.00, 52.00, 52.00, -52.00 |
-| Bigscreen Beyond | `beyond` | 2560x2560 | -48.97, 39.58, 38.01, -50.52 | -40.02, 48.56, 38.13, -50.43 |
-
-Both eyes are measured values from the
-[HMD Geometry Database](https://risa2000.github.io/hmdgdb/), which records what
-each headset's runtime actually reports — note how few of these are symmetric, that
-the eyes are not exact mirrors of each other, and that most are taller than they are
-wide. Add one by appending a row to `ui::kHeadsetSpecs` in
-[ui_enhancements.h](src/ui_enhancements.h); the enum, menu and settings keys follow
-from the table.
-
-### Field of View
-
-The default FOV is set to 70° for comfortable desktop viewing. To modify, edit the FOV value in `src/runtime.cpp`:
-
-```cpp
-// In xrLocateViews_runtime function
-views[i].fov = { -0.7f, 0.7f, 0.7f, -0.7f }; // tan(35°) ≈ 0.7
-```
+Pick a headset from **FOV → Headset Profile** to preset the per-eye frustum, the
+panel resolution reported to `xrEnumerateViewConfigurationViews`, and a nominal
+IPD. The values are measured ones from the
+[HMD Geometry Database](https://risa2000.github.io/hmdgdb/). Add a profile by
+appending a row to `ui::kHeadsetSpecs` in
+[ui_enhancements.h](src/ui_enhancements.h); the enum, menu and settings keys
+follow from the table.
 
 ### Window Size
 
