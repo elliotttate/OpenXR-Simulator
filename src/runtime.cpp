@@ -6189,7 +6189,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                     Logf("[SimXR] GL PREVIEW: About to Present - hwnd=%p, swapchain=%p", s.hwnd, s.previewSwapchain.Get());
                 }
 
-                HRESULT presentHr = s.previewSwapchain->Present(1, 0);
+                HRESULT presentHr = s.previewSwapchain->Present(0, 0);
                 if (FAILED(presentHr) && glFrameCount % 60 == 1) {
                     Logf("[SimXR] GL PREVIEW: Present FAILED with hr=0x%08X", presentHr);
                 }
@@ -6323,11 +6323,14 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                                    rtv.Get(), rightVp, rightBlend);
                 }
 
-                // Present D3D11 (may be deferred if overlays are pending)
+                // Present D3D11 (may be deferred if overlays are pending). Sync interval 0:
+                // this is a mirror, and it runs on the app's render thread, so waiting for
+                // vblank here would pace the application to the monitor rather than to the
+                // headset it thinks it is driving.
                 if (!skipPresent) {
                     MSG msg;
                     while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-                    s.previewSwapchain->Present(1, 0);
+                    s.previewSwapchain->Present(0, 0);
                 } else {
                     g_presentPending = true;
                 }
@@ -7211,7 +7214,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
             // D3D12 GDI-based path: blitD3D12ToPreview already painted via GDI, nothing to do
             Log("[SimXR] Deferred D3D12: GDI blit already done in blitD3D12ToPreview");
         } else if (s.previewSwapchain) {
-            s.previewSwapchain->Present(1, 0);
+            s.previewSwapchain->Present(0, 0);
         }
         g_presentPending = false;
     }
