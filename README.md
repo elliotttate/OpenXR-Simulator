@@ -12,6 +12,7 @@ A lightweight OpenXR runtime that enables VR applications to run in a desktop wi
 
 - **Multi-API Support** - Supports D3D11, D3D12, Vulkan and OpenGL graphics backends
 - **Desktop VR Preview** - Run VR applications in a resizable desktop window with side-by-side stereo view
+- **Headset Emulation** - Reproduces the measured per-eye FOV, panel resolution and IPD of ten popular headsets (Quest 2/3/Pro, Index, Vive Pro 2, Reverb G2, PS VR2, PICO 4, Bigscreen Beyond)
 - **Mouse & Keyboard Controls** - Navigate the virtual space using standard input devices
 - **Proper sRGB Handling** - Automatic gamma correction for accurate color reproduction
 - **Unity & Unreal Compatible** - Tested with Unity's OpenXR plugin and Unreal Engine (via UEVR)
