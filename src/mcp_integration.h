@@ -715,9 +715,9 @@ inline bool CheckProjLogDumpRequest() {
 // artifacts (shadows lagging a head-pose whip) that a one-shot screenshot
 // round-trip is far too slow to catch.
 //
-// D3D12 sessions only: BurstOnFrame records the preview's DIB back buffer, which
-// is the one place a composited frame exists in CPU memory. A D3D11 or OpenGL
-// session acks the command as failed rather than recording it.
+// D3D12 and Vulkan sessions only: BurstOnFrame records the preview's DIB back
+// buffer, which is the one place a composited frame exists in CPU memory. A
+// D3D11 or OpenGL session acks the command as failed rather than recording it.
 //
 // Drive it by writing burst_command.json:
 //   {"frames": 32, "pose": {"yaw": 25, "pitch": 0, "x": 0, "y": 1.7, "z": 0}}

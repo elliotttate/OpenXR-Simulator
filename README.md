@@ -4,13 +4,13 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue)](https://github.com)
 [![OpenXR](https://img.shields.io/badge/OpenXR-1.0-green)](https://www.khronos.org/openxr/)
 
-A lightweight OpenXR runtime that enables VR applications to run in a desktop window for development and testing without requiring a physical VR headset. Supports D3D11, D3D12, and OpenGL graphics backends.
+A lightweight OpenXR runtime that enables VR applications to run in a desktop window for development and testing without requiring a physical VR headset. Supports D3D11, D3D12, Vulkan and OpenGL graphics backends.
 
 ![KAJUqBgmzewBPq9YkMDsm5AwsucqBaUY6gw2eMLX](https://github.com/user-attachments/assets/4dd804e1-13f4-46eb-a540-7c5cb77bf09c)
 
 ## 🎯 Features
 
-- **Multi-API Support** - Supports D3D11, D3D12, and OpenGL graphics backends
+- **Multi-API Support** - Supports D3D11, D3D12, Vulkan and OpenGL graphics backends
 - **Desktop VR Preview** - Run VR applications in a resizable desktop window with side-by-side stereo view
 - **Mouse & Keyboard Controls** - Navigate the virtual space using standard input devices
 - **Proper sRGB Handling** - Automatic gamma correction for accurate color reproduction
@@ -100,6 +100,7 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 - ✅ Core OpenXR 1.0 specification
 - ✅ D3D11 graphics binding (`XR_KHR_D3D11_enable`)
 - ✅ D3D12 graphics binding (`XR_KHR_D3D12_enable`)
+- ✅ Vulkan graphics binding (`XR_KHR_vulkan_enable` and `XR_KHR_vulkan_enable2`)
 - ✅ OpenGL graphics binding (`XR_KHR_opengl_enable`)
 - ✅ Win32 time conversion (`XR_KHR_win32_convert_performance_counter_time`)
 - ✅ Multiple swapchain formats (sRGB, UNORM, HDR, typeless, depth)
@@ -109,9 +110,34 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 - ✅ Basic action system for input
 - ✅ Screenshot capture (D3D11, D3D12, and OpenGL)
 
+### Vulkan sessions
+
+The compositor is D3D12 whatever the app binds. A Vulkan session's swapchain images are
+D3D12 committed resources created `SHARED`, imported into the app's own `VkDevice` through
+`VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT`, and handed back as `VkImage`s — so the
+app renders in Vulkan and the preview, quad layers, screenshots and burst capture read the
+same pixels as `ID3D12Resource`s with no second code path. `xrGetVulkanGraphicsDevice2KHR`
+returns the `VkPhysicalDevice` whose `deviceLUID` matches the DXGI adapter the compositor
+runs on, which is what makes the shared-handle import legal.
+
+`xrEnumerateSwapchainFormats` reports `VkFormat` values under a Vulkan session. Images are
+handed over in `VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` (depth:
+`VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL`) and must be released in the same layout,
+as the spec requires — an app renders straight into an acquired image with no barrier of its
+own, so the runtime owes it that layout and never changes it afterwards.
+
+The app's `VkQueue` and the compositor's D3D12 queue are ordered by one shared `ID3D12Fence`
+imported as a timeline `VkSemaphore`, driven by a single strictly increasing counter that
+each side signals in turn. `SIMXR_VK_NO_TIMELINE=1` falls back to CPU waits, which is correct
+but serialises the frame — useful when a driver's timeline import misbehaves.
+
+Colour resources carry `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS` (no DCC, so the bytes
+Vulkan wrote are readable through a D3D12 SRV), depth uses a typeless DXGI format, and both
+set `D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT` explicitly. Those three come from BetterVR's
+own Vulkan/D3D12 bridge and are there for AMD.
+
 ### Limitations
 
-- ❌ No Vulkan support (D3D11, D3D12, and OpenGL only)
 - ❌ No hand tracking
 - ❌ No haptic feedback
 - ❌ No foveated rendering
@@ -242,7 +268,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🗺️ Roadmap
 
-- [ ] Vulkan graphics binding (`XR_KHR_vulkan_enable`)
 - [ ] Linux support
 - [ ] Configurable controller emulation
 - [ ] Multi-monitor support

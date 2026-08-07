@@ -1,8 +1,9 @@
 # Using this runtime with BetterVR
 
-[BetterVR](https://github.com/Crementif/BotW-BetterVR) is a Cemu VR layer. It is a
-Vulkan layer, but its OpenXR session uses `XrGraphicsBindingD3D12KHR` and does its
-own Vulkan to D3D12 interop, so this runtime needs no Vulkan support to host it.
+[BetterVR](https://github.com/Crementif/BotW-BetterVR) is a Cemu VR layer. Today its
+OpenXR session uses `XrGraphicsBindingD3D12KHR` and it does its own Vulkan to D3D12
+interop; the port in progress replaces that with a native Vulkan session on Cemu's own
+device. This runtime hosts both — see "Vulkan sessions" below.
 
 This branch fills the same slot as Meta's XR Simulator: a desktop OpenXR runtime
 for developing without a headset, but source-built and patchable.

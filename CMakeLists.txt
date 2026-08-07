@@ -21,6 +21,18 @@ endforeach()
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CMAKE_SOURCE_DIR}/src)
 
+# Vulkan headers only -- the runtime resolves every entry point through the
+# app-supplied vkGetInstanceProcAddr (or a lazily loaded vulkan-1.dll), so it must
+# keep loading on machines with no Vulkan at all.
+find_path(SIMXR_VULKAN_INCLUDE_DIR vulkan/vulkan.h
+    HINTS $ENV{VULKAN_SDK}/Include $ENV{VULKAN_SDK}/include
+    PATHS ${CMAKE_SOURCE_DIR}/../BotW-BetterVR/cmake-build-Release/vcpkg_installed/x64-windows-static/include
+          ${CMAKE_SOURCE_DIR}/../BotW-BetterVR/build/vcpkg_installed/x64-windows-static/include)
+if(NOT SIMXR_VULKAN_INCLUDE_DIR)
+    message(FATAL_ERROR "vulkan/vulkan.h not found. Install the Vulkan SDK or set VULKAN_SDK.")
+endif()
+include_directories(${SIMXR_VULKAN_INCLUDE_DIR})
+
 # OpenXR Simulator Runtime DLL
 add_library(openxr_simulator SHARED
     src/runtime.cpp
