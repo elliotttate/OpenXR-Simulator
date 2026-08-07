@@ -358,6 +358,16 @@ struct PreviewFrame12 {
     UINT64 fenceValue{0};              // last value signalled for this slot; 0 = never submitted
     bool pending{false};               // submitted, not yet painted into the back buffer
     bool recording{false};             // the RT is open and this frame has layers in it
+
+    // What the frame in this slot was, captured when it was recorded rather than when it
+    // is painted. The painter runs a frame or two later, so anything it read live would
+    // label the image with a pose the image was not rendered with -- which is precisely
+    // the question a burst exists to answer.
+    uint32_t frame{0};
+    bool hasProjection{false};
+    float headYaw{0}, headPitch{0}, headRoll{0};
+    float headX{0}, headY{0}, headZ{0};
+    mcp::ProjLogEntry proj{};          // pose the app submitted for this frame
 };
 
 // Everything a Vulkan session needs on top of the D3D12 compositor it shares with a
@@ -5442,13 +5452,20 @@ static bool beginPreviewRT(rt::Session& s, rt::PreviewFrame12& f) {
 }
 
 // Read the composited RT back and hand the slot to the painter.
-static void closePreviewSlot(rt::Session& s) {
+static void closePreviewSlot(rt::Session& s, uint32_t frameCount, bool hasProjection) {
     if (!s.previewSlotOpen) return;
     s.previewSlotOpen = false;
     rt::PreviewFrame12& f = s.previewFrames[s.previewSlot];
     if (!f.recording) return;                       // nothing was recorded this frame
     f.recording = false;
     if (!f.readback || !s.previewRT12) return;
+
+    // Label the slot now, while the pose that produced it is still the live one.
+    f.frame = frameCount;
+    f.hasProjection = hasProjection;
+    f.headYaw = rt::g_headYaw; f.headPitch = rt::g_headPitch; f.headRoll = rt::g_headRoll;
+    f.headX = rt::g_headPos.x; f.headY = rt::g_headPos.y; f.headZ = rt::g_headPos.z;
+    f.proj = mcp::g_lastProjEntry;
 
     const D3D12_RESOURCE_DESC rtDesc = s.previewRT12->GetDesc();
     const UINT rtWidth = (UINT)rtDesc.Width, rtHeight = rtDesc.Height;
@@ -7023,6 +7040,16 @@ static void consumeCompletedPreviewFrame(rt::Session& s) {
     // Every layer of the frame - eyes and quads alike - was composited into the render
     // target on the GPU, so this is one copy of one finished image.
     paintPreviewComposite(s, f);
+
+    // The burst records the frame that was just painted, described by the metadata that
+    // frame was recorded with rather than by whatever the head is doing now.
+    if (mcp::g_burstActive && f.hasProjection && s.previewMemBits) {
+        GdiFlush();
+        mcp::g_lastProjEntry = f.proj;
+        mcp::BurstOnFrame((const uint8_t*)s.previewMemBits, s.previewMemW, s.previewMemH,
+                          s.previewMemStride, f.frame,
+                          f.headYaw, f.headPitch, f.headRoll, f.headX, f.headY, f.headZ);
+    }
 }
 
 static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* info) {
@@ -7213,22 +7240,12 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     // Every layer of this frame has now been recorded, so hand the slot to the painter and
     // paint whichever earlier frame the GPU has finished in the meantime.
     if (rt::g_session.usesD3D12) {
-        closePreviewSlot(rt::g_session);
+        closePreviewSlot(rt::g_session, (uint32_t)frameCount, projectionCount > 0);
         vkrt::FrameSyncEnd(rt::g_session);
+        // Paints a finished composite if there is one, and records it into a running
+        // burst using the metadata it was recorded with.
         consumeCompletedPreviewFrame(rt::g_session);
         captureD3D12Screenshot(rt::g_session);
-        // previewMemDirty for the same reason captureD3D12Screenshot tests it: without it
-        // a frame whose composite is still on the GPU would be recorded as a duplicate of
-        // the previous one.
-        if (mcp::g_burstActive && projectionCount > 0 && rt::g_session.previewMemBits &&
-            rt::g_session.previewMemDirty) {
-            GdiFlush();
-            mcp::BurstOnFrame((const uint8_t*)rt::g_session.previewMemBits,
-                              rt::g_session.previewMemW, rt::g_session.previewMemH,
-                              rt::g_session.previewMemStride, frameCount,
-                              rt::g_headYaw, rt::g_headPitch, rt::g_headRoll,
-                              rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z);
-        }
         presentPreviewBackBuffer(rt::g_session);
     }
 
