@@ -330,6 +330,25 @@ static constexpr UINT kPreviewSrvSlots = 8;
 // c0..c3, tans, uvRect, opts - see kPreviewQuadHLSL.
 static constexpr UINT kQuadConstantCount = 28;
 
+// Preview frames in flight. The preview used to submit its blit and then block the
+// calling thread on a fence until the GPU had finished it, so the readback could be
+// mapped in the same call. That thread is the app's render thread, inside xrEndFrame,
+// and the fence sits behind the app's whole frame (the cross-queue wait in
+// presentProjection puts it there) — so the wait did not cost the blit, it cost the
+// entire GPU frame, every frame, and CPU/GPU overlap stopped existing. Three slots let
+// the composite be submitted and picked up a frame or two later instead, with the CPU
+// never waiting on the GPU at all.
+static constexpr UINT kPreviewFrames = 3;
+
+struct PreviewFrame12 {
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12Resource> readback;   // composited frame, kPreviewRTFormat rows at previewReadbackPitch
+    UINT rtWidth{0}, rtHeight{0};      // size the composite in `readback` was rendered at
+    UINT64 fenceValue{0};              // last value signalled for this slot; 0 = never submitted
+    bool pending{false};               // submitted, not yet painted into the back buffer
+    bool recording{false};             // the RT is open and this frame has layers in it
+};
+
 struct Session {
     XrSession handle{(XrSession)1};
     XrSessionState state{XR_SESSION_STATE_IDLE};
@@ -349,8 +368,13 @@ struct Session {
     ComPtr<ID3D12Fence> crossQueueFence;
     UINT64 crossQueueFenceValue{0};
     ComPtr<ID3D12Resource> previewRT12;         // offscreen render target (replaces swapchain backbuffer)
-    ComPtr<ID3D12Resource> previewReadback12;   // CPU-readable buffer for GDI blit
     UINT previewReadbackPitch{0};               // row pitch aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+    // Frames in flight. The composite of each one hangs off its own slot, so nothing is
+    // mapped while the GPU may still be writing it and nothing has to be waited for to
+    // be reused.
+    PreviewFrame12 previewFrames[kPreviewFrames];
+    UINT previewSlot{0};                        // slot this frame records into
+    bool previewSlotOpen{false};                // previewSlot's allocator is reset and being recorded
     // Preview back buffer (D3D12/GDI): every layer paints into this memory DC, which is
     // blitted to the window once per frame. Painting layers straight to the window makes
     // the eye blit erase overlays for the length of the quad readback that follows it,
@@ -363,12 +387,10 @@ struct Session {
     int previewMemW{0};
     int previewMemH{0};
     bool previewMemDirty{false};
-    ComPtr<ID3D12CommandAllocator> previewCmdAlloc;
     ComPtr<ID3D12GraphicsCommandList> previewCmdList;
     ComPtr<ID3D12Fence> previewFence;
     HANDLE previewFenceEvent{nullptr};
-    UINT64 previewFenceValue{0};
-    bool previewRecording{false};               // the RT is open and this frame has layers in it
+    UINT64 previewFenceValue{0};                // last value signalled on previewQueue12
     // Scaling pipeline for the D3D12 preview. The eyes are drawn into the RT at the size
     // the window shows them, so the readback that follows is the window's pixel count and
     // not the stereo render's - a 5120x1440 submission mirrored into a 1280x360 fit rect
@@ -1185,21 +1207,50 @@ static DXGI_FORMAT PreviewSrvFormat(DXGI_FORMAT resourceFormat) {
     }
 }
 
+// Block until the last composite handed to the preview queue has run. Leaves the pending
+// slots alone, so whatever is waiting to be painted still gets painted.
+static void WaitForPreviewFence(rt::Session& s) {
+    if (!s.previewFence || !s.previewFenceEvent || s.previewFenceValue == 0) return;
+    if (s.previewFence->GetCompletedValue() < s.previewFenceValue) {
+        s.previewFence->SetEventOnCompletion(s.previewFenceValue, s.previewFenceEvent);
+        WaitForSingleObject(s.previewFenceEvent, 1000);
+    }
+}
+
+// Block until nothing the preview queue has submitted is still running, so the
+// resources it reads can be dropped.
+static void WaitForPreviewIdle(rt::Session& s) {
+    WaitForPreviewFence(s);
+    // Nothing is in flight any more, so no slot is waiting to be picked up either.
+    for (UINT i = 0; i < rt::kPreviewFrames; ++i) {
+        s.previewFrames[i].pending = false;
+        s.previewFrames[i].recording = false;
+    }
+    s.previewSlotOpen = false;
+}
+
 // Just the resources that depend on the preview's size. The window is resizable and
 // the RT tracks its client area, so this runs on every resize step - the queue, fences
 // and command list have to survive it. Recreating the cross-queue fence in particular
 // would drop a signal the app's own queue is mid-flight on.
 static void ResetD3D12PreviewSurfaces(rt::Session& s) {
+    WaitForPreviewIdle(s);
     s.previewRT12.Reset();
     s.previewRtvHeap.Reset();
-    s.previewReadback12.Reset();
+    for (UINT i = 0; i < rt::kPreviewFrames; ++i) {
+        s.previewFrames[i].readback.Reset();
+        s.previewFrames[i].rtWidth = s.previewFrames[i].rtHeight = 0;
+    }
     s.previewReadbackPitch = 0;
-    s.previewRecording = false;
 }
 
 static void ResetD3D12PreviewResources(rt::Session& s) {
     ResetD3D12PreviewSurfaces(s);
-    s.previewCmdAlloc.Reset();
+    for (UINT i = 0; i < rt::kPreviewFrames; ++i) {
+        s.previewFrames[i] = rt::PreviewFrame12{};
+    }
+    s.previewSlot = 0;
+    s.previewSlotOpen = false;
     s.previewCmdList.Reset();
     s.previewFence.Reset();
     s.previewFenceValue = 0;
@@ -3905,21 +3956,28 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         readbackDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_HEAP_PROPERTIES readbackHeap = {};
         readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
-        hr = s.d3d12Device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE,
-            &readbackDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(s.previewReadback12.GetAddressOf()));
-        if (FAILED(hr)) {
-            Logf("[SimXR] DX12 preview: CreateCommittedResource (readback) failed 0x%08X", (unsigned)hr);
-            s.previewRT12.Reset();
-            return;
+        for (UINT i = 0; i < rt::kPreviewFrames; ++i) {
+            hr = s.d3d12Device->CreateCommittedResource(&readbackHeap, D3D12_HEAP_FLAG_NONE,
+                &readbackDesc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(s.previewFrames[i].readback.ReleaseAndGetAddressOf()));
+            if (FAILED(hr)) {
+                Logf("[SimXR] DX12 preview: CreateCommittedResource (readback %u) failed 0x%08X", i, (unsigned)hr);
+                s.previewRT12.Reset();
+                return;
+            }
         }
 
-        // Command allocator, list and fence are size-independent, so a resize keeps them
-        // and the fence counter carries on where it was.
-        if (!s.previewCmdAlloc) {
-            s.d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(s.previewCmdAlloc.GetAddressOf()));
+        // Command list, per-slot allocators and the fence are size-independent, so a
+        // resize keeps them and the fence counter carries on where it was.
+        for (UINT i = 0; i < rt::kPreviewFrames; ++i) {
+            if (!s.previewFrames[i].alloc) {
+                s.d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(s.previewFrames[i].alloc.GetAddressOf()));
+            }
         }
-        if (!s.previewCmdList && s.previewCmdAlloc) {
-            s.d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.previewCmdAlloc.Get(), nullptr, IID_PPV_ARGS(s.previewCmdList.GetAddressOf()));
+        if (!s.previewCmdList && s.previewFrames[0].alloc) {
+            s.d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                s.previewFrames[0].alloc.Get(), nullptr, IID_PPV_ARGS(s.previewCmdList.GetAddressOf()));
             s.previewCmdList->Close();
         }
         if (!s.previewFence) {
@@ -3927,7 +3985,8 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
             s.previewFenceValue = 0;
             s.previewFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
         }
-        Logf("[SimXR] DX12 preview: GPU-scaled readback initialized (%ux%u, pitch=%u)", width, height, rowPitch);
+        Logf("[SimXR] DX12 preview: GPU-scaled readback initialized (%ux%u, pitch=%u, %u frames in flight)",
+             width, height, rowPitch, rt::kPreviewFrames);
         return;
     }
 }
@@ -4294,18 +4353,34 @@ static void presentPreviewBackBuffer(rt::Session& s) {
     s.previewMemDirty = false;
 }
 
-// --- Preview frame compositing (D3D12) ---------------------------------------------------------
+// --- Preview frame slots (D3D12) --------------------------------------------------------------
+
+// Open this frame's slot, or nullptr if all of them are still on the GPU. The eye composite
+// and every quad layer of a frame share one slot and one allocator: whichever pass runs first
+// resets the allocator, later passes only reset the command list, and xrEndFrame closes the
+// slot. Returning nullptr drops the frame from the preview, which is the whole point — the
+// caller is the app's render thread and must never wait for the GPU here.
+static rt::PreviewFrame12* beginPreviewSlot(rt::Session& s) {
+    if (!s.previewFence || !s.previewCmdList || !s.previewQueue12) return nullptr;
+    rt::PreviewFrame12& f = s.previewFrames[s.previewSlot];
+    if (s.previewSlotOpen) return &f;
+    // Still executing, or still holding a composite the painter has not picked up.
+    if (f.pending || f.fenceValue > s.previewFence->GetCompletedValue()) return nullptr;
+    if (!f.alloc || FAILED(f.alloc->Reset())) return nullptr;
+    f.recording = false;
+    s.previewSlotOpen = true;
+    return &f;
+}
 
 // Open the render target for this frame's layers. Idempotent: whichever layer pass runs
 // first pays for the command-list reset, the transition and the clear, and the rest just
 // draw. Every layer of a frame therefore lands in one RT and comes back in one readback,
 // which is also why the mirror can no longer show the eyes for a moment without the HUD
 // over them - the two are never in the back buffer separately.
-static bool beginPreviewRT(rt::Session& s) {
-    if (s.previewRecording) return true;
-    if (!s.previewRT12 || !s.previewRtvHeap || !s.previewCmdList || !s.previewCmdAlloc) return false;
-    if (FAILED(s.previewCmdAlloc->Reset())) return false;
-    if (FAILED(s.previewCmdList->Reset(s.previewCmdAlloc.Get(), nullptr))) return false;
+static bool beginPreviewRT(rt::Session& s, rt::PreviewFrame12& f) {
+    if (f.recording) return true;
+    if (!s.previewRT12 || !s.previewRtvHeap) return false;
+    if (FAILED(s.previewCmdList->Reset(f.alloc.Get(), nullptr))) return false;
 
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -4323,21 +4398,86 @@ static bool beginPreviewRT(rt::Session& s) {
     const float clearBlack[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     s.previewCmdList->ClearRenderTargetView(rtv, clearBlack, 0, nullptr);
 
-    s.previewRecording = true;
+    f.recording = true;
     return true;
 }
 
-// Copy the finished composite into the GDI back buffer. The RT was rendered at the client
-// area's size and in the DIB's own BGRA layout, so this is a straight row copy - no GDI
-// scaling, no swizzle. The centering absorbs a resize that landed after ensurePreviewSized
-// ran: the image sits in the middle of the new client area for one frame rather than being
-// torn or written out of bounds.
-static void paintPreviewComposite(rt::Session& s, UINT rtWidth, UINT rtHeight) {
-    if (!s.previewReadback12 || !s.hwnd || rtWidth == 0 || rtHeight == 0) return;
+// Read the composited RT back and hand the slot to the painter.
+static void closePreviewSlot(rt::Session& s) {
+    if (!s.previewSlotOpen) return;
+    s.previewSlotOpen = false;
+    rt::PreviewFrame12& f = s.previewFrames[s.previewSlot];
+    if (!f.recording) return;                       // nothing was recorded this frame
+    f.recording = false;
+    if (!f.readback || !s.previewRT12) return;
+
+    const D3D12_RESOURCE_DESC rtDesc = s.previewRT12->GetDesc();
+    const UINT rtWidth = (UINT)rtDesc.Width, rtHeight = rtDesc.Height;
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = s.previewRT12.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    s.previewCmdList->ResourceBarrier(1, &barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = f.readback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint.Format = rt::kPreviewRTFormat;
+    dst.PlacedFootprint.Footprint.Width = rtWidth;
+    dst.PlacedFootprint.Footprint.Height = rtHeight;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = s.previewReadbackPitch;
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = s.previewRT12.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    s.previewCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    s.previewCmdList->ResourceBarrier(1, &barrier);
+    s.previewCmdList->Close();
+
+    // Order the read of the app's swapchain images after the app's own frame work.
+    if (s.crossQueueFence && s.d3d12Queue) {
+        s.crossQueueFenceValue++;
+        s.d3d12Queue->Signal(s.crossQueueFence.Get(), s.crossQueueFenceValue);
+        s.previewQueue12->Wait(s.crossQueueFence.Get(), s.crossQueueFenceValue);
+    }
+    ID3D12CommandList* lists[] = { s.previewCmdList.Get() };
+    s.previewQueue12->ExecuteCommandLists(1, lists);
+    const UINT64 value = ++s.previewFenceValue;
+    s.previewQueue12->Signal(s.previewFence.Get(), value);
+
+    // The preview reads the app's swapchain images on its own queue. The CPU wait this path
+    // used to do was also what kept the app from rendering the next frame into those images
+    // while the read was still in flight, so with the wait gone the app's queue has to be
+    // told to wait for the read instead. It is a GPU-side wait on work already ahead of it
+    // in the pipeline, so unlike the CPU wait it costs nothing.
+    if (s.d3d12Queue) s.d3d12Queue->Wait(s.previewFence.Get(), value);
+
+    f.fenceValue = value;
+    f.rtWidth = rtWidth;
+    f.rtHeight = rtHeight;
+    f.pending = true;
+    s.previewSlot = (s.previewSlot + 1) % rt::kPreviewFrames;
+}
+
+// Copy a finished composite into the GDI back buffer. The RT was rendered at the fit rect's
+// size and in the DIB's own BGRA layout, so this is a straight row copy - no GDI scaling, no
+// swizzle. The centering absorbs a resize that landed after ensurePreviewSized ran: the image
+// sits in the middle of the new client area for one frame rather than being torn or written
+// out of bounds.
+static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
+    if (!f.readback || !s.hwnd || f.rtWidth == 0 || f.rtHeight == 0) return;
 
     void* mapped = nullptr;
-    D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * rtHeight };
-    if (FAILED(s.previewReadback12->Map(0, &readRange, &mapped)) || !mapped) return;
+    D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * f.rtHeight };
+    if (FAILED(f.readback->Map(0, &readRange, &mapped)) || !mapped) return;
 
     RECT cr{};
     GetClientRect(s.hwnd, &cr);
@@ -4349,10 +4489,10 @@ static void paintPreviewComposite(rt::Session& s, UINT rtWidth, UINT rtHeight) {
         // before writing the same pixels by hand.
         GdiFlush();
 
-        const int dstX = (clientW - (int)rtWidth) / 2;
-        const int dstY = (clientH - (int)rtHeight) / 2;
-        const int x0 = (std::max)(0, dstX), x1 = (std::min)(clientW, dstX + (int)rtWidth);
-        const int y0 = (std::max)(0, dstY), y1 = (std::min)(clientH, dstY + (int)rtHeight);
+        const int dstX = (clientW - (int)f.rtWidth) / 2;
+        const int dstY = (clientH - (int)f.rtHeight) / 2;
+        const int x0 = (std::max)(0, dstX), x1 = (std::min)(clientW, dstX + (int)f.rtWidth);
+        const int y0 = (std::max)(0, dstY), y1 = (std::min)(clientH, dstY + (int)f.rtHeight);
         const int copyW = (std::max)(0, x1 - x0);
 
         uint8_t* dstBase = (uint8_t*)s.previewMemBits;
@@ -4372,66 +4512,7 @@ static void paintPreviewComposite(rt::Session& s, UINT rtWidth, UINT rtHeight) {
         s.previewMemDirty = true;
     }
     D3D12_RANGE writeRange = { 0, 0 };
-    s.previewReadback12->Unmap(0, &writeRange);
-}
-
-// Read the composited RT back and paint it. Called once per frame, after every layer of
-// that frame has been recorded into the target.
-static void closePreviewFrame(rt::Session& s) {
-    if (!s.previewRecording) return;
-    s.previewRecording = false;
-    if (!s.previewReadback12 || !s.previewRT12) return;
-
-    const D3D12_RESOURCE_DESC rtDesc = s.previewRT12->GetDesc();
-    const UINT rtWidth = (UINT)rtDesc.Width, rtHeight = rtDesc.Height;
-
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = s.previewRT12.Get();
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    s.previewCmdList->ResourceBarrier(1, &barrier);
-
-    D3D12_TEXTURE_COPY_LOCATION dst = {};
-    dst.pResource = s.previewReadback12.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint.Offset = 0;
-    dst.PlacedFootprint.Footprint.Format = rt::kPreviewRTFormat;
-    dst.PlacedFootprint.Footprint.Width = rtWidth;
-    dst.PlacedFootprint.Footprint.Height = rtHeight;
-    dst.PlacedFootprint.Footprint.Depth = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = s.previewReadbackPitch;
-    D3D12_TEXTURE_COPY_LOCATION src = {};
-    src.pResource = s.previewRT12.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = 0;
-    s.previewCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-    s.previewCmdList->ResourceBarrier(1, &barrier);
-    s.previewCmdList->Close();
-
-    // Order the read of the app's swapchain images after the app's own frame work. One
-    // signal per frame now that every layer shares a submission, where the eye pass and
-    // each quad layer used to raise their own.
-    if (s.crossQueueFence && s.d3d12Queue) {
-        s.crossQueueFenceValue++;
-        s.d3d12Queue->Signal(s.crossQueueFence.Get(), s.crossQueueFenceValue);
-        s.previewQueue12->Wait(s.crossQueueFence.Get(), s.crossQueueFenceValue);
-    }
-
-    ID3D12CommandList* lists[] = { s.previewCmdList.Get() };
-    s.previewQueue12->ExecuteCommandLists(1, lists);
-    const UINT64 value = ++s.previewFenceValue;
-    s.previewQueue12->Signal(s.previewFence.Get(), value);
-    if (s.previewFence->GetCompletedValue() < value) {
-        s.previewFence->SetEventOnCompletion(value, s.previewFenceEvent);
-        WaitForSingleObject(s.previewFenceEvent, 1000);
-    }
-
-    paintPreviewComposite(s, rtWidth, rtHeight);
+    f.readback->Unmap(0, &writeRange);
 }
 
 // Draws the eye swapchains, scaled, into the offscreen RT, reads that back and copies it
@@ -4459,10 +4540,13 @@ static void blitD3D12ToPreview(rt::Session& s,
         return;
     }
 
+    // All three frames still on the GPU: skip this one instead of waiting for it.
+    rt::PreviewFrame12* slot = beginPreviewSlot(s);
+    if (!slot || !slot->readback) return;
     // The RT is the size the window shows, so this pass is also the downscale: each eye
     // is drawn into its half of it, filtered, instead of copied at full resolution and
     // resampled on the CPU afterwards.
-    if (!beginPreviewRT(s)) return;
+    if (!beginPreviewRT(s, *slot)) return;
 
     ID3D12Resource* renderTarget = s.previewRT12.Get();
 
@@ -4633,8 +4717,8 @@ static void blitD3D12ToPreview(rt::Session& s,
 
     static int blitCount = 0;
     if (g_logVerbose && ++blitCount % 60 == 1) {
-        Logf("[SimXR] blitD3D12ToPreview: L[%u] R[%u] into a %ux%u target",
-             leftIdx, rightIdx, rtWidth, rtHeight);
+        Logf("[SimXR] blitD3D12ToPreview: L[%u] R[%u] (%ux%u) recorded into slot %u",
+             leftIdx, rightIdx, rtWidth, rtHeight, s.previewSlot);
     }
 }
 
@@ -5276,7 +5360,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             if (!s.previewRT12) return;
 
             // The cross-queue sync that orders this read after the app's own frame work
-            // is raised once for the whole frame, in closePreviewFrame.
+            // is raised once for the whole frame, in closePreviewSlot.
 
             // Blit using D3D12 copy commands → readback → GDI (no DXGI Present, no hook conflicts)
             if (proj.viewCount > 1) {
@@ -5367,10 +5451,12 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         const D3D12_RESOURCE_DESC qd = quadTex->GetDesc();
         if (qd.SampleDesc.Count > 1) return;      // needs a resolve first; not worth it for a mirror
 
-        // Share this frame's open render target with the eye pass. On a quad-only frame
-        // nothing has opened it yet, so this is what clears it - which is also what
-        // replaces the old "wipe the back buffer to black" step.
-        if (!beginPreviewRT(s)) return;
+        // Share this frame's slot and its open render target with the eye pass. On a
+        // quad-only frame nothing has opened the RT yet, so this is what clears it - which
+        // is also what replaces the old "wipe the back buffer to black" step.
+        rt::PreviewFrame12* slot = beginPreviewSlot(s);
+        if (!slot) return;
+        if (!beginPreviewRT(s, *slot)) return;
 
         const D3D12_RESOURCE_DESC rtDesc = s.previewRT12->GetDesc();
         const int rtWidth = (int)rtDesc.Width, rtHeight = (int)rtDesc.Height;
@@ -5906,6 +5992,35 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     s.d3d11Context->PSSetShaderResources(0, 1, nullSRV);
 }
 
+// Draw the newest preview frame the GPU has actually finished into the GDI back buffer.
+// Nothing here waits: a frame that is not ready yet stays pending and is picked up on a
+// later call, and if two are ready only the newest is painted - painting the older one
+// first would just be overdrawn in the same call.
+static void consumeCompletedPreviewFrame(rt::Session& s) {
+    if (!s.previewFence || !s.hwnd) return;
+    const UINT64 done = s.previewFence->GetCompletedValue();
+
+    int newest = -1;
+    for (UINT i = 0; i < rt::kPreviewFrames; ++i) {
+        const rt::PreviewFrame12& f = s.previewFrames[i];
+        if (!f.pending || f.fenceValue > done) continue;
+        if (newest < 0 || f.fenceValue > s.previewFrames[newest].fenceValue) newest = (int)i;
+    }
+    if (newest < 0) return;
+
+    for (UINT i = 0; i < rt::kPreviewFrames; ++i) {
+        rt::PreviewFrame12& f = s.previewFrames[i];
+        if (f.pending && f.fenceValue <= done && (int)i != newest) f.pending = false;
+    }
+
+    rt::PreviewFrame12& f = s.previewFrames[newest];
+    f.pending = false;
+
+    // Every layer of the frame - eyes and quads alike - was composited into the render
+    // target on the GPU, so this is one copy of one finished image.
+    paintPreviewComposite(s, f);
+}
+
 static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* info) {
     // Reentrance guard: when our preview swapchain calls Present(), Steam's overlay
     // (gameoverlayrenderer64) hooks it, which can trigger UEVR to re-submit frames
@@ -6021,8 +6136,10 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
             // D3D12 normally clears as part of opening the render target, which whichever
             // layer pass runs first does - so the black and the layers over it reach the
             // window in one repaint. A frame carrying no layers at all has no such pass,
-            // so open the target here to wipe the last 3D frame off the mirror.
-            beginPreviewRT(rt::g_session);
+            // so open and close the target here to wipe the last 3D frame off the mirror.
+            if (rt::PreviewFrame12* slot = beginPreviewSlot(rt::g_session)) {
+                beginPreviewRT(rt::g_session, *slot);
+            }
         }
     }
 
@@ -6046,10 +6163,11 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         }
     }
 
-    // Every layer of this frame has now been recorded, so read the composite back and
-    // show it in one blit.
+    // Every layer of this frame has now been recorded, so hand the slot to the painter and
+    // paint whichever earlier frame the GPU has finished in the meantime.
     if (rt::g_session.usesD3D12) {
-        closePreviewFrame(rt::g_session);
+        closePreviewSlot(rt::g_session);
+        consumeCompletedPreviewFrame(rt::g_session);
         if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
         captureD3D12Screenshot(rt::g_session);
         presentPreviewBackBuffer(rt::g_session);
@@ -6513,6 +6631,12 @@ static XrResult XRAPI_PTR xrGetInputSourceLocalizedName_runtime(XrSession, const
 static XrResult XRAPI_PTR xrDestroySwapchain_runtime(XrSwapchain sc) {
     auto it = rt::g_swapchains.find(sc);
     if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
+
+    // A D3D12 command list does not keep the resources it references alive, and the
+    // preview no longer waits for its own submissions inside xrEndFrame - so a composite
+    // reading these images can still be queued. Dropping the last reference here would
+    // pull them out from under it. Not on any frame path, so the wait costs nothing.
+    if (rt::g_session.usesD3D12) rt::WaitForPreviewIdle(rt::g_session);
 
     // For OpenGL swapchains, delete the textures
     if (it->second.backend == rt::Swapchain::Backend::OpenGL && !it->second.imagesGL.empty()) {
