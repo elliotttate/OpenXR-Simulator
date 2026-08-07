@@ -704,6 +704,176 @@ inline bool CheckProjLogDumpRequest() {
     return true;
 }
 
+// ---------- Frame-burst capture ----------
+//
+// Records N consecutive composited preview frames into RAM and flushes them as
+// burst_NNN.bmp plus burst_manifest.json when the burst completes. The manifest
+// carries, per frame, the simulator head pose that was active AND the pose the
+// app embedded in its projection layer that frame — so a caller can see exactly
+// which frame the app's render pose picked up a commanded step, and compare
+// that against what the pixels show. Built for chasing multi-frame settling
+// artifacts (shadows lagging a head-pose whip) that a one-shot screenshot
+// round-trip is far too slow to catch.
+//
+// D3D12 sessions only: BurstOnFrame records the preview's DIB back buffer, which
+// is the one place a composited frame exists in CPU memory. A D3D11 or OpenGL
+// session acks the command as failed rather than recording it.
+//
+// Drive it by writing burst_command.json:
+//   {"frames": 32, "pose": {"yaw": 25, "pitch": 0, "x": 0, "y": 1.7, "z": 0}}
+// "pose" is optional (omit to just record), "roll" inside it is optional.
+// The pose step is applied at the same frame boundary the burst starts on, and
+// the first captured frame is the frame submitted THAT boundary — i.e. still
+// rendered with the old pose, giving a baseline. Poll burst_done.json.
+
+struct BurstCommand {
+    bool valid = false;
+    int  frames = 16;
+    HeadPoseCommand pose;   // pose.valid == step the head pose at burst start
+};
+
+inline BurstCommand CheckBurstCommand() {
+    BurstCommand cmd;
+    std::string p = GetSimulatorDataPath() + "\\burst_command.json";
+    FILE* f = nullptr;
+    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    DeleteFileA(p.c_str());
+
+    json::Object o(buf);
+    if (!o.valid()) return cmd;
+    cmd.valid = true;
+    cmd.frames = (int)o.number("frames", 16.0f);
+    if (cmd.frames < 1) cmd.frames = 1;
+    if (cmd.frames > 64) cmd.frames = 64;
+    json::Object pose = o.object("pose");
+    if (pose.valid()) {
+        cmd.pose.valid = true;
+        cmd.pose.x = pose.number("x", 0.0f);
+        cmd.pose.y = pose.number("y", 1.7f);
+        cmd.pose.z = pose.number("z", 0.0f);
+        cmd.pose.yaw = pose.number("yaw", 0.0f);
+        cmd.pose.pitch = pose.number("pitch", 0.0f);
+        cmd.pose.hasRoll = pose.has("roll");
+        if (cmd.pose.hasRoll) cmd.pose.roll = pose.number("roll", 0.0f);
+    }
+    McpLogf("Burst command: frames=%d stepPose=%d", cmd.frames, cmd.pose.valid ? 1 : 0);
+    return cmd;
+}
+
+struct BurstFrameMeta {
+    uint32_t frame = 0;
+    float headYaw = 0, headPitch = 0, headRoll = 0;
+    float headX = 0, headY = 0, headZ = 0;
+    ProjLogEntry proj;      // app-submitted pose/FOV for this frame
+    double tMs = 0;
+};
+
+inline bool g_burstActive = false;
+inline int  g_burstTotal = 0;
+inline uint32_t g_burstW = 0, g_burstH = 0;
+inline std::vector<std::vector<uint8_t>> g_burstPixels;   // tight BGRX rows
+inline std::vector<BurstFrameMeta> g_burstMeta;
+inline ProjLogEntry g_lastProjEntry;   // most recent projection-layer submit
+
+inline void BurstStart(int frames) {
+    // Clear the previous burst's outputs so a poller can't mix runs.
+    std::string dataPath = GetSimulatorDataPath();
+    DeleteFileA((dataPath + "\\burst_done.json").c_str());
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA((dataPath + "\\burst_*.bmp").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do { DeleteFileA((dataPath + "\\" + fd.cFileName).c_str()); } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    DeleteFileA((dataPath + "\\burst_manifest.json").c_str());
+
+    g_burstPixels.clear();
+    g_burstMeta.clear();
+    g_burstPixels.reserve(frames);
+    g_burstMeta.reserve(frames);
+    g_burstTotal = frames;
+    g_burstW = 0;
+    g_burstH = 0;
+    g_burstActive = true;
+    McpLogf("Burst started: %d frames", frames);
+}
+
+inline void BurstFlush() {
+    g_burstActive = false;
+    std::string dataPath = GetSimulatorDataPath();
+    size_t n = g_burstMeta.size();
+    for (size_t i = 0; i < n; ++i) {
+        char name[64];
+        snprintf(name, sizeof(name), "burst_%03u.bmp", (unsigned)i);
+        SavePixelsToBMP(g_burstPixels[i].data(), g_burstW, g_burstH,
+                        (dataPath + "\\" + name).c_str(), (int)g_burstW * 4, true);
+    }
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, (dataPath + "\\burst_manifest.json").c_str(), "w") == 0 && f) {
+        fprintf(f, "{\n  \"width\": %u,\n  \"height\": %u,\n  \"count\": %u,\n  \"frames\": [\n",
+                g_burstW, g_burstH, (unsigned)n);
+        for (size_t i = 0; i < n; ++i) {
+            const BurstFrameMeta& m = g_burstMeta[i];
+            fprintf(f, "    {\"i\": %u, \"file\": \"burst_%03u.bmp\", \"frame\": %u, \"t_ms\": %.2f, "
+                    "\"head\": {\"yaw\": %.4f, \"pitch\": %.4f, \"roll\": %.4f, \"x\": %.4f, \"y\": %.4f, \"z\": %.4f}, "
+                    "\"submitted\": {\"frame\": %u, \"qx\": %.6f, \"qy\": %.6f, \"qz\": %.6f, \"qw\": %.6f, "
+                    "\"x\": %.4f, \"y\": %.4f, \"z\": %.4f}}%s\n",
+                    (unsigned)i, (unsigned)i, m.frame, m.tMs,
+                    m.headYaw, m.headPitch, m.headRoll, m.headX, m.headY, m.headZ,
+                    m.proj.frame, m.proj.poseQx, m.proj.poseQy, m.proj.poseQz, m.proj.poseQw,
+                    m.proj.posX, m.proj.posY, m.proj.posZ,
+                    (i + 1 < n) ? "," : "");
+        }
+        fprintf(f, "  ]\n}\n");
+        fclose(f);
+    }
+
+    if (fopen_s(&f, (dataPath + "\\burst_done.json").c_str(), "w") == 0 && f) {
+        fprintf(f, "{\"count\": %u, \"width\": %u, \"height\": %u}\n", (unsigned)n, g_burstW, g_burstH);
+        fclose(f);
+    }
+
+    g_burstPixels.clear();
+    McpLogf("Burst flushed: %u frames (%ux%u)", (unsigned)n, g_burstW, g_burstH);
+}
+
+inline void BurstOnFrame(const uint8_t* bits, int w, int h, int stride, uint32_t frameCount,
+                         float headYaw, float headPitch, float headRoll,
+                         float headX, float headY, float headZ) {
+    if (!g_burstActive || !bits || w <= 0 || h <= 0) return;
+    if (g_burstW == 0) {
+        g_burstW = (uint32_t)w;
+        g_burstH = (uint32_t)h;
+    } else if (g_burstW != (uint32_t)w || g_burstH != (uint32_t)h) {
+        // Window resized mid-burst: flush what we have rather than mixing sizes.
+        BurstFlush();
+        return;
+    }
+
+    std::vector<uint8_t> frame((size_t)w * h * 4);
+    for (int y = 0; y < h; ++y) {
+        memcpy(frame.data() + (size_t)y * w * 4, bits + (size_t)y * stride, (size_t)w * 4);
+    }
+    g_burstPixels.push_back(std::move(frame));
+
+    BurstFrameMeta m;
+    m.frame = frameCount;
+    m.headYaw = headYaw; m.headPitch = headPitch; m.headRoll = headRoll;
+    m.headX = headX; m.headY = headY; m.headZ = headZ;
+    m.proj = g_lastProjEntry;
+    m.tMs = (double)GetTickCount64();
+    g_burstMeta.push_back(m);
+
+    if ((int)g_burstMeta.size() >= g_burstTotal) {
+        BurstFlush();
+    }
+}
+
 // Controller pose control structure for MCP
 // Allows setting right or left controller position/orientation and trigger
 struct ControllerPoseCommand {

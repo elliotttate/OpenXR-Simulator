@@ -6148,15 +6148,41 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
-    // Drain the request that decides whether this frame has to reach the mirror, before
+    // Drain the requests that decide whether this frame has to reach the mirror, before
     // deciding it. Every backend's screenshot path then just tests g_screenshotRequested.
     if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
 
+    // Frame-burst capture: the optional pose step lands at this frame boundary,
+    // so the frame submitted right now (rendered with the OLD pose) is the
+    // burst's baseline and every later frame shows the app catching up.
+    if (mcp::g_commandsDue) {
+        mcp::BurstCommand bc = mcp::CheckBurstCommand();
+        if (bc.valid && !rt::g_session.usesD3D12) {
+            // A burst is recorded out of the D3D12 preview's DIB back buffer, the only place
+            // a composited frame sits in CPU memory. The D3D11 and OpenGL previews go
+            // straight to a swapchain, so say so rather than leaving a poller waiting on a
+            // burst_done.json that is never coming.
+            Log("[SimXR] burst: only D3D12 sessions can be recorded");
+            mcp::WriteCommandAck("burst", false);
+        } else if (bc.valid) {
+            if (bc.pose.valid) {
+                rt::g_headPos.x = bc.pose.x;
+                rt::g_headPos.y = bc.pose.y;
+                rt::g_headPos.z = bc.pose.z;
+                rt::g_headYaw = bc.pose.yaw;
+                rt::g_headPitch = bc.pose.pitch;
+                if (bc.pose.hasRoll) rt::g_headRoll = bc.pose.roll;
+            }
+            mcp::BurstStart(bc.frames);
+            mcp::WriteCommandAck("burst", true);
+        }
+    }
+
     // Decide once, here, whether the mirror updates this frame; every preview path below
-    // hangs off it (see g_previewDueThisFrame). A pending screenshot overrides the cap - it
-    // asked for a particular frame, not for the next one the rate happens to allow, and
-    // with the mirror off there would be no next one.
-    g_previewDueThisFrame = ui::PreviewFrameDue() || mcp::g_screenshotRequested;
+    // hangs off it (see g_previewDueThisFrame). A pending screenshot or a running burst
+    // overrides the cap - both asked for a particular frame, not for the next one the rate
+    // happens to allow, and with the mirror off there would be no next one.
+    g_previewDueThisFrame = ui::PreviewFrameDue() || mcp::g_screenshotRequested || mcp::g_burstActive;
 
     if (shouldLog) {
         Logf("[SimXR] xrEndFrame: layers=%u", info->layerCount);
@@ -6216,6 +6242,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
                 mcp::g_projLog[mcp::g_projLogHead] = e;
                 mcp::g_projLogHead = (mcp::g_projLogHead + 1) % mcp::PROJ_LOG_CAPACITY;
                 if (mcp::g_projLogCount < mcp::PROJ_LOG_CAPACITY) ++mcp::g_projLogCount;
+                mcp::g_lastProjEntry = e;
             }
 
             presentProjection(rt::g_session, *proj, hasOverlays);  // skipPresent if overlays pending
@@ -6269,6 +6296,18 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         closePreviewSlot(rt::g_session);
         consumeCompletedPreviewFrame(rt::g_session);
         captureD3D12Screenshot(rt::g_session);
+        // previewMemDirty means consumeCompletedPreviewFrame actually painted something
+        // this call. Without it a frame whose composite is still on the GPU would be
+        // captured as a duplicate of the previous one.
+        if (mcp::g_burstActive && projectionCount > 0 && rt::g_session.previewMemBits &&
+            rt::g_session.previewMemDirty) {
+            GdiFlush();
+            mcp::BurstOnFrame((const uint8_t*)rt::g_session.previewMemBits,
+                              rt::g_session.previewMemW, rt::g_session.previewMemH,
+                              rt::g_session.previewMemStride, frameCount,
+                              rt::g_headYaw, rt::g_headPitch, rt::g_headRoll,
+                              rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z);
+        }
         presentPreviewBackBuffer(rt::g_session);
     }
 
