@@ -48,6 +48,10 @@ if(WIN32)
         UNICODE
         _UNICODE
     )
+    if(MSVC)
+        # Without this MSVC decodes the UTF-8 sources as the system ANSI codepage.
+        target_compile_options(openxr_simulator PRIVATE /utf-8)
+    endif()
 endif()
 
 # Generate OpenXR runtime manifest
