@@ -88,6 +88,27 @@ barrier, exactly as `Layer3D::RecordRender` does, which is the only way
 resource-state bugs show up at all. An earlier version only did
 acquire/wait/release and passed a runtime that was corrupting every frame.
 
+## Vulkan sessions
+
+```powershell
+.\probe\run_xr_probe.ps1 -Vulkan
+.\probe\run_xr_probe.ps1 -Vulkan -Enable1
+```
+
+`probe/xr_probe_vk.cpp` is the same replay over `XR_KHR_vulkan_enable2` (or
+`XR_KHR_vulkan_enable` with `-Enable1`), for the native-Vulkan BetterVR: the runtime's
+`xrCreateVulkanInstanceKHR` / `xrCreateVulkanDeviceKHR` / `xrGetVulkanGraphicsDevice2KHR`
+handshake, `VkFormat` swapchains, and a real render pass into every acquired image whose
+`initialLayout` claims the runtime already put it in `COLOR_ATTACHMENT_OPTIMAL`.
+
+It runs with `VK_LAYER_KHRONOS_validation`, and proves the layer is watching by provoking a
+harmless VUID first — a probe whose callback is silent passes every runtime, which is the
+same trap the D3D12 probe fell into once. Note the one thing it *cannot* catch: Vulkan
+validation does not track image layouts for images backed by imported external memory, so a
+runtime handing swapchain images over in the wrong layout goes unreported here. That
+guarantee is covered instead by the two probes producing a pixel-identical preview: run
+either one with `XR_PROBE_PROJECTION_ONLY=1` and compare screenshots.
+
 ## Differences from the Meta simulator
 
 - `xrGetInstanceProperties` reports `"OpenXR Simulator Runtime"`, so BetterVR's
