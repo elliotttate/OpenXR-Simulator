@@ -291,8 +291,6 @@ static DXGI_FORMAT ToTypeless(DXGI_FORMAT format) {
 // Released from WndProc and instance teardown, both of which run long before the D3D12
 // preview path where it is defined.
 namespace rt { struct Session; }
-static void destroyPreviewBackBuffer(rt::Session& s);
-
 // Runtime state
 namespace rt {
 
@@ -427,14 +425,6 @@ struct Session {
     // blitted to the window once per frame. Painting layers straight to the window makes
     // the eye blit erase overlays for the length of the quad readback that follows it,
     // which shows up as a flickering 2D layer.
-    HDC previewMemDC{nullptr};
-    HBITMAP previewMemBitmap{nullptr};
-    HGDIOBJ previewMemOldBitmap{nullptr};
-    void* previewMemBits{nullptr};
-    int previewMemStride{0};
-    int previewMemW{0};
-    int previewMemH{0};
-    bool previewMemDirty{false};
     ComPtr<ID3D12GraphicsCommandList> previewCmdList;
     ComPtr<ID3D12Fence> previewFence;
     HANDLE previewFenceEvent{nullptr};
@@ -1397,7 +1387,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 rt::PushState(rt::g_session.handle, XR_SESSION_STATE_EXITING);
             }
             Log("[SimXR] WndProc: WM_CLOSE received");
-            ::destroyPreviewBackBuffer(rt::g_session);
             DestroyWindow(hWnd);
             return 0;
         case WM_DESTROY:
@@ -2870,7 +2859,6 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
             std::lock_guard<std::mutex> lock(rt::g_windowMutex);
             if (rt::g_persistentWindow) {
                 Log("[SimXR] xrDestroyInstance: Destroying preview window");
-                destroyPreviewBackBuffer(rt::g_session);
                 DestroyWindow(rt::g_persistentWindow);
                 rt::g_persistentWindow = nullptr;
             }
@@ -5307,92 +5295,18 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
     }
 }
 
-// --- Preview back buffer (D3D12/GDI) ---------------------------------------------------------------
-// The eye blit and the quad overlay both paint with GDI, from different points in the
-// xrEndFrame layer loop and with a full GPU readback between them. Straight to the window
-// that is visibly two-step: the eyes land first and erase the overlay, which only comes
-// back milliseconds later. Both now draw into this off-screen DC and the window is
-// updated once, after every layer of the frame has been composited.
-static void destroyPreviewBackBuffer(rt::Session& s) {
-    if (s.previewMemDC) {
-        if (s.previewMemOldBitmap) SelectObject(s.previewMemDC, s.previewMemOldBitmap);
-        DeleteDC(s.previewMemDC);
-    }
-    if (s.previewMemBitmap) DeleteObject(s.previewMemBitmap);
-    s.previewMemDC = nullptr;
-    s.previewMemBitmap = nullptr;
-    s.previewMemOldBitmap = nullptr;
-    s.previewMemBits = nullptr;
-    s.previewMemStride = 0;
-    s.previewMemW = s.previewMemH = 0;
-    s.previewMemDirty = false;
-}
-
-static HDC acquirePreviewBackBuffer(rt::Session& s, int clientW, int clientH) {
-    if (!s.hwnd || clientW <= 0 || clientH <= 0) return nullptr;
-    if (s.previewMemDC && (s.previewMemW != clientW || s.previewMemH != clientH)) destroyPreviewBackBuffer(s);
-    if (!s.previewMemDC) {
-        HDC windowDC = GetDC(s.hwnd);
-        if (!windowDC) return nullptr;
-        s.previewMemDC = CreateCompatibleDC(windowDC);
-
-        // A DIB section rather than a compatible bitmap: the composited frame is copied into
-        // it by hand, and screenshots and burst capture read the pixels back out of it. 32bpp
-        // BI_RGB is B,G,R,X in memory; the negative height makes it top-down.
-        BITMAPINFO bmi = {};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = clientW;
-        bmi.bmiHeader.biHeight = -clientH;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-        s.previewMemBitmap = CreateDIBSection(windowDC, &bmi, DIB_RGB_COLORS, &s.previewMemBits, nullptr, 0);
-
-        ReleaseDC(s.hwnd, windowDC);
-        if (!s.previewMemDC || !s.previewMemBitmap || !s.previewMemBits) {
-            destroyPreviewBackBuffer(s);
-            return nullptr;
-        }
-        s.previewMemOldBitmap = SelectObject(s.previewMemDC, s.previewMemBitmap);
-        s.previewMemStride = clientW * 4;
-        s.previewMemW = clientW;
-        s.previewMemH = clientH;
-        RECT full{0, 0, clientW, clientH};
-        FillRect(s.previewMemDC, &full, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    }
-    return s.previewMemDC;
-}
-
-// The D3D12 preview never goes through a swapchain, so the composited frame only exists here.
-// Must run after every layer is composited, or the shot shows the eyes without the overlays.
-static void captureD3D12Screenshot(rt::Session& s) {
+// The D3D12 preview never goes through a swapchain, so the composited frame only exists in
+// the readback buffer paintPreviewComposite has mapped. Called from there, with the pixels
+// of the frame that was just shown, so a shot can never be of a frame the window never had.
+static void saveD3D12Screenshot(const uint8_t* pixels, UINT width, UINT height, UINT pitch) {
     if (!mcp::g_screenshotRequested) return;
-    if (!s.previewMemBits || s.previewMemW <= 0 || s.previewMemH <= 0) return;
-    // Only once consumeCompletedPreviewFrame has actually painted a composite this call.
-    // The preview runs a few frames behind the app, so the back buffer otherwise still
-    // holds a frame from before the request - and with the mirror rate off, one from
-    // arbitrarily long before it. The request keeps the mirror due until it is served,
-    // so a fresh frame lands within kPreviewFrames.
-    if (!s.previewMemDirty) return;
 
-    GdiFlush();
     const std::string path = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
-    if (mcp::SavePixelsToBMP((const uint8_t*)s.previewMemBits, (uint32_t)s.previewMemW,
-                             (uint32_t)s.previewMemH, path.c_str(), s.previewMemStride, true)) {
+    if (mcp::SavePixelsToBMP(pixels, width, height, path.c_str(), (int)pitch, true)) {
         std::wstring wp(path.begin(), path.end());
         ui::NotifyScreenshotSaved(wp);
     }
     mcp::g_screenshotRequested = false;
-}
-
-static void presentPreviewBackBuffer(rt::Session& s) {
-    if (!s.previewMemDC || !s.previewMemDirty || !s.hwnd) return;
-    HDC windowDC = GetDC(s.hwnd);
-    if (windowDC) {
-        BitBlt(windowDC, 0, 0, s.previewMemW, s.previewMemH, s.previewMemDC, 0, 0, SRCCOPY);
-        ReleaseDC(s.hwnd, windowDC);
-    }
-    s.previewMemDirty = false;
 }
 
 // Whether the mirror updates this frame, latched once per xrEndFrame from the Mirror Rate
@@ -5535,50 +5449,75 @@ static void closePreviewSlot(rt::Session& s, uint32_t frameCount, bool hasProjec
     s.previewSlot = (s.previewSlot + 1) % rt::kPreviewFrames;
 }
 
-// Copy a finished composite into the GDI back buffer. The RT was rendered at the fit rect's
-// size and in the DIB's own BGRA layout, so this is a straight row copy - no GDI scaling, no
-// swizzle. The centering absorbs a resize that landed after ensurePreviewSized ran: the image
-// sits in the middle of the new client area for one frame rather than being torn or written
-// out of bounds.
+// Show a finished composite. The readback already holds the window's own pixel count in
+// GDI's byte order, so this is one StretchDIBits from the mapped rows straight to the
+// window - no intermediate back buffer, and none of the per-frame memcpy that copying into
+// one costs (~15MB a frame at a 2560x1440 window, on the app's render thread).
+//
+// The screenshot and burst paths read the same mapping, which is also what makes them
+// structurally unable to capture a frame the window never showed.
 static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
     if (!f.readback || !s.hwnd || f.rtWidth == 0 || f.rtHeight == 0) return;
+    if (s.previewReadbackPitch == 0) return;
 
     void* mapped = nullptr;
     D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * f.rtHeight };
     if (FAILED(f.readback->Map(0, &readRange, &mapped)) || !mapped) return;
 
-    RECT cr{};
-    GetClientRect(s.hwnd, &cr);
-    const int clientW = cr.right - cr.left;
-    const int clientH = cr.bottom - cr.top;
-    HDC hdc = acquirePreviewBackBuffer(s, clientW, clientH);
-    if (hdc && s.previewMemBits && s.previewMemStride > 0) {
-        // acquirePreviewBackBuffer may have queued GDI work on this DC; land it
-        // before writing the same pixels by hand.
-        GdiFlush();
+    HDC windowDC = GetDC(s.hwnd);
+    if (windowDC) {
+        RECT cr{};
+        GetClientRect(s.hwnd, &cr);
+        const int clientW = cr.right - cr.left;
+        const int clientH = cr.bottom - cr.top;
 
+        // The rows are 256-byte aligned, which GDI has no field for - but a DIB whose
+        // width is the whole pitch has exactly that stride, and the source rect then
+        // takes the real pixels out of the left of each row.
+        BITMAPINFO bmi = {};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = (LONG)(s.previewReadbackPitch / 4);
+        bmi.bmiHeader.biHeight = -(LONG)f.rtHeight;   // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        // Centred, which absorbs a resize that landed after ensurePreviewSized ran: the
+        // image sits in the middle of the new client area for one frame rather than being
+        // stretched. Only then are there borders to paint, so only then is anything else
+        // touched at all.
         const int dstX = (clientW - (int)f.rtWidth) / 2;
         const int dstY = (clientH - (int)f.rtHeight) / 2;
-        const int x0 = (std::max)(0, dstX), x1 = (std::min)(clientW, dstX + (int)f.rtWidth);
-        const int y0 = (std::max)(0, dstY), y1 = (std::min)(clientH, dstY + (int)f.rtHeight);
-        const int copyW = (std::max)(0, x1 - x0);
-
-        uint8_t* dstBase = (uint8_t*)s.previewMemBits;
-        const uint8_t* srcBase = (const uint8_t*)mapped;
-        for (int y = 0; y < clientH; ++y) {
-            uint8_t* row = dstBase + (size_t)y * s.previewMemStride;
-            if (copyW == 0 || y < y0 || y >= y1) {
-                memset(row, 0, (size_t)clientW * 4);
-                continue;
-            }
-            if (x0 > 0) memset(row, 0, (size_t)x0 * 4);
-            if (x1 < clientW) memset(row + (size_t)x1 * 4, 0, (size_t)(clientW - x1) * 4);
-            memcpy(row + (size_t)x0 * 4,
-                   srcBase + (size_t)(y - dstY) * s.previewReadbackPitch + (size_t)(x0 - dstX) * 4,
-                   (size_t)copyW * 4);
+        if (dstX != 0 || dstY != 0) {
+            HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+            RECT top{ 0, 0, clientW, (std::max)(0, dstY) };
+            RECT bottom{ 0, (std::min)(clientH, dstY + (int)f.rtHeight), clientW, clientH };
+            RECT left{ 0, (std::max)(0, dstY), (std::max)(0, dstX), (std::min)(clientH, dstY + (int)f.rtHeight) };
+            RECT right{ (std::min)(clientW, dstX + (int)f.rtWidth), (std::max)(0, dstY), clientW,
+                        (std::min)(clientH, dstY + (int)f.rtHeight) };
+            if (top.bottom > top.top) FillRect(windowDC, &top, black);
+            if (bottom.bottom > bottom.top) FillRect(windowDC, &bottom, black);
+            if (left.right > left.left) FillRect(windowDC, &left, black);
+            if (right.right > right.left) FillRect(windowDC, &right, black);
         }
-        s.previewMemDirty = true;
+
+        StretchDIBits(windowDC, dstX, dstY, (int)f.rtWidth, (int)f.rtHeight,
+                      0, 0, (int)f.rtWidth, (int)f.rtHeight,
+                      mapped, &bmi, DIB_RGB_COLORS, SRCCOPY);
+        ReleaseDC(s.hwnd, windowDC);
     }
+
+    saveD3D12Screenshot((const uint8_t*)mapped, f.rtWidth, f.rtHeight, s.previewReadbackPitch);
+
+    // The burst records the frame that was just shown, described by the metadata that
+    // frame was recorded with rather than by whatever the head is doing now.
+    if (mcp::g_burstActive && f.hasProjection) {
+        mcp::g_lastProjEntry = f.proj;
+        mcp::BurstOnFrame((const uint8_t*)mapped, (int)f.rtWidth, (int)f.rtHeight,
+                          (int)s.previewReadbackPitch, f.frame,
+                          f.headYaw, f.headPitch, f.headRoll, f.headX, f.headY, f.headZ);
+    }
+
     D3D12_RANGE writeRange = { 0, 0 };
     f.readback->Unmap(0, &writeRange);
 }
@@ -6429,10 +6368,9 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                                    nullptr, 0, 0, rectL, layout, viewMode);
             }
 
-            // No Present call needed - blitD3D12ToPreview handles GDI painting directly
-
-            // D3D12 screenshots are taken in captureD3D12Screenshot at the end of xrEndFrame,
-            // not here: the quad layers of this frame still have to go into the render target.
+            // No Present call needed: the composite is shown by paintPreviewComposite once
+            // the GPU has finished it, which is also where a screenshot is served from - not
+            // here, where the quad layers of this frame have yet to go into the target.
         }
     }
 }
@@ -7038,18 +6976,8 @@ static void consumeCompletedPreviewFrame(rt::Session& s) {
     f.pending = false;
 
     // Every layer of the frame - eyes and quads alike - was composited into the render
-    // target on the GPU, so this is one copy of one finished image.
+    // target on the GPU, so this shows one finished image, and captures it if asked.
     paintPreviewComposite(s, f);
-
-    // The burst records the frame that was just painted, described by the metadata that
-    // frame was recorded with rather than by whatever the head is doing now.
-    if (mcp::g_burstActive && f.hasProjection && s.previewMemBits) {
-        GdiFlush();
-        mcp::g_lastProjEntry = f.proj;
-        mcp::BurstOnFrame((const uint8_t*)s.previewMemBits, s.previewMemW, s.previewMemH,
-                          s.previewMemStride, f.frame,
-                          f.headYaw, f.headPitch, f.headRoll, f.headX, f.headY, f.headZ);
-    }
 }
 
 static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* info) {
@@ -7242,11 +7170,9 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     if (rt::g_session.usesD3D12) {
         closePreviewSlot(rt::g_session, (uint32_t)frameCount, projectionCount > 0);
         vkrt::FrameSyncEnd(rt::g_session);
-        // Paints a finished composite if there is one, and records it into a running
-        // burst using the metadata it was recorded with.
+        // Shows a finished composite if the GPU has produced one, and serves the
+        // screenshot and burst requests off the very pixels it showed.
         consumeCompletedPreviewFrame(rt::g_session);
-        captureD3D12Screenshot(rt::g_session);
-        presentPreviewBackBuffer(rt::g_session);
     }
 
     // MCP Integration - write frame status BEFORE Present (Present may block on D3D12)
