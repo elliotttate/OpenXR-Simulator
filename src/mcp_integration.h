@@ -33,13 +33,49 @@ inline void McpLogf(const char* fmt, ...) {
     McpLog(buf);
 }
 
-inline std::string GetSimulatorDataPath() {
-    char base[MAX_PATH]{};
-    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
-    if (len > 0 && len < sizeof(base)) {
-        return std::string(base) + "\\OpenXR-Simulator";
+inline const std::string& GetSimulatorDataPath() {
+    static const std::string path = []() -> std::string {
+        char base[MAX_PATH]{};
+        DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
+        if (len > 0 && len < sizeof(base)) {
+            return std::string(base) + "\\OpenXR-Simulator";
+        }
+        return ".";
+    }();
+    return path;
+}
+
+// The Check*Command functions below each open a file that is almost never there, and
+// there are ten of them on the frame path. A failed CreateFile is not free once a
+// real-time AV filter sits on %LOCALAPPDATA%, and ten of them per frame is milliseconds.
+//
+// The commands come from the MCP server, driven by an agent or a human, so they arrive
+// thousands of frames apart. Watch the directory and only pay for the opens on the frames
+// where something in it actually changed. The 500ms backstop covers the cases the
+// notification cannot: our own writes into the same folder consume one, and the handle
+// goes stale if the folder is deleted and recreated underneath us.
+inline bool g_commandsDue = true;   // poll once on the first frame to drain anything stale
+
+inline void RefreshCommandsDue() {
+    static HANDLE watch = INVALID_HANDLE_VALUE;
+    static ULONGLONG lastPoll = 0;
+    static bool init = false;
+    if (!init) {
+        init = true;
+        CreateDirectoryA(GetSimulatorDataPath().c_str(), nullptr);
+        watch = FindFirstChangeNotificationA(GetSimulatorDataPath().c_str(), FALSE,
+                                             FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE);
     }
-    return ".";
+
+    if (watch != INVALID_HANDLE_VALUE && WaitForSingleObject(watch, 0) == WAIT_OBJECT_0) {
+        FindNextChangeNotification(watch);
+        g_commandsDue = true;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastPoll >= 500) {
+        lastPoll = now;
+        g_commandsDue = true;
+    }
 }
 
 inline bool g_screenshotRequested = false;
@@ -473,10 +509,13 @@ inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t heigh
                               const char* format, const char* sessionState,
                               float headYaw = 0, float headPitch = 0, float headRoll = 0,
                               float headX = 0, float headY = 1.7f, float headZ = 0) {
-    static uint32_t lastWrite = UINT32_MAX;
-    // Only write every 30 frames to reduce I/O (but always write the first frame)
-    if (lastWrite != UINT32_MAX && frameCount - lastWrite < 30) return;
-    lastWrite = frameCount;
+    // Rate-limited by wall clock, not by frame count: this is a status file an MCP client
+    // polls, so twice a second is as useful as ninety times a second, and each write is a
+    // create/format/flush that also trips the directory watch RefreshCommandsDue uses.
+    static ULONGLONG lastWriteMs = 0;
+    const ULONGLONG nowMs = GetTickCount64();
+    if (lastWriteMs != 0 && nowMs - lastWriteMs < 500) return;
+    lastWriteMs = nowMs;
 
     std::string path = GetSimulatorDataPath() + "\\runtime_status.json";
     FILE* file = nullptr;

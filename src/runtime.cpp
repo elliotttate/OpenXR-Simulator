@@ -2938,8 +2938,11 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
 
     }
 
-    // MCP commands work regardless of window focus (file-based IPC)
-    {
+    // MCP commands work regardless of window focus (file-based IPC).
+    // RefreshCommandsDue keeps this whole block off the frame path until the command
+    // directory actually changes; see its comment for why that matters.
+    mcp::RefreshCommandsDue();
+    if (mcp::g_commandsDue) {
         mcp::HeadPoseCommand cmd = mcp::CheckHeadPoseCommand();
         if (cmd.valid) {
             rt::g_headPos.x = cmd.x;
@@ -4144,7 +4147,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             if (rightTex != 0) flipImageVertically(rightPixels, width, height);
 
             // MCP Integration - check for screenshot requests and capture (OpenGL path)
-            mcp::CheckScreenshotRequest();
+            if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
             if (mcp::g_screenshotRequested) {
                 bool captured = false;
                 std::string outPath = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
@@ -4642,7 +4645,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             }
 
             // MCP Integration - check for screenshot requests and capture
-            mcp::CheckScreenshotRequest();
+            if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
             if (mcp::g_screenshotRequested) {
                 mcp::CaptureScreenshot(s.d3d11Device.Get(), s.d3d11Context.Get(), s.previewSwapchain.Get());
                 std::string p = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
@@ -4701,7 +4704,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
             // MCP Integration - check for screenshot requests and capture (D3D12)
             // Screenshots use the readback buffer that was just filled by blitD3D12ToPreview
-            mcp::CheckScreenshotRequest();
+            if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
             if (mcp::g_screenshotRequested && s.previewRT12 && s.previewCmdAlloc && s.previewCmdList) {
                 mcp::CaptureScreenshotD3D12(s.d3d12Device.Get(), s.previewQueue12.Get(),
                                              s.previewRT12.Get(),
@@ -5455,9 +5458,11 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
                           rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z);
 
     // Drain MCP projection-log dump request if pending.
-    if (mcp::CheckProjLogDumpRequest()) {
+    if (mcp::g_commandsDue && mcp::CheckProjLogDumpRequest()) {
         mcp::DumpProjectionLog();
     }
+    // Every command file has been looked at for this change notification.
+    mcp::g_commandsDue = false;
 
     // Now Present after all layers are rendered (D3D11/GL only; D3D12 uses GDI in blit function)
     if (g_presentPending) {
