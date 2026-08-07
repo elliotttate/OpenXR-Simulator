@@ -132,6 +132,17 @@ appending a row to `ui::kHeadsetSpecs` in
 [ui_enhancements.h](src/ui_enhancements.h); the enum, menu and settings keys
 follow from the table.
 
+### Mirror Rate
+
+The preview window is a mirror of what the headset would show, and drawing it costs
+the app a little time on every frame it updates. **Tools → Mirror Rate** caps how
+often that happens: **60 Hz** by default, or 30/15 Hz, **Every Frame**, or **Off** to
+freeze the mirror entirely while the application keeps running normally. Lower is
+cheaper — turning it off leaves the runtime costing essentially nothing per frame,
+which is worth doing while profiling the application itself. It applies to every
+backend, and a screenshot request always forces a fresh frame through regardless of
+the setting.
+
 ### Window Size
 
 Default preview window is 1920x540 (960x540 per eye). Modify in `runtime.cpp`:
@@ -183,6 +194,8 @@ reg query "HKLM\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"
 
 ### Performance issues
 
+- Turn **Tools → Mirror Rate** down, or **Off**. Mirroring the eyes to the window is
+  the only per-frame work the runtime does that scales with resolution.
 - Leave `SIMXR_VERBOSE` unset. Setting it makes the runtime log every frame, and each
   line is flushed to disk — useful when diagnosing a frame, expensive as a default.
 - Reduce swapchain resolution in your application

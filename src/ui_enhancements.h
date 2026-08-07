@@ -67,7 +67,11 @@ enum MenuCommand {
 
     // One id per kHeadsetSpecs entry, in table order.
     ID_PROFILE_FIRST = 1600,
-    ID_PROFILE_LAST = 1663
+    ID_PROFILE_LAST = 1663,
+
+    // One id per kPreviewRatePresets entry, in table order.
+    ID_PREVIEW_RATE_FIRST = 1750,
+    ID_PREVIEW_RATE_LAST = 1765
 };
 
 // View mode enum
@@ -127,6 +131,12 @@ struct UIState {
 
     // Render options
     bool showFullRender = false;  // If true, show full swapchain instead of imageRect crop
+
+    // How often the mirror window is allowed to update, in Hz. Mirroring is not free -
+    // it composites the eyes, reads them back and repaints the window - and none of that
+    // buys anything above the rate a monitor shows. 0 freezes the mirror (the app still
+    // runs normally); kPreviewRateEveryFrame follows the app.
+    int previewFps = 60;
 };
 
 inline UIState g_uiState;
@@ -268,6 +278,53 @@ inline bool IsIpdSettingsCommand(int cmd) {
 }
 
 // ---------------------------------------------------------------------------
+// Mirror rate
+// ---------------------------------------------------------------------------
+
+// Sentinel for "no cap", kept well above any real refresh rate so the comparison in
+// PreviewFrameDue never has to special-case it.
+inline constexpr int kPreviewRateEveryFrame = 10000;
+
+struct PreviewRatePreset { int fps; const wchar_t* label; };
+inline constexpr PreviewRatePreset kPreviewRatePresets[] = {
+    { kPreviewRateEveryFrame, L"&Every Frame (no cap)" },
+    { 60, L"&60 Hz" },
+    { 30, L"&30 Hz" },
+    { 15, L"1&5 Hz" },
+    {  0, L"&Off (freeze mirror)" },
+};
+inline constexpr int kPreviewRatePresetCount =
+    (int)(sizeof(kPreviewRatePresets) / sizeof(kPreviewRatePresets[0]));
+
+static_assert(kPreviewRatePresetCount <= ID_PREVIEW_RATE_LAST - ID_PREVIEW_RATE_FIRST + 1,
+              "kPreviewRatePresets outgrew the reserved menu id block");
+
+inline bool IsPreviewRateCommand(int cmd) {
+    return cmd >= ID_PREVIEW_RATE_FIRST && cmd < ID_PREVIEW_RATE_FIRST + kPreviewRatePresetCount;
+}
+
+// Whether the mirror is allowed to update on this frame. Called once per frame from
+// xrEndFrame; the answer has to hold for the whole frame, since the eye composite and the
+// quad layers of one frame have to be recorded together or not at all.
+inline bool PreviewFrameDue() {
+    const int fps = g_uiState.previewFps;
+    if (fps <= 0) return false;
+    if (fps >= kPreviewRateEveryFrame) return true;
+
+    static LARGE_INTEGER freq = []() { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    static long long nextTick = 0;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart < nextTick) return false;
+    const long long period = freq.QuadPart / fps;
+    // Re-base rather than accumulate when we have fallen more than a period behind, so a
+    // stall (or a rate change) cannot leave a backlog that fires on every frame after it.
+    if (nextTick == 0 || now.QuadPart - nextTick > period) nextTick = now.QuadPart + period;
+    else nextTick += period;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Zoom and pan
 //
 // Both are properties of the image, not of the window: zooming in scales the eyes
@@ -362,7 +419,8 @@ inline std::string SerializeSettings() {
         "  \"window_width\": %d,\n"
         "  \"window_height\": %d,\n"
         "  \"full_render\": %s,\n"
-        "  \"show_stats\": %s\n"
+        "  \"show_stats\": %s,\n"
+        "  \"preview_fps\": %d\n"
         "}\n",
         ViewModeName(g_uiState.viewMode),
         DisplayLayoutName(g_uiState.displayLayout),
@@ -375,7 +433,8 @@ inline std::string SerializeSettings() {
         g_uiState.windowWidth,
         g_uiState.windowHeight,
         g_uiState.showFullRender ? "true" : "false",
-        g_uiState.showStats ? "true" : "false");
+        g_uiState.showStats ? "true" : "false",
+        g_uiState.previewFps);
     return buf;
 }
 
@@ -424,6 +483,9 @@ inline void ApplySettingsJson(const char* text) {
     g_uiState.windowHeight = (std::max)(0, o.number("window_height", g_uiState.windowHeight));
     g_uiState.showFullRender = o.boolean("full_render", g_uiState.showFullRender);
     g_uiState.showStats = o.boolean("show_stats", g_uiState.showStats);
+
+    g_uiState.previewFps = (std::max)(0, (std::min)(kPreviewRateEveryFrame,
+        (int)o.number("preview_fps", g_uiState.previewFps)));
 }
 
 // Restore saved settings from `dataDir` and arm SaveSettings().
@@ -543,6 +605,13 @@ inline HMENU CreateAppMenu() {
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_RESET_VIEW, L"&Reset View\tHome");
     AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_TOGGLE_STATS, L"Show &Statistics\tF3");
+    AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
+
+    HMENU rateMenu = CreatePopupMenu();
+    for (int i = 0; i < kPreviewRatePresetCount; ++i) {
+        AppendMenuW(rateMenu, MF_STRING, ID_PREVIEW_RATE_FIRST + i, kPreviewRatePresets[i].label);
+    }
+    AppendMenuW(toolsMenu, MF_POPUP, (UINT_PTR)rateMenu, L"Mirror &Rate");
     AppendMenuW(menuBar, MF_POPUP, (UINT_PTR)toolsMenu, L"&Tools");
 
     // Help Menu
@@ -594,6 +663,12 @@ inline void UpdateMenuState(HMENU menu) {
     for (int i = 0; i < kHeadsetProfileCount; ++i) {
         CheckMenuItem(menu, ID_PROFILE_FIRST + i,
             (int)g_uiState.headsetProfile == i ? MF_CHECKED : MF_UNCHECKED);
+    }
+
+    // Mirror rate checks
+    for (int i = 0; i < kPreviewRatePresetCount; ++i) {
+        CheckMenuItem(menu, ID_PREVIEW_RATE_FIRST + i,
+            g_uiState.previewFps == kPreviewRatePresets[i].fps ? MF_CHECKED : MF_UNCHECKED);
     }
 
     // IPD checks
@@ -959,6 +1034,10 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
             return true;
 
         default:
+            if (IsPreviewRateCommand(cmd)) {
+                g_uiState.previewFps = kPreviewRatePresets[cmd - ID_PREVIEW_RATE_FIRST].fps;
+                break;
+            }
             if (!IsHeadsetProfileCommand(cmd)) return false;
             SetHeadsetProfile((HeadsetProfile)(cmd - ID_PROFILE_FIRST));
             settingsChanged = true;

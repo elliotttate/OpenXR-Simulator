@@ -4435,6 +4435,12 @@ static void presentPreviewBackBuffer(rt::Session& s) {
     s.previewMemDirty = false;
 }
 
+// Whether the mirror updates this frame, latched once per xrEndFrame from the Mirror Rate
+// setting: a frame's eyes and its quad layers have to be composited together or not at all,
+// so the cap cannot be re-evaluated per layer. Every backend honours it - what it saves is
+// the readback on D3D12 and OpenGL, and the composite and Present on all three.
+static bool g_previewDueThisFrame = true;
+
 // --- Preview frame slots (D3D12) --------------------------------------------------------------
 
 // Open this frame's slot, or nullptr if all of them are still on the GPU. The eye composite
@@ -4444,6 +4450,7 @@ static void presentPreviewBackBuffer(rt::Session& s) {
 // caller is the app's render thread and must never wait for the GPU here.
 static rt::PreviewFrame12* beginPreviewSlot(rt::Session& s) {
     if (!s.previewFence || !s.previewCmdList || !s.previewQueue12) return nullptr;
+    if (!g_previewDueThisFrame) return nullptr;
     rt::PreviewFrame12& f = s.previewFrames[s.previewSlot];
     if (s.previewSlotOpen) return &f;
     // Still executing, or still holding a composite the painter has not picked up.
@@ -4880,6 +4887,10 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
         // OpenGL preview path - read pixels from GL textures and display via D3D11
         if (s.usesOpenGL) {
+            // Nothing below this point is cheap: the path reads both eyes back off the GPU
+            // before it can show them, which is exactly what Mirror Rate exists to skip.
+            if (!g_previewDueThisFrame) return;
+
             static int glFrameCount = 0;
             glFrameCount++;
 
@@ -4958,8 +4969,9 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             if (leftTex != 0) flipImageVertically(leftPixels, width, height);
             if (rightTex != 0) flipImageVertically(rightPixels, width, height);
 
-            // MCP Integration - check for screenshot requests and capture (OpenGL path)
-            if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
+            // MCP Integration - capture a screenshot if one was asked for (OpenGL path).
+            // xrEndFrame drains the request before it decides whether this frame is due,
+            // so a pending shot is what forced the frame we are in.
             if (mcp::g_screenshotRequested) {
                 bool captured = false;
                 std::string outPath = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
@@ -5318,87 +5330,92 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // ===== D3D11 PATH =====
             if (!s.previewSwapchain) return;
 
-            // Save D3D11 context state - will auto-restore when stateBackup goes out of scope
-            D3D11StateBackup stateBackup(s.d3d11Context.Get());
+            // Mirror Rate: the composite and the Present it feeds are what this skips.
+            // The frame counter below stays outside it, so the rate shown in the title is
+            // still the application's and not the mirror's.
+            if (g_previewDueThisFrame) {
+                // Save D3D11 context state - will auto-restore when stateBackup goes out of scope
+                D3D11StateBackup stateBackup(s.d3d11Context.Get());
 
-            // Get the backbuffer and create RTV
-            ComPtr<ID3D11Texture2D> bb;
-            if (FAILED(s.previewSwapchain->GetBuffer(0, IID_PPV_ARGS(bb.GetAddressOf())))) {
-                Log("[SimXR] Failed to get preview swapchain buffer.");
-                return;
-            }
-
-            // Explicit sRGB RTV for proper gamma encoding
-            ComPtr<ID3D11RenderTargetView> rtv;
-            if (!rt::CreatePreviewRtv(s, bb.Get(), rtv)) {
-                Log("[SimXR] Failed to create RTV for preview.");
-                return;
-            }
-
-            // Bind RTV and clear the full backbuffer (= client area) to black
-            // so any letterbox border ends up black instead of stale content.
-            ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
-            s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
-            const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
-
-            // Where the eyes land in the backbuffer (= client area), after zoom and pan.
-            // Single eye uses the rect whole; SBS / OverUnder split it; Anaglyph
-            // overlays both eyes into it.
-            rt::FitRect fit = rt::ComputePresentRect((int)s.previewWidth, (int)s.previewHeight);
-
-            D3D11_VIEWPORT fullVp = { fit.x, fit.y, fit.w, fit.h, 0.0f, 1.0f };
-            D3D11_VIEWPORT leftVp = fullVp;
-            D3D11_VIEWPORT rightVp = fullVp;
-            if (!singleEye) {
-                if (layout == ui::DisplayLayout::SideBySide) {
-                    leftVp.Width  = fit.w * 0.5f;
-                    rightVp.Width = fit.w * 0.5f;
-                    rightVp.TopLeftX = fit.x + fit.w * 0.5f;
-                } else if (layout == ui::DisplayLayout::OverUnder) {
-                    leftVp.Height  = fit.h * 0.5f;
-                    rightVp.Height = fit.h * 0.5f;
-                    rightVp.TopLeftY = fit.y + fit.h * 0.5f;
+                // Get the backbuffer and create RTV
+                ComPtr<ID3D11Texture2D> bb;
+                if (FAILED(s.previewSwapchain->GetBuffer(0, IID_PPV_ARGS(bb.GetAddressOf())))) {
+                    Log("[SimXR] Failed to get preview swapchain buffer.");
+                    return;
                 }
-            }
 
-            ID3D11BlendState* leftBlend = nullptr;
-            ID3D11BlendState* rightBlend = nullptr;
-            if (!singleEye && layout == ui::DisplayLayout::Anaglyph) {
-                leftBlend = s.anaglyphRedBS.Get();
-                rightBlend = s.anaglyphCyanBS.Get();
-            }
-
-            if (showLeft) {
-                blitViewToHalf(s, chL, leftIdx, vL.subImage.imageArrayIndex, vL.subImage.imageRect,
-                               rtv.Get(), leftVp, leftBlend);
-            }
-
-            // Blit right eye
-            if (showRight && proj.viewCount > 1) {
-                const auto& vR = proj.views[1];
-                auto& chR = const_cast<rt::Swapchain&>(*chRPtr);
-                uint32_t rightIdx = 0;
-                if (chR.lastReleased != UINT32_MAX && chR.lastReleased < chR.imageCount) {
-                    rightIdx = chR.lastReleased;
-                } else if (chR.lastAcquired != UINT32_MAX && chR.lastAcquired < chR.imageCount) {
-                    rightIdx = chR.lastAcquired;
+                // Explicit sRGB RTV for proper gamma encoding
+                ComPtr<ID3D11RenderTargetView> rtv;
+                if (!rt::CreatePreviewRtv(s, bb.Get(), rtv)) {
+                    Log("[SimXR] Failed to create RTV for preview.");
+                    return;
                 }
-                blitViewToHalf(s, chR, rightIdx, vR.subImage.imageArrayIndex, vR.subImage.imageRect,
-                               rtv.Get(), rightVp, rightBlend);
-            } else if (showRight && !showLeft) {
-                // Mirror left eye if right-only mode but only one view
-                blitViewToHalf(s, chL, leftIdx, vL.subImage.imageArrayIndex, vL.subImage.imageRect,
-                               rtv.Get(), rightVp, rightBlend);
-            }
 
-            // Present D3D11 (may be deferred if overlays are pending)
-            if (!skipPresent) {
-                MSG msg;
-                while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-                s.previewSwapchain->Present(1, 0);
-            } else {
-                g_presentPending = true;
+                // Bind RTV and clear the full backbuffer (= client area) to black
+                // so any letterbox border ends up black instead of stale content.
+                ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
+                s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
+                const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
+
+                // Where the eyes land in the backbuffer (= client area), after zoom and pan.
+                // Single eye uses the rect whole; SBS / OverUnder split it; Anaglyph
+                // overlays both eyes into it.
+                rt::FitRect fit = rt::ComputePresentRect((int)s.previewWidth, (int)s.previewHeight);
+
+                D3D11_VIEWPORT fullVp = { fit.x, fit.y, fit.w, fit.h, 0.0f, 1.0f };
+                D3D11_VIEWPORT leftVp = fullVp;
+                D3D11_VIEWPORT rightVp = fullVp;
+                if (!singleEye) {
+                    if (layout == ui::DisplayLayout::SideBySide) {
+                        leftVp.Width  = fit.w * 0.5f;
+                        rightVp.Width = fit.w * 0.5f;
+                        rightVp.TopLeftX = fit.x + fit.w * 0.5f;
+                    } else if (layout == ui::DisplayLayout::OverUnder) {
+                        leftVp.Height  = fit.h * 0.5f;
+                        rightVp.Height = fit.h * 0.5f;
+                        rightVp.TopLeftY = fit.y + fit.h * 0.5f;
+                    }
+                }
+
+                ID3D11BlendState* leftBlend = nullptr;
+                ID3D11BlendState* rightBlend = nullptr;
+                if (!singleEye && layout == ui::DisplayLayout::Anaglyph) {
+                    leftBlend = s.anaglyphRedBS.Get();
+                    rightBlend = s.anaglyphCyanBS.Get();
+                }
+
+                if (showLeft) {
+                    blitViewToHalf(s, chL, leftIdx, vL.subImage.imageArrayIndex, vL.subImage.imageRect,
+                                   rtv.Get(), leftVp, leftBlend);
+                }
+
+                // Blit right eye
+                if (showRight && proj.viewCount > 1) {
+                    const auto& vR = proj.views[1];
+                    auto& chR = const_cast<rt::Swapchain&>(*chRPtr);
+                    uint32_t rightIdx = 0;
+                    if (chR.lastReleased != UINT32_MAX && chR.lastReleased < chR.imageCount) {
+                        rightIdx = chR.lastReleased;
+                    } else if (chR.lastAcquired != UINT32_MAX && chR.lastAcquired < chR.imageCount) {
+                        rightIdx = chR.lastAcquired;
+                    }
+                    blitViewToHalf(s, chR, rightIdx, vR.subImage.imageArrayIndex, vR.subImage.imageRect,
+                                   rtv.Get(), rightVp, rightBlend);
+                } else if (showRight && !showLeft) {
+                    // Mirror left eye if right-only mode but only one view
+                    blitViewToHalf(s, chL, leftIdx, vL.subImage.imageArrayIndex, vL.subImage.imageRect,
+                                   rtv.Get(), rightVp, rightBlend);
+                }
+
+                // Present D3D11 (may be deferred if overlays are pending)
+                if (!skipPresent) {
+                    MSG msg;
+                    while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+                    s.previewSwapchain->Present(1, 0);
+                } else {
+                    g_presentPending = true;
+                }
             }
 
             // Update window title with stats
@@ -5418,8 +5435,9 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 ui::UpdateWindowTitle(s.hwnd, ui::g_lastFps, 0, &si);
             }
 
-            // MCP Integration - check for screenshot requests and capture
-            if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
+            // MCP Integration - capture a screenshot if one was asked for. xrEndFrame
+            // drains the request before it decides whether this frame is due, so a pending
+            // shot is what forced the frame we are in.
             if (mcp::g_screenshotRequested) {
                 mcp::CaptureScreenshot(s.d3d11Device.Get(), s.d3d11Context.Get(), s.previewSwapchain.Get());
                 std::string p = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
@@ -5481,6 +5499,9 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     if (!quad) return;
     // D3D12 sessions use previewRT12, not previewSwapchain
     if (!s.previewSwapchain && !s.previewRT12) return;
+    // A layer of a frame the mirror is skipping. presentProjection skipped the eyes under
+    // it and will not present, so drawing this would be work nothing ever shows.
+    if (!g_previewDueThisFrame) return;
 
     auto it = rt::g_swapchains.find(quad->subImage.swapchain);
     if (it == rt::g_swapchains.end()) return;
@@ -6122,6 +6143,16 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
+    // Drain the request that decides whether this frame has to reach the mirror, before
+    // deciding it. Every backend's screenshot path then just tests g_screenshotRequested.
+    if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
+
+    // Decide once, here, whether the mirror updates this frame; every preview path below
+    // hangs off it (see g_previewDueThisFrame). A pending screenshot overrides the cap - it
+    // asked for a particular frame, not for the next one the rate happens to allow, and
+    // with the mirror off there would be no next one.
+    g_previewDueThisFrame = ui::PreviewFrameDue() || mcp::g_screenshotRequested;
+
     if (shouldLog) {
         Logf("[SimXR] xrEndFrame: layers=%u", info->layerCount);
     }
@@ -6192,7 +6223,9 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     // !previewSwapchain && !previewRT12 guard.
     if (projectionCount == 0) {
         ensurePreviewWithoutProjection(rt::g_session);
-        if (!rt::g_session.usesD3D12) {
+        if (!g_previewDueThisFrame) {
+            // Nothing paints this frame, so there is nothing to wipe either.
+        } else if (!rt::g_session.usesD3D12) {
             clearPreviewToBlack(rt::g_session);
         } else if (!hasOverlays) {
             // D3D12 normally clears as part of opening the render target, which whichever
@@ -6230,7 +6263,6 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     if (rt::g_session.usesD3D12) {
         closePreviewSlot(rt::g_session);
         consumeCompletedPreviewFrame(rt::g_session);
-        if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
         captureD3D12Screenshot(rt::g_session);
         presentPreviewBackBuffer(rt::g_session);
     }
