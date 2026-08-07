@@ -365,11 +365,9 @@ struct PreviewFrame12 {
 // creates them shared and hands the app imported VkImages over the same memory, so the
 // preview, screenshot and quad paths never learn there is a second API involved.
 struct VulkanSession {
-    VkInstance instance{VK_NULL_HANDLE};
     VkPhysicalDevice physicalDevice{VK_NULL_HANDLE};
     VkDevice device{VK_NULL_HANDLE};
     VkQueue queue{VK_NULL_HANDLE};
-    uint32_t queueFamily{0};
     VkCommandPool cmdPool{VK_NULL_HANDLE};
     VkCommandBuffer cmdBuffer{VK_NULL_HANDLE};
     // One shared D3D12 fence imported as a timeline VkSemaphore orders the app's queue
@@ -492,7 +490,6 @@ struct Swapchain {
     // Vulkan path: images12 still holds the shared D3D12 resources the compositor reads,
     // imagesVk the VkImages bound over the same memory that the app is handed.
     bool isVulkan{false};
-    int64_t vkFormat{0};
     std::vector<VkImage> imagesVk;
     std::vector<VkDeviceMemory> memoryVk;
     std::vector<HANDLE> sharedHandles;
@@ -2127,10 +2124,8 @@ static void InitFrameSync(rt::Session& s) {
 
 static bool InitSession(rt::Session& s, const XrGraphicsBindingVulkanKHR& b) {
     s.vk = rt::VulkanSession{};
-    s.vk.instance = b.instance;
     s.vk.physicalDevice = b.physicalDevice;
     s.vk.device = b.device;
-    s.vk.queueFamily = b.queueFamilyIndex;
 
     if (!LoadInstanceLevel(b.instance)) { Log("[SimXR][VK] instance-level entry points missing"); return false; }
     if (!LoadDeviceLevel(b.device)) { Log("[SimXR][VK] device-level entry points missing (external memory not enabled?)"); return false; }
@@ -2236,7 +2231,6 @@ static XrResult CreateSwapchainImages(rt::Session& s, rt::Swapchain& chain, cons
     const uint32_t mips = ci.mipCount ? ci.mipCount : 1;
     const uint32_t samples = ci.sampleCount ? ci.sampleCount : 1;
     chain.isVulkan = true;
-    chain.vkFormat = ci.format;
     chain.format = fp->typed;
     chain.backend = rt::Swapchain::Backend::D3D12;
     chain.mipCount = mips;
@@ -4541,7 +4535,7 @@ cbuffer Quad : register(b0) {
     float4 c3;        // view-space corner 3 (bottom-left)
     float4 tans;      // tanLeft, tanRight, tanUp, tanDown
     float4 uvRect;    // u0, v0, u1, v1
-    float4 opts;      // x: 1 = premultiplied source, 0 = straight alpha; y: 1 = opaque
+    float4 opts;      // x: 1 = opaque, ignore the source alpha
 };
 Texture2D<float4> Src : register(t0);
 SamplerState Smp : register(s0);
@@ -4571,9 +4565,9 @@ VSOut VSMain(uint id : SV_VertexID) {
 
 float4 PSMain(VSOut i) : SV_Target {
     float4 c = Src.Sample(Smp, i.uv);
-    if (opts.y > 0.5) return float4(c.rgb, 1.0);          // opaque: alpha is ignored
-    if (opts.x > 0.5) return c;                           // premultiplied: blend takes it as is
-    return c;                                             // straight alpha: SRC_ALPHA in the blend
+    // Premultiplied and straight alpha differ only in the blend state's SrcBlend, so the
+    // sample goes through untouched either way; opaque is the one that needs saying here.
+    return (opts.x > 0.5) ? float4(c.rgb, 1.0) : c;
 }
 )HLSL";
 
@@ -5780,20 +5774,10 @@ static bool g_presentPending = false;
 
 // Wipe the preview to black. Used on frames that carry no projection layer so
 // overlays are not composited over the stale - and by then wrong - stereo image
-// the last 3D frame left behind.
+// the last 3D frame left behind. D3D11 and OpenGL only: a D3D12 session gets the
+// same wipe from the clear that opens its render target.
 static void clearPreviewToBlack(rt::Session& s) {
     if (!s.hwnd) return;
-
-    if (s.usesD3D12) {
-        // Clearing the window instead would be undone by presentPreviewBackBuffer.
-        RECT cr{};
-        GetClientRect(s.hwnd, &cr);
-        HDC hdc = acquirePreviewBackBuffer(s, cr.right - cr.left, cr.bottom - cr.top);
-        if (!hdc) return;
-        FillRect(hdc, &cr, (HBRUSH)GetStockObject(BLACK_BRUSH));
-        s.previewMemDirty = true;
-        return;
-    }
 
     if (!s.previewSwapchain || !s.d3d11Device || !s.d3d11Context) return;
     ComPtr<ID3D11Texture2D> backbuffer;
@@ -6595,8 +6579,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
             if (consts[17] - consts[16] < 1e-6f || consts[18] - consts[19] < 1e-6f) continue;
             consts[20] = uvRect[0]; consts[21] = uvRect[1];
             consts[22] = uvRect[2]; consts[23] = uvRect[3];
-            consts[24] = (blendMode == rt::LayerBlend::Premultiplied) ? 1.0f : 0.0f;
-            consts[25] = (blendMode == rt::LayerBlend::Opaque) ? 1.0f : 0.0f;
+            consts[24] = (blendMode == rt::LayerBlend::Opaque) ? 1.0f : 0.0f;
             s.previewCmdList->SetGraphicsRoot32BitConstants(1, rt::kQuadConstantCount, consts, 0);
 
             const D3D12_VIEWPORT vp = { (float)er.x, (float)er.y, (float)er.w, (float)er.h, 0.0f, 1.0f };
@@ -6852,9 +6835,6 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
 
         D3D11_BOX box = { rect.x, rect.y, 0, rect.x + rect.w, rect.y + rect.h, 1 };
         s.d3d11Context->CopySubresourceRegion(quadTex.Get(), 0, 0, 0, 0, copySrc, copySubresource, &box);
-
-        texWidth = rect.w;
-        texHeight = rect.h;
 
         if (shouldLog) {
             Logf("[SimXR] Rendering quad layer (D3D11): size=%.2fx%.2f, rect=%u,%u %ux%u, typedFmt=%d, srcFmt=%d, arraySlice=%u",
