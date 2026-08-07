@@ -5360,6 +5360,12 @@ static HDC acquirePreviewBackBuffer(rt::Session& s, int clientW, int clientH) {
 static void captureD3D12Screenshot(rt::Session& s) {
     if (!mcp::g_screenshotRequested) return;
     if (!s.previewMemBits || s.previewMemW <= 0 || s.previewMemH <= 0) return;
+    // Only once consumeCompletedPreviewFrame has actually painted a composite this call.
+    // The preview runs a few frames behind the app, so the back buffer otherwise still
+    // holds a frame from before the request - and with the mirror rate off, one from
+    // arbitrarily long before it. The request keeps the mirror due until it is served,
+    // so a fresh frame lands within kPreviewFrames.
+    if (!s.previewMemDirty) return;
 
     GdiFlush();
     const std::string path = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
@@ -7256,9 +7262,9 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         vkrt::FrameSyncEnd(rt::g_session);
         consumeCompletedPreviewFrame(rt::g_session);
         captureD3D12Screenshot(rt::g_session);
-        // previewMemDirty means consumeCompletedPreviewFrame actually painted something
-        // this call. Without it a frame whose composite is still on the GPU would be
-        // captured as a duplicate of the previous one.
+        // previewMemDirty for the same reason captureD3D12Screenshot tests it: without it
+        // a frame whose composite is still on the GPU would be recorded as a duplicate of
+        // the previous one.
         if (mcp::g_burstActive && projectionCount > 0 && rt::g_session.previewMemBits &&
             rt::g_session.previewMemDirty) {
             GdiFlush();
