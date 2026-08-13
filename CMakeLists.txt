@@ -24,6 +24,8 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 # OpenXR Simulator Runtime DLL
 add_library(openxr_simulator SHARED
     src/runtime.cpp
+    src/flicker_detector.cpp
+    src/flicker_detector.h
     src/mcp_integration.h
     src/ui_enhancements.h
 )
@@ -35,6 +37,7 @@ target_link_libraries(openxr_simulator
     dxgi
     d3dcompiler
     dwmapi
+    msimg32
     uxtheme
 )
 

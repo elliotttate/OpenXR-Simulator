@@ -57,6 +57,10 @@ SCREENSHOT_MAX_WIDTH = 1280
 SCREENSHOT_JPEG_QUALITY = 70
 FRAME_INFO_FILE = SIMULATOR_DIR / "frame_info.json"
 STATUS_FILE = SIMULATOR_DIR / "runtime_status.json"
+FLICKER_STATUS_FILE = SIMULATOR_DIR / "flicker_status.json"
+FLICKER_CAPTURE_REQUEST_FILE = SIMULATOR_DIR / "flicker_capture_request.json"
+UI_FLICKER_STATUS_FILE = SIMULATOR_DIR / "ui_flicker_status.json"
+UI_FLICKER_CAPTURE_REQUEST_FILE = SIMULATOR_DIR / "ui_flicker_capture_request.json"
 
 # Diagnostic command files (the simulator polls for and consumes these).
 HEAD_POSE_CMD_FILE       = SIMULATOR_DIR / "head_pose_command.json"
@@ -253,6 +257,37 @@ def to_jpeg(image_bytes: bytes, max_width: int = SCREENSHOT_MAX_WIDTH,
     out = BytesIO()
     img.save(out, format="JPEG", quality=quality, optimize=True)
     return out.getvalue()
+
+
+def build_flicker_contact_sheet(incident_dir: Path, max_frames: int = 8) -> Optional[bytes]:
+    """Build an in-memory JPEG from simulator-composed preview frames for LLM review."""
+    from io import BytesIO
+    from PIL import Image, ImageDraw
+
+    candidates = sorted(
+        incident_dir.glob("frame*_preview.bmp"),
+        key=lambda path: int(re.search(r"frame(\d+)", path.name).group(1)),
+    )[-max(2, min(max_frames, 12)):]
+    if len(candidates) < 2:
+        return None
+    cells = []
+    for path in candidates:
+        image = Image.open(path).convert("RGB")
+        image.thumbnail((640, 360), Image.Resampling.LANCZOS)
+        cell = Image.new("RGB", (image.width, image.height + 24), "#111318")
+        cell.paste(image, (0, 24))
+        ImageDraw.Draw(cell).text((6, 5), path.stem, fill="#f1f5f9")
+        cells.append(cell)
+    columns = 2
+    cell_width = max(cell.width for cell in cells)
+    cell_height = max(cell.height for cell in cells)
+    rows = (len(cells) + columns - 1) // columns
+    sheet = Image.new("RGB", (columns * cell_width, rows * cell_height), "#090b10")
+    for index, cell in enumerate(cells):
+        sheet.paste(cell, ((index % columns) * cell_width, (index // columns) * cell_height))
+    output = BytesIO()
+    sheet.save(output, format="JPEG", quality=78, optimize=True)
+    return output.getvalue()
 
 
 def get_frame_info() -> dict[str, Any]:
@@ -481,6 +516,66 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {}
+            }
+        ),
+        Tool(
+            name="get_flicker_status",
+            description="Read the continuous detector attached to the OpenXR Simulator's final composed preview. "
+                       "Returns layer-continuity and pixel anomaly counters and, when available, a contact sheet "
+                       "from the latest incident for direct LLM visual review.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "include_images": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "Include an image contact sheet from the latest incident"
+                    },
+                    "max_frames": {
+                        "type": "integer",
+                        "default": 8,
+                        "minimum": 2,
+                        "maximum": 12
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="capture_flicker_window",
+            description="Capture the simulator's rolling composed-preview history plus following frames now, "
+                       "even if the automatic detector threshold has not fired. Returns a contact sheet for "
+                       "direct temporal review by an LLM.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "timeout": {"type": "number", "default": 5.0, "minimum": 1.0, "maximum": 15.0},
+                    "max_frames": {"type": "integer", "default": 12, "minimum": 2, "maximum": 12}
+                }
+            }
+        ),
+        Tool(
+            name="get_ui_flicker_status",
+            description="Read UI-only quad-layer flicker diagnostics. This ignores world motion and reports "
+                       "whether every new projection containing a submitted UI quad was actually recomposed, "
+                       "plus cropped UI temporal evidence for the latest incident.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "include_images": {"type": "boolean", "default": True},
+                    "max_frames": {"type": "integer", "default": 8, "minimum": 2, "maximum": 12}
+                }
+            }
+        ),
+        Tool(
+            name="capture_ui_flicker_window",
+            description="Force a rolling pre/post capture cropped to the left/right UI quad rectangles. "
+                       "Use this when a person reports UI flicker but whole-frame detection is clean.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "timeout": {"type": "number", "default": 5.0, "minimum": 1.0, "maximum": 15.0},
+                    "max_frames": {"type": "integer", "default": 12, "minimum": 2, "maximum": 12}
+                }
             }
         ),
         Tool(
@@ -758,6 +853,184 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             type="text",
             text=json.dumps(info, indent=2)
         )]
+
+    elif name == "get_flicker_status":
+        if not FLICKER_STATUS_FILE.exists():
+            return [TextContent(
+                type="text",
+                text="No flicker_status.json exists. Start an OpenXR application with the instrumented simulator runtime."
+            )]
+        try:
+            status = json.loads(FLICKER_STATUS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            return [TextContent(type="text", text=f"Failed to read flicker status: {error}")]
+        age_seconds = max(0.0, time.time() - FLICKER_STATUS_FILE.stat().st_mtime)
+        status["statusAgeSeconds"] = round(age_seconds, 3)
+        status["statusFresh"] = age_seconds < 5.0
+        result: list[TextContent | ImageContent] = [
+            TextContent(type="text", text=json.dumps(status, indent=2))
+        ]
+        incident_value = status.get("lastIncidentDirectory")
+        if arguments.get("include_images", True) and incident_value:
+            incident_dir = Path(incident_value).resolve()
+            try:
+                incident_dir.relative_to(SIMULATOR_DIR.resolve())
+                contact_sheet = build_flicker_contact_sheet(
+                    incident_dir, int(arguments.get("max_frames", 8)))
+            except (ValueError, OSError, AttributeError):
+                contact_sheet = None
+            if contact_sheet:
+                result.append(ImageContent(
+                    type="image",
+                    data=base64.standard_b64encode(contact_sheet).decode("utf-8"),
+                    mimeType="image/jpeg",
+                ))
+        return result
+
+    elif name == "capture_flicker_window":
+        ensure_simulator_dir()
+        timeout = max(1.0, min(float(arguments.get("timeout", 5.0)), 15.0))
+        max_frames = max(2, min(int(arguments.get("max_frames", 12)), 12))
+        previous_incident = ""
+        if FLICKER_STATUS_FILE.exists():
+            try:
+                previous_incident = json.loads(
+                    FLICKER_STATUS_FILE.read_text(encoding="utf-8")
+                ).get("lastIncidentDirectory", "")
+            except (OSError, json.JSONDecodeError):
+                pass
+        _write_json_command(FLICKER_CAPTURE_REQUEST_FILE, {
+            "requestedUnixMs": int(time.time() * 1000),
+            "source": "mcp",
+        })
+        deadline = time.time() + timeout
+        incident_dir: Optional[Path] = None
+        status: dict[str, Any] = {}
+        while time.time() < deadline:
+            try:
+                status = json.loads(FLICKER_STATUS_FILE.read_text(encoding="utf-8"))
+                current = status.get("lastIncidentDirectory", "")
+                if current and current != previous_incident:
+                    candidate = Path(current).resolve()
+                    candidate.relative_to(SIMULATOR_DIR.resolve())
+                    if len(list(candidate.glob("frame*_preview.bmp"))) >= 2:
+                        incident_dir = candidate
+                        break
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
+            time.sleep(0.1)
+        if not incident_dir:
+            return [TextContent(
+                type="text",
+                text="Timed out waiting for a manual composed-preview burst. The simulator may not be rendering new D3D12 preview frames."
+            )]
+        # Give the post-trigger ring a short opportunity to finish without making
+        # a partially filled packet look like a detector failure.
+        settle_deadline = min(deadline, time.time() + 1.0)
+        while time.time() < settle_deadline and len(list(incident_dir.glob("frame*_preview.bmp"))) < max_frames:
+            time.sleep(0.1)
+        contact_sheet = build_flicker_contact_sheet(incident_dir, max_frames)
+        result = [TextContent(type="text", text=json.dumps({
+            "captureSource": "openxr-simulator-composed-preview",
+            "incidentDirectory": str(incident_dir),
+            "framesAvailable": len(list(incident_dir.glob("frame*_preview.bmp"))),
+            "status": status,
+        }, indent=2))]
+        if contact_sheet:
+            result.append(ImageContent(
+                type="image",
+                data=base64.standard_b64encode(contact_sheet).decode("utf-8"),
+                mimeType="image/jpeg",
+            ))
+        return result
+
+    elif name == "get_ui_flicker_status":
+        if not UI_FLICKER_STATUS_FILE.exists():
+            return [TextContent(
+                type="text",
+                text="No ui_flicker_status.json exists. Start an OpenXR application that submits a D3D12 quad layer."
+            )]
+        try:
+            status = json.loads(UI_FLICKER_STATUS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            return [TextContent(type="text", text=f"Failed to read UI flicker status: {error}")]
+        age_seconds = max(0.0, time.time() - UI_FLICKER_STATUS_FILE.stat().st_mtime)
+        status["statusAgeSeconds"] = round(age_seconds, 3)
+        status["statusFresh"] = age_seconds < 5.0
+        result: list[TextContent | ImageContent] = [
+            TextContent(type="text", text=json.dumps(status, indent=2))
+        ]
+        incident_value = status.get("lastIncidentDirectory")
+        if arguments.get("include_images", True) and incident_value:
+            incident_dir = Path(incident_value).resolve()
+            try:
+                incident_dir.relative_to(SIMULATOR_DIR.resolve())
+                contact_sheet = build_flicker_contact_sheet(
+                    incident_dir, int(arguments.get("max_frames", 8)))
+            except (ValueError, OSError, AttributeError):
+                contact_sheet = None
+            if contact_sheet:
+                result.append(ImageContent(
+                    type="image",
+                    data=base64.standard_b64encode(contact_sheet).decode("utf-8"),
+                    mimeType="image/jpeg",
+                ))
+        return result
+
+    elif name == "capture_ui_flicker_window":
+        ensure_simulator_dir()
+        timeout = max(1.0, min(float(arguments.get("timeout", 5.0)), 15.0))
+        max_frames = max(2, min(int(arguments.get("max_frames", 12)), 12))
+        previous_incident = ""
+        if UI_FLICKER_STATUS_FILE.exists():
+            try:
+                previous_incident = json.loads(
+                    UI_FLICKER_STATUS_FILE.read_text(encoding="utf-8")
+                ).get("lastIncidentDirectory", "")
+            except (OSError, json.JSONDecodeError):
+                pass
+        _write_json_command(UI_FLICKER_CAPTURE_REQUEST_FILE, {
+            "requestedUnixMs": int(time.time() * 1000),
+            "source": "mcp-ui-only",
+        })
+        deadline = time.time() + timeout
+        incident_dir: Optional[Path] = None
+        status: dict[str, Any] = {}
+        while time.time() < deadline:
+            try:
+                status = json.loads(UI_FLICKER_STATUS_FILE.read_text(encoding="utf-8"))
+                current = status.get("lastIncidentDirectory", "")
+                if current and current != previous_incident:
+                    candidate = Path(current).resolve()
+                    candidate.relative_to(SIMULATOR_DIR.resolve())
+                    if len(list(candidate.glob("frame*_preview.bmp"))) >= 2:
+                        incident_dir = candidate
+                        break
+            except (OSError, json.JSONDecodeError, ValueError):
+                pass
+            time.sleep(0.1)
+        if not incident_dir:
+            return [TextContent(
+                type="text",
+                text="Timed out waiting for a UI-only burst. No valid quad rectangle may be visible."
+            )]
+        settle_deadline = min(deadline, time.time() + 1.0)
+        while time.time() < settle_deadline and len(list(incident_dir.glob("frame*_preview.bmp"))) < max_frames:
+            time.sleep(0.1)
+        contact_sheet = build_flicker_contact_sheet(incident_dir, max_frames)
+        result = [TextContent(type="text", text=json.dumps({
+            "captureSource": "openxr-simulator-ui-quad",
+            "incidentDirectory": str(incident_dir),
+            "framesAvailable": len(list(incident_dir.glob("frame*_preview.bmp"))),
+            "status": status,
+        }, indent=2))]
+        if contact_sheet:
+            result.append(ImageContent(
+                type="image",
+                data=base64.standard_b64encode(contact_sheet).decode("utf-8"),
+                mimeType="image/jpeg",
+            ))
+        return result
 
     elif name == "read_logs":
         lines = arguments.get("lines", 100)

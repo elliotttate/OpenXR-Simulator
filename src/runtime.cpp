@@ -17,6 +17,8 @@
 #include <dxgi.h>
 #include <dxgi1_6.h>
 
+#include "flicker_detector.h"
+
 // OpenGL headers - minimal definitions for what we need
 #include <GL/gl.h>
 
@@ -98,6 +100,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <share.h>
 #include <chrono>
 
 #include <openxr/openxr.h>
@@ -134,7 +137,7 @@ static void EnsureLogFile() {
     } else {
         snprintf(path, sizeof(path), ".\\openxr_simulator.log");
     }
-    fopen_s(&g_LogFile, path, "a");
+    g_LogFile = _fsopen(path, "a", _SH_DENYNO);
 }
 static void Log(const char* msg) {
     OutputDebugStringA(msg);
@@ -310,12 +313,45 @@ struct Session {
     ComPtr<ID3D12Resource> previewRT12;         // offscreen render target (replaces swapchain backbuffer)
     ComPtr<ID3D12Resource> previewReadback12;   // CPU-readable buffer for GDI blit
     UINT previewReadbackPitch{0};               // row pitch aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+    // Persistent CPU/GDI frame surface. Projection and quad layers are composed
+    // here, then copied to the window once per xrEndFrame to avoid layer flicker.
+    HDC previewMemDC{nullptr};
+    HBITMAP previewDib{nullptr};
+    HGDIOBJ previewOldBitmap{nullptr};
+    void* previewDibBits{nullptr};
+    UINT previewDibWidth{0};
+    UINT previewDibHeight{0};
+    // Changes only after a complete projection readback reaches the CPU DIB.
+    // The flicker detector uses this to ignore duplicate paints at XR cadence.
+    uint64_t previewDibGeneration{0};
+    uint64_t previewPresentedGeneration{0};
+    uint64_t projectionDibGeneration{0};
     // Quad-layer readback (D3D12): the quad swapchain texture is copied here so its pixels can be GDI-painted
     // over the eye preview. Lazily (re)created to the quad texture size; pitch aligned to 256.
     ComPtr<ID3D12Resource> quadReadback12;
     UINT quadReadbackPitch{0};
     uint32_t quadReadbackW{0};
     uint32_t quadReadbackH{0};
+    // Last successful quad readback. UI readback is intentionally slower than
+    // projection preview readback, so this cache must be re-applied whenever a
+    // new projection overwrites the composed DIB.
+    HDC quadCacheMemDC{nullptr};
+    HBITMAP quadCacheDib{nullptr};
+    HGDIOBJ quadCacheOldBitmap{nullptr};
+    void* quadCacheDibBits{nullptr};
+    uint32_t quadCacheDibW{0};
+    uint32_t quadCacheDibH{0};
+    std::vector<uint8_t> quadCachedPixels;
+    uint32_t quadCachedW{0};
+    uint32_t quadCachedH{0};
+    DXGI_FORMAT quadCachedFormat{DXGI_FORMAT_UNKNOWN};
+    bool quadCachedSourceAlpha{false};
+    bool quadCacheValid{false};
+    int32_t quadLastRects[2][4] = {};
+    float quadLastAlphaCoverage{0.0f};
+    bool uiFrameFreshReadback{false};
+    bool uiFrameCachedPixelsUsed{false};
+    bool uiFrameComposed{false};
     ComPtr<ID3D12CommandAllocator> previewCmdAlloc;
     ComPtr<ID3D12GraphicsCommandList> previewCmdList;
     ComPtr<ID3D12Fence> previewFence;
@@ -411,8 +447,8 @@ static XrFovf GetUiFov(uint32_t eyeIndex) {
         int fovDeg = ui::g_uiState.fovDegrees;
         if (fovDeg <= 0 || fovDeg > 180) fovDeg = 90;
         float fovRadians = fovDeg * 0.5f * 3.14159265f / 180.0f;
-        float fovTan = tanf(fovRadians);
-        return XrFovf{ -fovTan, fovTan, fovTan, -fovTan };
+        // XrFovf fields are angles in radians, not tangent-space extents.
+        return XrFovf{ -fovRadians, fovRadians, fovRadians, -fovRadians };
     }
 
     switch (ui::g_uiState.headsetProfile) {
@@ -509,6 +545,11 @@ static ControllerState g_rightController = {
 
 // Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
 static std::unordered_map<XrSpace, int> g_controllerSpaces;
+
+// Map reference-space handles to their XrReferenceSpaceType (VIEW/LOCAL/STAGE) so
+// xrLocateSpace can report the real head pose + TRACKED bits for the VIEW space
+// (a real runtime sets *_TRACKED_BIT when tracking is active; UEVR gates on it).
+static std::unordered_map<XrSpace, int> g_refSpaceTypes;
 
 // Map XrPath to path string for controller detection
 static std::unordered_map<XrPath, std::string> g_pathStrings;
@@ -813,14 +854,122 @@ static void ResetD3D12PreviewResources(rt::Session& s) {
     s.previewQueue12.Reset();
     s.crossQueueFence.Reset();
     s.crossQueueFenceValue = 0;
+    if (s.previewMemDC && s.previewOldBitmap) {
+        SelectObject(s.previewMemDC, s.previewOldBitmap);
+    }
+    if (s.previewDib) {
+        DeleteObject(s.previewDib);
+        s.previewDib = nullptr;
+    }
+    if (s.previewMemDC) {
+        DeleteDC(s.previewMemDC);
+        s.previewMemDC = nullptr;
+    }
+    s.previewOldBitmap = nullptr;
+    s.previewDibBits = nullptr;
+    s.previewDibWidth = 0;
+    s.previewDibHeight = 0;
+    s.previewDibGeneration = 0;
+    s.previewPresentedGeneration = 0;
+    s.projectionDibGeneration = 0;
+    if (s.quadCacheMemDC && s.quadCacheOldBitmap) {
+        SelectObject(s.quadCacheMemDC, s.quadCacheOldBitmap);
+    }
+    if (s.quadCacheDib) DeleteObject(s.quadCacheDib);
+    if (s.quadCacheMemDC) DeleteDC(s.quadCacheMemDC);
+    s.quadCacheMemDC = nullptr;
+    s.quadCacheDib = nullptr;
+    s.quadCacheOldBitmap = nullptr;
+    s.quadCacheDibBits = nullptr;
+    s.quadCacheDibW = s.quadCacheDibH = 0;
+    s.quadCachedPixels.clear();
+    s.quadCachedW = s.quadCachedH = 0;
+    s.quadCachedFormat = DXGI_FORMAT_UNKNOWN;
+    s.quadCachedSourceAlpha = false;
+    s.quadCacheValid = false;
+    memset(s.quadLastRects, 0, sizeof(s.quadLastRects));
+    s.quadLastAlphaCoverage = 0.0f;
     if (s.previewFenceEvent) {
         CloseHandle(s.previewFenceEvent);
         s.previewFenceEvent = nullptr;
     }
 }
 
+// Paint the persistent D3D12 projection+overlay DIB. Keeping this in the
+// window's WM_PAINT path prevents DefWindowProc/background erases from
+// alternating with direct GetDC blits and producing visible flicker.
+static bool PaintD3D12FrameSurface(HWND hWnd, HDC hdc) {
+    auto& s = rt::g_session;
+    if (!s.usesD3D12 || !s.previewMemDC || !s.previewDibBits ||
+        s.previewDibWidth == 0 || s.previewDibHeight == 0) {
+        return false;
+    }
+
+    RECT cr{};
+    if (!GetClientRect(hWnd, &cr)) return false;
+    const int clientW = cr.right - cr.left;
+    const int clientH = cr.bottom - cr.top;
+    if (clientW <= 0 || clientH <= 0) return false;
+
+    rt::FitRect fit = rt::ComputeFitRect(
+        (int)s.previewDibWidth, (int)s.previewDibHeight, clientW, clientH);
+    const int dstX = (int)fit.x;
+    const int dstY = (int)fit.y;
+    const int dstW = std::max(1, (int)fit.w);
+    const int dstH = std::max(1, (int)fit.h);
+
+    // Do not clear the complete client area before the image blit. On some GDI
+    // and remote-display paths that intermediate black surface is visible and
+    // looks like high-frequency flicker. Only update the exposed letterbox bars.
+    const HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    RECT bar{};
+    if (dstY > 0) {
+        bar = {0, 0, clientW, dstY};
+        FillRect(hdc, &bar, black);
+    }
+    if (dstY + dstH < clientH) {
+        bar = {0, dstY + dstH, clientW, clientH};
+        FillRect(hdc, &bar, black);
+    }
+    if (dstX > 0) {
+        bar = {0, dstY, dstX, dstY + dstH};
+        FillRect(hdc, &bar, black);
+    }
+    if (dstX + dstW < clientW) {
+        bar = {dstX + dstW, dstY, clientW, dstY + dstH};
+        FillRect(hdc, &bar, black);
+    }
+    SetStretchBltMode(hdc, HALFTONE);
+    SetBrushOrgEx(hdc, 0, 0, nullptr);
+    StretchBlt(hdc, dstX, dstY, dstW, dstH,
+               s.previewMemDC, 0, 0,
+               (int)s.previewDibWidth, (int)s.previewDibHeight, SRCCOPY);
+    return true;
+}
+
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+        case WM_ERASEBKGND:
+            // WM_PAINT covers the full client area from the persistent DIB.
+            // Suppress the class background brush between rendered frames.
+            if (rt::g_session.usesD3D12 && rt::g_session.previewDibBits) return 1;
+            break;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC hdc = BeginPaint(hWnd, &ps);
+            const bool paintedPreview = PaintD3D12FrameSurface(hWnd, hdc);
+            if (!paintedPreview) {
+                RECT cr{};
+                GetClientRect(hWnd, &cr);
+                FillRect(hdc, &cr, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            }
+            EndPaint(hWnd, &ps);
+            flicker::ObservePaint(rt::g_session.previewDibGeneration, paintedPreview);
+            return 0;
+        }
+        case WM_PRINTCLIENT:
+            if (PaintD3D12FrameSurface(hWnd, (HDC)wParam)) return 0;
+            break;
         case WM_CLOSE:
             if (rt::g_session.handle != XR_NULL_HANDLE) {
                 rt::PushState(rt::g_session.handle, XR_SESSION_STATE_EXITING);
@@ -1056,10 +1205,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             return 0;
         }
-        case WM_ERASEBKGND:
-            // We repaint the full client area every frame. Skipping the GDI
-            // erase prevents flicker behind the D3D12 GDI blit during resize.
-            return 1;
         case WM_MOUSEMOVE:
             if (rt::g_mouseCapture) {
                 POINT currentPos;
@@ -1536,12 +1681,16 @@ static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance, 
         for (uint32_t i = 0; i < 2; ++i) {
             views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
             views[i].next = nullptr;
+            // Keep the recommended render-target aspect aligned with the
+            // default Quest 3 FOV. Its horizontal/vertical tangent spans are
+            // about 2.39/2.61 (0.917), so a near-square/tall eye target avoids
+            // the horizontal stretch and crop caused by the old 16:9 target.
             views[i].recommendedImageRectWidth = 1280;
-            views[i].recommendedImageRectHeight = 720;
+            views[i].recommendedImageRectHeight = 1400;
             views[i].recommendedSwapchainSampleCount = 1;
             views[i].maxImageRectWidth = 4096; views[i].maxImageRectHeight = 4096; views[i].maxSwapchainSampleCount = 1;
         }
-        Log("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (1280x720 recommended)");
+        Log("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (1280x1400 recommended)");
     }
     return XR_SUCCESS;
 }
@@ -2200,11 +2349,10 @@ static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const 
     // The app just released the image it acquired earlier
     ch.lastReleased = ch.lastAcquired;
 
-    // For D3D12: the app has finished using this image, reset our tracked state to COMMON.
-    // D3D12 implicit state promotion/decay means COMMON is always safe after a GPU sync point.
-    if (ch.backend == rt::Swapchain::Backend::D3D12 && ch.lastReleased < ch.imageStates12.size()) {
-        ch.imageStates12[ch.lastReleased] = D3D12_RESOURCE_STATE_COMMON;
-    }
+    // Preserve the D3D12 state the application returned to us. UEVR transitions
+    // runtime-owned color images back to RENDER_TARGET before releasing them.
+    // Pretending they are COMMON makes the preview queue issue barriers with the
+    // wrong StateBefore value and can turn otherwise valid eye copies black.
 
     static int releaseCount = 0;
     bool shouldLog = (++releaseCount <= 10);
@@ -3373,11 +3521,77 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
     }
 }
 
-// D3D12 blit function - copies swapchain textures to offscreen RT, reads back to CPU, paints via GDI.
-// Uses GDI instead of DXGI Present to avoid hook conflicts with Steam overlay / UEVR.
+static bool ensureD3D12FrameSurface(rt::Session& s, UINT width, UINT height) {
+    if (s.previewMemDC && s.previewDib && s.previewDibBits &&
+        s.previewDibWidth == width && s.previewDibHeight == height) {
+        return true;
+    }
+
+    if (s.previewMemDC && s.previewOldBitmap) {
+        SelectObject(s.previewMemDC, s.previewOldBitmap);
+    }
+    if (s.previewDib) DeleteObject(s.previewDib);
+    if (s.previewMemDC) DeleteDC(s.previewMemDC);
+    s.previewMemDC = nullptr;
+    s.previewDib = nullptr;
+    s.previewOldBitmap = nullptr;
+    s.previewDibBits = nullptr;
+    s.previewDibWidth = 0;
+    s.previewDibHeight = 0;
+    s.previewDibGeneration = 0;
+    s.previewPresentedGeneration = 0;
+    s.projectionDibGeneration = 0;
+
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = (LONG)width;
+    bmi.bmiHeader.biHeight = -(LONG)height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    s.previewMemDC = CreateCompatibleDC(nullptr);
+    if (!s.previewMemDC) return false;
+    s.previewDib = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &s.previewDibBits, nullptr, 0);
+    if (!s.previewDib || !s.previewDibBits) {
+        if (s.previewDib) DeleteObject(s.previewDib);
+        DeleteDC(s.previewMemDC);
+        s.previewMemDC = nullptr;
+        s.previewDib = nullptr;
+        s.previewDibBits = nullptr;
+        return false;
+    }
+
+    s.previewOldBitmap = SelectObject(s.previewMemDC, s.previewDib);
+    s.previewDibWidth = width;
+    s.previewDibHeight = height;
+    return true;
+}
+
+static void presentD3D12FrameSurface(rt::Session& s) {
+    if (!s.hwnd || !s.previewMemDC || !s.previewDibBits ||
+        s.previewDibWidth == 0 || s.previewDibHeight == 0) {
+        return;
+    }
+    // The XR loop may be 90+ Hz while the intentionally throttled preview DIB
+    // changes at ~30 Hz. Repainting an identical generation adds GDI churn and
+    // can expose transient clears without producing any new visible content.
+    if (s.previewDibGeneration == 0 ||
+        s.previewDibGeneration == s.previewPresentedGeneration) {
+        return;
+    }
+    if (RedrawWindow(s.hwnd, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE)) {
+        s.previewPresentedGeneration = s.previewDibGeneration;
+    }
+}
+
+// D3D12 blit function - copies swapchain textures to an offscreen RT, reads back to a
+// persistent CPU DIB, and leaves it there for quad composition. xrEndFrame paints the
+// fully composed DIB once, avoiding projection/quad flicker and DXGI Present hooks.
 static void blitD3D12ToPreview(rt::Session& s,
-                                rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice,
-                                rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice,
+                                rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice, const XrRect2Di& leftRect,
+                                rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice, const XrRect2Di* rightRect,
                                 ui::DisplayLayout layout, ui::ViewMode viewMode) {
     if (!s.previewRT12 || !s.previewReadback12 || !s.previewCmdList || !s.previewCmdAlloc) {
         Log("[SimXR] blitD3D12ToPreview: Missing D3D12 preview resources");
@@ -3391,6 +3605,20 @@ static void blitD3D12ToPreview(rt::Session& s,
                           chainL.format == DXGI_FORMAT_D16_UNORM);
     if (isDepthFormat) {
         return;
+    }
+
+    // Throttle the preview paint to ~30Hz: the GPU readback + GDI paint below couple the
+    // XR frame loop to the (60Hz, DWM-throttled) desktop, capping high-FPS apps. The
+    // preview only exists for humans, so skipping frames here never affects the app.
+    {
+        static LARGE_INTEGER s_lastPreviewPaint = {};
+        static LARGE_INTEGER s_qpcFreq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        if (s_lastPreviewPaint.QuadPart != 0 &&
+            (double)(now.QuadPart - s_lastPreviewPaint.QuadPart) / (double)s_qpcFreq.QuadPart < (1.0 / 30.0)) {
+            return;
+        }
+        s_lastPreviewPaint = now;
     }
 
     // Wait for previous frame to finish
@@ -3449,7 +3677,7 @@ static void blitD3D12ToPreview(rt::Session& s,
     UINT rtWidth = (UINT)rtDesc.Width;
     UINT rtHeight = rtDesc.Height;
 
-    auto copyEye = [&](rt::Swapchain& chain, uint32_t idx, uint32_t slice,
+    auto copyEye = [&](rt::Swapchain& chain, uint32_t idx, uint32_t slice, const XrRect2Di& imageRect,
                        UINT dstX, UINT dstY, const char* label) -> bool {
         if (idx >= chain.images12.size() || !chain.images12[idx]) return false;
         if (chain.imageStates12.size() <= idx) {
@@ -3460,8 +3688,7 @@ static void blitD3D12ToPreview(rt::Session& s,
         if (subresource == UINT_MAX) return false;
 
         ID3D12Resource* srcTex = chain.images12[idx].Get();
-        // Transition from COMMON (reset on release) to COPY_SOURCE
-        // D3D12 supports implicit promotion from COMMON, but explicit barrier is safer
+        const D3D12_RESOURCE_STATES originalState = chain.imageStates12[idx];
         transition(srcTex, chain.imageStates12[idx], D3D12_RESOURCE_STATE_COPY_SOURCE);
 
         D3D12_TEXTURE_COPY_LOCATION dst = {};
@@ -3474,24 +3701,35 @@ static void blitD3D12ToPreview(rt::Session& s,
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         src.SubresourceIndex = subresource;
 
-        // Clip source box to fit within render target (CopyTextureRegion is 1:1 pixel copy, no scaling)
-        UINT copyW = chain.width;
-        UINT copyH = chain.height;
+        // OpenXR views may submit a subrect of a double-wide swapchain. Respect
+        // imageRect instead of copying the full backing texture into each eye.
+        const UINT srcX = imageRect.offset.x > 0 ? (UINT)imageRect.offset.x : 0;
+        const UINT srcY = imageRect.offset.y > 0 ? (UINT)imageRect.offset.y : 0;
+        UINT copyW = imageRect.extent.width > 0 ? (UINT)imageRect.extent.width :
+                     (srcX < chain.width ? chain.width - srcX : 0);
+        UINT copyH = imageRect.extent.height > 0 ? (UINT)imageRect.extent.height :
+                     (srcY < chain.height ? chain.height - srcY : 0);
+        if (srcX >= chain.width || srcY >= chain.height) return false;
+        if (srcX + copyW > chain.width) copyW = chain.width - srcX;
+        if (srcY + copyH > chain.height) copyH = chain.height - srcY;
+
+        // Clip the selected subrect to fit within the preview render target.
         if (dstX + copyW > rtWidth)  copyW = (dstX < rtWidth)  ? rtWidth  - dstX : 0;
         if (dstY + copyH > rtHeight) copyH = (dstY < rtHeight) ? rtHeight - dstY : 0;
         if (copyW == 0 || copyH == 0) return false;
 
         D3D12_BOX srcBox = {};
-        srcBox.left = 0;
-        srcBox.top = 0;
+        srcBox.left = srcX;
+        srcBox.top = srcY;
         srcBox.front = 0;
-        srcBox.right = copyW;
-        srcBox.bottom = copyH;
+        srcBox.right = srcX + copyW;
+        srcBox.bottom = srcY + copyH;
         srcBox.back = 1;
 
         s.previewCmdList->CopyTextureRegion(&dst, dstX, dstY, 0, &src, &srcBox);
-        // Transition back to COMMON so the app can use implicit promotion next frame
-        transition(srcTex, chain.imageStates12[idx], D3D12_RESOURCE_STATE_COMMON);
+        // Return the runtime-owned texture in the state the application expects
+        // to reacquire (UEVR uses RENDER_TARGET for color swapchains).
+        transition(srcTex, chain.imageStates12[idx], originalState);
         return true;
     };
 
@@ -3516,23 +3754,23 @@ static void blitD3D12ToPreview(rt::Session& s,
     // Single-eye mode: render selected eye full-screen
     if (singleEye || forceSingleEye) {
         if (viewMode == ui::ViewMode::RightEyeOnly && hasRight) {
-            copyEye(*chainR, rightIdx, rightSlice, 0, 0, "R");
+            copyEye(*chainR, rightIdx, rightSlice, rightRect ? *rightRect : leftRect, 0, 0, "R");
         } else if (hasLeft) {
-            copyEye(chainL, leftIdx, leftSlice, 0, 0, "L");
+            copyEye(chainL, leftIdx, leftSlice, leftRect, 0, 0, "L");
         } else if (hasRight) {
-            copyEye(*chainR, rightIdx, rightSlice, 0, 0, "R");
+            copyEye(*chainR, rightIdx, rightSlice, rightRect ? *rightRect : leftRect, 0, 0, "R");
         }
     } else {
         UINT rightX = (effectiveLayout == ui::DisplayLayout::OverUnder) ? 0 : (UINT)(s.previewWidth / 2);
         UINT rightY = (effectiveLayout == ui::DisplayLayout::OverUnder) ? (UINT)(s.previewHeight / 2) : 0;
 
         if (hasLeft) {
-            copyEye(chainL, leftIdx, leftSlice, 0, 0, "L");
+            copyEye(chainL, leftIdx, leftSlice, leftRect, 0, 0, "L");
         }
         if (hasRight) {
-            copyEye(*chainR, rightIdx, rightSlice, rightX, rightY, "R");
+            copyEye(*chainR, rightIdx, rightSlice, rightRect ? *rightRect : leftRect, rightX, rightY, "R");
         } else if (hasLeft) {
-            copyEye(chainL, leftIdx, leftSlice, rightX, rightY, "L");
+            copyEye(chainL, leftIdx, leftSlice, leftRect, rightX, rightY, "L");
         }
     }
 
@@ -3575,110 +3813,36 @@ static void blitD3D12ToPreview(rt::Session& s,
     }
     s.previewFenceValue++;
 
-    // Map readback buffer and paint to window via GDI (bypasses all DXGI Present hooks).
-    // The RT here is at the natural content size; StretchDIBits scales it into the
-    // letterbox fit rect inside the current window client area, so resizing the
-    // window scales the stereo image (with black bars) instead of cropping it.
+    // Map the GPU readback into the persistent top-down BGRA DIB. Quad layers are
+    // blended into this same surface later in xrEndFrame, then it is painted once.
     void* mapped = nullptr;
     D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * rtHeight };
     hr = s.previewReadback12->Map(0, &readRange, &mapped);
-    if (SUCCEEDED(hr) && mapped && s.hwnd) {
-        HDC hdc = GetDC(s.hwnd);
-        if (hdc) {
-            // Get current client area (live, in case a resize is mid-flight)
-            RECT cr{};
-            GetClientRect(s.hwnd, &cr);
-            int clientW = cr.right - cr.left;
-            int clientH = cr.bottom - cr.top;
-            if (clientW > 0 && clientH > 0) {
-                rt::FitRect fit = rt::ComputeFitRect((int)rtWidth, (int)rtHeight, clientW, clientH);
-                int dstX = (int)fit.x;
-                int dstY = (int)fit.y;
-                int dstW = (int)fit.w;
-                int dstH = (int)fit.h;
-                if (dstW < 1) dstW = 1;
-                if (dstH < 1) dstH = 1;
-
-                // GDI 32bpp BI_RGB DIBs are interpreted as BGRA byte order. The
-                // readback buffer holds bytes in the channel order of the offscreen
-                // RT (rtDesc.Format / s.previewFormat), which mirrors the submitted
-                // swapchain's channel layout (see displayFormat selection in the
-                // present path). If the source is RGBA (R8G8B8A8) the readback bytes
-                // are R,G,B,A — GDI would swap R<->B and show pink as purple. Use
-                // BI_BITFIELDS with explicit RGBA masks so GDI reads the existing
-                // byte order correctly, with zero per-pixel cost. Genuinely-BGRA
-                // sources (B8G8R8A8) already match GDI's BGRA expectation, so they
-                // keep BI_RGB and are not double-swapped.
-                const bool srcIsRGBA =
-                    (rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                     rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                     rtDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS);
-
-                // BITMAPINFO only reserves one RGBQUAD; BI_BITFIELDS needs three
-                // DWORD masks immediately after the header, so use a wrapper struct.
-                struct { BITMAPINFOHEADER hdr; DWORD masks[3]; } bmiBF = {};
-                BITMAPINFO bmiRGB = {};
-                BITMAPINFO* pbmi = srcIsRGBA ? (BITMAPINFO*)&bmiBF : &bmiRGB;
-                BITMAPINFOHEADER& hdr = srcIsRGBA ? bmiBF.hdr : bmiRGB.bmiHeader;
-
-                hdr.biSize = sizeof(BITMAPINFOHEADER);
-                hdr.biWidth = (LONG)rtWidth;
-                hdr.biHeight = -(LONG)rtHeight;  // top-down
-                hdr.biPlanes = 1;
-                hdr.biBitCount = 32;
-                if (srcIsRGBA) {
-                    // RGBA byte order in memory -> little-endian DWORD 0xAABBGGRR
-                    hdr.biCompression = BI_BITFIELDS;
-                    bmiBF.masks[0] = 0x000000FF;  // Red   (byte 0)
-                    bmiBF.masks[1] = 0x0000FF00;  // Green (byte 1)
-                    bmiBF.masks[2] = 0x00FF0000;  // Blue  (byte 2)
+    if (SUCCEEDED(hr) && mapped) {
+        if (ensureD3D12FrameSurface(s, rtWidth, rtHeight)) {
+            const bool srcIsRGBA =
+                (rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                 rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                 rtDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS);
+            const uint8_t* src = (const uint8_t*)mapped;
+            uint8_t* dst = (uint8_t*)s.previewDibBits;
+            const size_t packedPitch = (size_t)rtWidth * 4;
+            for (UINT row = 0; row < rtHeight; ++row) {
+                const uint8_t* srcRow = src + (size_t)row * s.previewReadbackPitch;
+                uint8_t* dstRow = dst + (size_t)row * packedPitch;
+                if (!srcIsRGBA) {
+                    memcpy(dstRow, srcRow, packedPitch);
                 } else {
-                    hdr.biCompression = BI_RGB;    // BGRA byte order matches GDI default
-                }
-
-                // Bilinear scaling for the StretchDIBits downscale path
-                SetStretchBltMode(hdc, HALFTONE);
-                SetBrushOrgEx(hdc, 0, 0, nullptr);
-
-                // Paint the letterbox borders black so resizing doesn't leave
-                // stale pixels around the scaled stereo image.
-                HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
-                if (dstY > 0) {
-                    RECT top{0, 0, clientW, dstY};
-                    FillRect(hdc, &top, black);
-                }
-                if (dstY + dstH < clientH) {
-                    RECT bot{0, dstY + dstH, clientW, clientH};
-                    FillRect(hdc, &bot, black);
-                }
-                if (dstX > 0) {
-                    RECT left{0, dstY, dstX, dstY + dstH};
-                    FillRect(hdc, &left, black);
-                }
-                if (dstX + dstW < clientW) {
-                    RECT right{dstX + dstW, dstY, clientW, dstY + dstH};
-                    FillRect(hdc, &right, black);
-                }
-
-                // Handle aligned row pitch: if pitch matches width*4, blit directly; otherwise copy rows
-                UINT expectedPitch = rtWidth * 4;
-                if (s.previewReadbackPitch == expectedPitch) {
-                    StretchDIBits(hdc, dstX, dstY, dstW, dstH,
-                                  0, 0, rtWidth, rtHeight,
-                                  mapped, pbmi, DIB_RGB_COLORS, SRCCOPY);
-                } else {
-                    // Copy rows with correct pitch to a contiguous buffer
-                    std::vector<uint8_t> pixels(expectedPitch * rtHeight);
-                    const uint8_t* src = (const uint8_t*)mapped;
-                    for (UINT row = 0; row < rtHeight; ++row) {
-                        memcpy(pixels.data() + row * expectedPitch, src + row * s.previewReadbackPitch, expectedPitch);
+                    for (UINT x = 0; x < rtWidth; ++x) {
+                        dstRow[x * 4 + 0] = srcRow[x * 4 + 2];
+                        dstRow[x * 4 + 1] = srcRow[x * 4 + 1];
+                        dstRow[x * 4 + 2] = srcRow[x * 4 + 0];
+                        dstRow[x * 4 + 3] = srcRow[x * 4 + 3];
                     }
-                    StretchDIBits(hdc, dstX, dstY, dstW, dstH,
-                                  0, 0, rtWidth, rtHeight,
-                                  pixels.data(), pbmi, DIB_RGB_COLORS, SRCCOPY);
                 }
             }
-            ReleaseDC(s.hwnd, hdc);
+            ++s.previewDibGeneration;
+            ++s.projectionDibGeneration;
         }
         D3D12_RANGE writeRange = { 0, 0 };
         s.previewReadback12->Unmap(0, &writeRange);
@@ -3690,7 +3854,7 @@ static void blitD3D12ToPreview(rt::Session& s,
 
     static int blitCount = 0;
     if (++blitCount % 60 == 1) {
-        Logf("[SimXR] blitD3D12ToPreview: GDI blit L[%u] R[%u] (%ux%u)", leftIdx, rightIdx, rtWidth, rtHeight);
+        Logf("[SimXR] blitD3D12ToPreview: staged L[%u] R[%u] (%ux%u)", leftIdx, rightIdx, rtWidth, rtHeight);
     }
 }
 
@@ -3713,15 +3877,26 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
         return;
     }
     auto& chL = itL->second;
-    uint32_t width = chL.width, height = chL.height;
+    uint32_t width = vL.subImage.imageRect.extent.width > 0
+                         ? (uint32_t)vL.subImage.imageRect.extent.width
+                         : chL.width;
+    uint32_t height = vL.subImage.imageRect.extent.height > 0
+                          ? (uint32_t)vL.subImage.imageRect.extent.height
+                          : chL.height;
     const rt::Swapchain* chRPtr = &chL;
     if (proj.viewCount > 1) {
         const auto& vR = proj.views[1];
         auto itR = rt::g_swapchains.find(vR.subImage.swapchain);
         if (itR != rt::g_swapchains.end()) {
             chRPtr = &itR->second;
-            if (itR->second.width > width) width = itR->second.width;
-            if (itR->second.height > height) height = itR->second.height;
+            const uint32_t rightWidth = vR.subImage.imageRect.extent.width > 0
+                                            ? (uint32_t)vR.subImage.imageRect.extent.width
+                                            : itR->second.width;
+            const uint32_t rightHeight = vR.subImage.imageRect.extent.height > 0
+                                             ? (uint32_t)vR.subImage.imageRect.extent.height
+                                             : itR->second.height;
+            if (rightWidth > width) width = rightWidth;
+            if (rightHeight > height) height = rightHeight;
         }
     }
     // Publish the source per-eye size so menu/keyboard zoom callbacks can
@@ -4342,15 +4517,16 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 } else if (chR.lastAcquired != UINT32_MAX && chR.lastAcquired < chR.imageCount) {
                     rightIdx = chR.lastAcquired;
                 }
-                blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex,
-                                   &chR, rightIdx, vR.subImage.imageArrayIndex,
+                blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex, vL.subImage.imageRect,
+                                   &chR, rightIdx, vR.subImage.imageArrayIndex, &vR.subImage.imageRect,
                                    layout, viewMode);
             } else {
-                blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex,
-                                   nullptr, 0, 0, layout, viewMode);
+                blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex, vL.subImage.imageRect,
+                                   nullptr, 0, 0, nullptr, layout, viewMode);
             }
 
-            // No Present call needed - blitD3D12ToPreview handles GDI painting directly
+            // No Present call here. blitD3D12ToPreview stages the eyes; xrEndFrame
+            // paints the completed projection+overlay DIB after all layers.
 
             // Update window title with FPS stats
             static int d3d12TitleFrameCount = 0;
@@ -4373,7 +4549,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // MCP Integration - check for screenshot requests and capture (D3D12)
             // Screenshots use the readback buffer that was just filled by blitD3D12ToPreview
             mcp::CheckScreenshotRequest();
-            if (mcp::g_screenshotRequested && s.previewRT12 && s.previewCmdAlloc && s.previewCmdList) {
+            if (mcp::g_screenshotRequested && mcp::g_screenshotLayer == "projection" &&
+                s.previewRT12 && s.previewCmdAlloc && s.previewCmdList) {
                 mcp::CaptureScreenshotD3D12(s.d3d12Device.Get(), s.previewQueue12.Get(),
                                              s.previewRT12.Get(),
                                              s.previewCmdAlloc.Get(), s.previewCmdList.Get(),
@@ -4387,76 +4564,190 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
     }
 }
 
-// Render a quad layer as 2D overlay (supports both D3D11 and OpenGL)
-// GDI-paint a quad's RGBA pixels (top-down, qw x qh) over the already-painted eye preview, for the D3D12
-// path. The head-locked quad (view-space pose+size) is projected to NDC with a default FOV and placed into
-// each eye half of the letterboxed preview. Opaque (StretchDIBits) for now; per-pixel alpha is a TODO
-// (needs Msimg32/AlphaBlend or a CPU read-blend of the window). Position/size are live-tunable from the mod
-// (hudx/hudy/hudz/hudw), so the FOV constant here only sets the default scale.
+// Composite a quad's RGBA pixels into the persistent D3D12 preview DIB. The
+// quad is projected independently for each eye using the submitted eye FOV;
+// xrEndFrame paints the finished projection+quad frame to the window once.
+// AlphaBlend expects premultiplied BGRA when AC_SRC_ALPHA is used.
 static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
-                             const uint8_t* rgba, uint32_t qw, uint32_t qh) {
-    if (!s.hwnd || !rgba || qw == 0 || qh == 0) return;
-    HDC hdc = GetDC(s.hwnd);
-    if (!hdc) return;
+                             const uint8_t* rgba, uint32_t qw, uint32_t qh, DXGI_FORMAT srcFormat,
+                             bool cachedPixels) {
+    if (!s.previewMemDC || !s.previewDibBits || !rgba || qw == 0 || qh == 0) return;
 
-    RECT cr{}; GetClientRect(s.hwnd, &cr);
-    const int clientW = cr.right - cr.left, clientH = cr.bottom - cr.top;
-    if (clientW <= 0 || clientH <= 0) { ReleaseDC(s.hwnd, hdc); return; }
+    const int eyeW = (int)s.previewDibWidth / 2;
+    const int eyeH = (int)s.previewDibHeight;
+    const int eyeOriginX[2] = {0, eyeW};
+    if (eyeW < 2 || eyeH < 2) return;
 
-    // Mirror blitD3D12ToPreview's letterbox so the quad lands in the same client coords as the eyes.
-    rt::FitRect fit = rt::ComputeFitRect((int)s.previewWidth, (int)s.previewHeight, clientW, clientH);
+    bool viewSpace = false;
+    int spaceType = -1;
+    auto spaceIt = rt::g_refSpaceTypes.find(quad->space);
+    if (spaceIt != rt::g_refSpaceTypes.end()) {
+        spaceType = spaceIt->second;
+        viewSpace = spaceType == XR_REFERENCE_SPACE_TYPE_VIEW;
+    }
+    const float relX = quad->pose.position.x - (viewSpace ? 0.0f : rt::g_headPos.x);
+    const float relY = quad->pose.position.y - (viewSpace ? 0.0f : rt::g_headPos.y);
+    const float relZ = quad->pose.position.z - (viewSpace ? 0.0f : rt::g_headPos.z);
+    const float dist = relZ < -0.01f ? -relZ : 1.5f;
 
-    // Default preview is side-by-side BothEyes (L | R). Composite into both halves.
-    const int eyeW = (int)fit.w / 2;
-    const int eyeH = (int)fit.h;
-    const int eyeOriginX[2] = { (int)fit.x, (int)fit.x + eyeW };
-    const int eyeOriginY = (int)fit.y;
-    if (eyeW < 2 || eyeH < 2) { ReleaseDC(s.hwnd, hdc); return; }
-
-    // Project the head-locked quad (view-space) to NDC. -z is forward.
-    const float z = quad->pose.position.z;
-    const float dist = (z < -0.01f) ? -z : 1.5f;
-    const float tanHx = 1.0f;                                  // ~90deg total H FOV (approx; tune via hudz/hudw)
-    const float tanHy = tanHx * ((float)eyeH / (float)eyeW);
-    const float cx = quad->pose.position.x / (dist * tanHx);
-    const float cy = quad->pose.position.y / (dist * tanHy);
-    const float hw = (quad->size.width  * 0.5f) / (dist * tanHx);
-    const float hh = (quad->size.height * 0.5f) / (dist * tanHy);
-    const float ndcL = cx - hw, ndcR = cx + hw, ndcT = cy + hh, ndcB = cy - hh;
-
-    // RGBA top-down DIB; BI_BITFIELDS so GDI reads R,G,B byte order (matches the eye-path masks).
     struct { BITMAPINFOHEADER hdr; DWORD masks[3]; } bmi = {};
     bmi.hdr.biSize = sizeof(BITMAPINFOHEADER);
     bmi.hdr.biWidth = (LONG)qw;
-    bmi.hdr.biHeight = -(LONG)qh;     // top-down
+    bmi.hdr.biHeight = -(LONG)qh;
     bmi.hdr.biPlanes = 1;
     bmi.hdr.biBitCount = 32;
     bmi.hdr.biCompression = BI_BITFIELDS;
-    bmi.masks[0] = 0x000000FF; bmi.masks[1] = 0x0000FF00; bmi.masks[2] = 0x00FF0000;
+    bmi.masks[0] = 0x000000FF;
+    bmi.masks[1] = 0x0000FF00;
+    bmi.masks[2] = 0x00FF0000;
 
-    SetStretchBltMode(hdc, HALFTONE);
-    SetBrushOrgEx(hdc, 0, 0, nullptr);
+    SetStretchBltMode(s.previewMemDC, HALFTONE);
+    SetBrushOrgEx(s.previewMemDC, 0, 0, nullptr);
 
-    for (int eye = 0; eye < 2; ++eye) {
-        const int px = eyeOriginX[eye] + (int)((ndcL * 0.5f + 0.5f) * eyeW);
-        const int py = eyeOriginY      + (int)((1.0f - (ndcT * 0.5f + 0.5f)) * eyeH);
-        const int pw = (int)((ndcR - ndcL) * 0.5f * eyeW);
-        const int ph = (int)((ndcT - ndcB) * 0.5f * eyeH);
-        if (pw < 1 || ph < 1) continue;
-        StretchDIBits(hdc, px, py, pw, ph, 0, 0, (int)qw, (int)qh,
-                      rgba, (BITMAPINFO*)&bmi, DIB_RGB_COLORS, SRCCOPY);
+    const bool sourceAlpha = (quad->layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
+    const bool bgraSource =
+        srcFormat == DXGI_FORMAT_B8G8R8A8_UNORM || srcFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+
+    std::vector<uint8_t> premulBGRA;
+    HDC alphaDC = nullptr;
+    uint64_t alphaNonzero = 0;
+    uint32_t alphaSum = 0;
+    uint8_t alphaMax = 0;
+    bool frameSurfaceChanged = false;
+    if (sourceAlpha) {
+        if (cachedPixels && s.quadCacheMemDC && s.quadCacheDibBits &&
+            s.quadCacheDibW == qw && s.quadCacheDibH == qh) {
+            alphaDC = s.quadCacheMemDC;
+            alphaNonzero = (uint64_t)std::llround(
+                (double)s.quadLastAlphaCoverage * (double)((uint64_t)qw * qh));
+        } else {
+            premulBGRA.resize((size_t)qw * qh * 4);
+            for (uint32_t i = 0; i < qw * qh; ++i) {
+                const uint8_t* srcPixel = rgba + (size_t)i * 4;
+                const uint8_t r = bgraSource ? srcPixel[2] : srcPixel[0];
+                const uint8_t g = srcPixel[1];
+                const uint8_t b = bgraSource ? srcPixel[0] : srcPixel[2];
+                const uint8_t a = srcPixel[3];
+                if (a != 0) ++alphaNonzero;
+                alphaSum += a;
+                alphaMax = std::max(alphaMax, a);
+                uint8_t* dstPixel = premulBGRA.data() + (size_t)i * 4;
+                dstPixel[0] = (uint8_t)((uint32_t)b * a / 255u);
+                dstPixel[1] = (uint8_t)((uint32_t)g * a / 255u);
+                dstPixel[2] = (uint8_t)((uint32_t)r * a / 255u);
+                dstPixel[3] = a;
+            }
+
+            if (!s.quadCacheMemDC || !s.quadCacheDib || !s.quadCacheDibBits ||
+                s.quadCacheDibW != qw || s.quadCacheDibH != qh) {
+                if (s.quadCacheMemDC && s.quadCacheOldBitmap) {
+                    SelectObject(s.quadCacheMemDC, s.quadCacheOldBitmap);
+                }
+                if (s.quadCacheDib) DeleteObject(s.quadCacheDib);
+                if (s.quadCacheMemDC) DeleteDC(s.quadCacheMemDC);
+                s.quadCacheMemDC = nullptr;
+                s.quadCacheDib = nullptr;
+                s.quadCacheOldBitmap = nullptr;
+                s.quadCacheDibBits = nullptr;
+                s.quadCacheDibW = s.quadCacheDibH = 0;
+
+                BITMAPINFO cacheInfo{};
+                cacheInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                cacheInfo.bmiHeader.biWidth = (LONG)qw;
+                cacheInfo.bmiHeader.biHeight = -(LONG)qh;
+                cacheInfo.bmiHeader.biPlanes = 1;
+                cacheInfo.bmiHeader.biBitCount = 32;
+                cacheInfo.bmiHeader.biCompression = BI_RGB;
+                s.quadCacheMemDC = CreateCompatibleDC(s.previewMemDC);
+                s.quadCacheDib = CreateDIBSection(s.previewMemDC, &cacheInfo,
+                    DIB_RGB_COLORS, &s.quadCacheDibBits, nullptr, 0);
+                if (s.quadCacheMemDC && s.quadCacheDib && s.quadCacheDibBits) {
+                    s.quadCacheOldBitmap = SelectObject(s.quadCacheMemDC, s.quadCacheDib);
+                    s.quadCacheDibW = qw;
+                    s.quadCacheDibH = qh;
+                }
+            }
+            if (s.quadCacheMemDC && s.quadCacheDibBits) {
+                memcpy(s.quadCacheDibBits, premulBGRA.data(), premulBGRA.size());
+                alphaDC = s.quadCacheMemDC;
+                s.quadCachedSourceAlpha = true;
+            }
+        }
     }
 
-    ReleaseDC(s.hwnd, hdc);
+    int quadRect[2][4] = {};
+    for (int eye = 0; eye < 2; ++eye) {
+        const XrFovf fov = rt::g_useCustomFov
+            ? XrFovf{rt::g_eyeFovL[eye], rt::g_eyeFovR[eye], rt::g_eyeFovU[eye], rt::g_eyeFovD[eye]}
+            : rt::GetUiFov((uint32_t)eye);
+        const float tanL = tanf(fov.angleLeft);
+        const float tanR = tanf(fov.angleRight);
+        const float tanU = tanf(fov.angleUp);
+        const float tanD = tanf(fov.angleDown);
+        const float invW = 1.0f / std::max(0.001f, tanR - tanL);
+        const float invH = 1.0f / std::max(0.001f, tanU - tanD);
+        const float slopeL = (relX - quad->size.width * 0.5f) / dist;
+        const float slopeR = (relX + quad->size.width * 0.5f) / dist;
+        const float slopeT = (relY + quad->size.height * 0.5f) / dist;
+        const float slopeB = (relY - quad->size.height * 0.5f) / dist;
+        const int px = eyeOriginX[eye] + (int)((slopeL - tanL) * invW * eyeW);
+        const int py = (int)((tanU - slopeT) * invH * eyeH);
+        const int pw = (int)((slopeR - slopeL) * invW * eyeW);
+        const int ph = (int)((slopeT - slopeB) * invH * eyeH);
+        quadRect[eye][0] = px;
+        quadRect[eye][1] = py;
+        quadRect[eye][2] = pw;
+        quadRect[eye][3] = ph;
+        if (pw < 1 || ph < 1) continue;
+
+        if (sourceAlpha && alphaDC) {
+            BLENDFUNCTION bf{};
+            bf.BlendOp = AC_SRC_OVER;
+            bf.SourceConstantAlpha = 255;
+            bf.AlphaFormat = AC_SRC_ALPHA;
+            if (!AlphaBlend(s.previewMemDC, px, py, pw, ph, alphaDC, 0, 0, (int)qw, (int)qh, bf)) {
+                Logf("[SimXR] D3D12 quad AlphaBlend failed err=%lu", GetLastError());
+            } else {
+                frameSurfaceChanged = true;
+            }
+        } else {
+            if (StretchDIBits(s.previewMemDC, px, py, pw, ph, 0, 0, (int)qw, (int)qh,
+                              rgba, (BITMAPINFO*)&bmi, DIB_RGB_COLORS, SRCCOPY) != GDI_ERROR) {
+                frameSurfaceChanged = true;
+            }
+        }
+    }
+
+    const float alphaCoverage = sourceAlpha && qw && qh
+        ? (float)((double)alphaNonzero / (double)((uint64_t)qw * qh)) : 1.0f;
+
+    // Overlay composition can change the displayed DIB on a frame where the
+    // 30 Hz projection readback was intentionally skipped. Treat it as a new
+    // visible generation so the detector cannot miss overlay-induced flicker.
+    if (frameSurfaceChanged) ++s.previewDibGeneration;
+    if (frameSurfaceChanged) {
+        memcpy(s.quadLastRects, quadRect, sizeof(quadRect));
+        s.quadLastAlphaCoverage = alphaCoverage;
+        s.uiFrameComposed = true;
+        s.uiFrameCachedPixelsUsed = cachedPixels;
+    }
+
     static int s_qlog = 0;
     if (++s_qlog % 120 == 1) {
-        Logf("[SimXR] D3D12 quad composited: tex=%ux%u pose=(%.2f,%.2f,%.2f) size=(%.2f,%.2f) fit=(%.0f,%.0f,%.0f,%.0f)",
-             qw, qh, quad->pose.position.x, quad->pose.position.y, quad->pose.position.z,
-             quad->size.width, quad->size.height, fit.x, fit.y, fit.w, fit.h);
+        const double alphaAvg = (qw && qh) ? (double)alphaSum / (double)(qw * qh) : 0.0;
+        Logf("[SimXR] D3D12 quad staged: tex=%ux%u alpha=%d aNonzero=%llu aMax=%u aAvg=%.2f space=%p type=%d view=%d pose=(%.2f,%.2f,%.2f) rel=(%.2f,%.2f,%.2f) size=(%.2f,%.2f) rectL=(%d,%d,%d,%d) rectR=(%d,%d,%d,%d) frame=%ux%u",
+             qw, qh, sourceAlpha ? 1 : 0, (unsigned long long)alphaNonzero, (unsigned)alphaMax, alphaAvg,
+             quad->space, spaceType, viewSpace ? 1 : 0,
+             quad->pose.position.x, quad->pose.position.y, quad->pose.position.z,
+             relX, relY, relZ, quad->size.width, quad->size.height,
+             quadRect[0][0], quadRect[0][1], quadRect[0][2], quadRect[0][3],
+             quadRect[1][0], quadRect[1][1], quadRect[1][2], quadRect[1][3],
+             s.previewDibWidth, s.previewDibHeight);
     }
 }
 
-static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) {
+static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad,
+                            bool projectionRefreshed) {
     if (!quad) return;
     // D3D12 sessions use previewRT12, not previewSwapchain
     if (!s.previewSwapchain && !s.previewRT12) return;
@@ -4476,16 +4767,39 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     uint32_t texIdx = (chain.lastReleased != UINT32_MAX) ? chain.lastReleased :
                       (chain.lastAcquired != UINT32_MAX) ? chain.lastAcquired : 0;
 
-    // --- D3D12 quad compositing -----------------------------------------------------------------------
-    // The D3D12 preview is GDI-painted (eyes already on the window via blitD3D12ToPreview). Read the quad
-    // swapchain texture to CPU (reusing the idle preview cmd list/queue/fence), then GDI-paint it over the
-    // eyes at the quad's projected rect, in each eye half. Opaque (StretchDIBits) when the quad has no
-    // source-alpha flag; per-pixel AlphaBlend otherwise (for the real UI texture). Self-contained: does not
-    // touch the eye composite path.
+        // --- D3D12 quad compositing -----------------------------------------------------------------------
+        // Read the quad swapchain texture to CPU (reusing the idle preview
+        // command objects), then blend it into the persistent eye-composite
+        // DIB. The window receives one completed frame after all layers.
     if (s.usesD3D12) {
         if (texIdx >= chain.images12.size() || !chain.images12[texIdx]) return;
         if (chain.imageStates12.size() <= texIdx) return;
         if (!s.previewCmdList || !s.previewCmdAlloc || !s.previewQueue12 || !s.previewFence || !s.hwnd) return;
+
+        // Throttle to ~10Hz: this synchronous GPU readback + GDI blend costs tens of ms at
+        // VR resolutions. At 30Hz the throttle stops helping once the app drops below
+        // 30 FPS (every frame passes the gate, and the ~40ms tax then HOLDS the app at
+        // ~20 FPS - a self-sustaining trap). 10Hz keeps the worst-case tax under ~30%
+        // of frame time even for a struggling app; the preview is only for humans.
+        {
+            static LARGE_INTEGER s_lastQuadPaint = {};
+            static LARGE_INTEGER s_qpcFreqQuad = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+            if (s_lastQuadPaint.QuadPart != 0 &&
+                (double)(now.QuadPart - s_lastQuadPaint.QuadPart) / (double)s_qpcFreqQuad.QuadPart < (1.0 / 10.0)) {
+                // A new projection readback replaces the entire composed DIB.
+                // Restore the most recent UI pixels even when a fresh GPU quad
+                // readback is throttled, otherwise the UI appears for one frame
+                // and disappears for the next two projection refreshes.
+                if (projectionRefreshed && s.quadCacheValid && !s.quadCachedPixels.empty()) {
+                    compositeQuadGDI(s, quad,
+                        s.quadCachedPixels.data(), s.quadCachedW, s.quadCachedH,
+                        s.quadCachedFormat, true);
+                }
+                return;
+            }
+            s_lastQuadPaint = now;
+        }
 
         const uint32_t qw = chain.width, qh = chain.height;
         const UINT qpitch = (qw * 4 + (D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
@@ -4558,7 +4872,30 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         D3D12_RANGE noWrite = { 0, 0 };
         s.quadReadback12->Unmap(0, &noWrite);
 
-        compositeQuadGDI(s, quad, qpix.data(), qw, qh);
+        // Match the OpenGL path: expose the actual D3D12 quad texture to MCP
+        // diagnostics, and defer quad-only screenshot requests until this layer
+        // has been read back.
+        mcp::StoreQuadLayerPixels(qpix.data(), qw, qh);
+        if (mcp::g_screenshotRequested && mcp::g_screenshotLayer == "quad") {
+            mcp::CaptureQuadScreenshot();
+            std::string p = mcp::GetSimulatorDataPath() + "\\screenshot_quad.bmp";
+            std::wstring wp(p.begin(), p.end());
+            ui::NotifyScreenshotSaved(wp);
+        }
+
+        s.quadCachedPixels = qpix;
+        s.quadCachedW = qw;
+        s.quadCachedH = qh;
+        s.quadCachedFormat = chain.format;
+        s.quadCacheValid = true;
+        s.uiFrameFreshReadback = true;
+        // Only blend onto a clean projection generation. When the 10 Hz quad
+        // readback happens between 30 Hz projection refreshes, cache it now and
+        // apply it on the next clean projection rather than double-alpha-blending
+        // over the UI already present in the persistent DIB.
+        if (projectionRefreshed) {
+            compositeQuadGDI(s, quad, qpix.data(), qw, qh, chain.format, false);
+        }
         return;
     }
 
@@ -4875,15 +5212,15 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     // (gameoverlayrenderer64) hooks it, which can trigger UEVR to re-submit frames
     // through the OpenXR API layer chain, re-entering this function and causing
     // infinite recursion → EXCEPTION_STACK_OVERFLOW.
-    static thread_local bool inEndFrame = false;
-    if (inEndFrame) {
-        static int reentrantCount = 0;
-        if (++reentrantCount <= 5) {
-            Logf("[SimXR] xrEndFrame: BLOCKED reentrant call #%d", reentrantCount);
+    static std::atomic_flag inEndFrame = ATOMIC_FLAG_INIT;
+    if (inEndFrame.test_and_set(std::memory_order_acquire)) {
+        static std::atomic<int> reentrantCount{0};
+        const int count = reentrantCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 5) {
+            Logf("[SimXR] xrEndFrame: BLOCKED concurrent/reentrant call #%d", count);
         }
         return XR_SUCCESS;
     }
-    inEndFrame = true;
 
     static int frameCount = 0;
     frameCount++;
@@ -4905,7 +5242,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
 
     if (!info) {
         Log("[SimXR] xrEndFrame: ERROR - info is null");
-        inEndFrame = false;
+        inEndFrame.clear(std::memory_order_release);
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
@@ -4925,10 +5262,16 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
             default: otherCount++; break;
         }
     }
+    flicker::ObserveSubmission((uint64_t)frameCount, (uint32_t)projectionCount,
+                               info->layerCount);
 
     // Determine if we need to defer Present for overlay layers
     bool hasOverlays = (quadCount > 0 || cylinderCount > 0);
     g_presentPending = false;
+    const uint64_t projectionGenerationBefore = rt::g_session.projectionDibGeneration;
+    rt::g_session.uiFrameFreshReadback = false;
+    rt::g_session.uiFrameCachedPixelsUsed = false;
+    rt::g_session.uiFrameComposed = false;
 
     // Second pass: render projection layers (background)
     // If there are overlays, skip Present until after they're rendered
@@ -4972,6 +5315,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
             presentProjection(rt::g_session, *proj, hasOverlays);  // skipPresent if overlays pending
         }
     }
+    const bool projectionRefreshed =
+        rt::g_session.projectionDibGeneration != projectionGenerationBefore;
 
     // Third pass: render overlay layers (quad, cylinder) on top of the projection
     for (uint32_t i = 0; i < info->layerCount; ++i) {
@@ -4981,7 +5326,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         switch (base->type) {
             case XR_TYPE_COMPOSITION_LAYER_QUAD: {
                 const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(base);
-                renderQuadLayer(rt::g_session, quad);
+                renderQuadLayer(rt::g_session, quad, projectionRefreshed);
                 break;
             }
             case (XrStructureType)37: {
@@ -4991,6 +5336,38 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
             default:
                 break;
         }
+    }
+
+    flicker::UiFrameInfo uiInfo;
+    uiInfo.quadLayers = (uint32_t)quadCount;
+    uiInfo.projectionRefreshed = projectionRefreshed;
+    uiInfo.freshReadback = rt::g_session.uiFrameFreshReadback;
+    uiInfo.cachedPixelsUsed = rt::g_session.uiFrameCachedPixelsUsed;
+    uiInfo.cacheValid = rt::g_session.quadCacheValid;
+    uiInfo.composed = rt::g_session.uiFrameComposed;
+    memcpy(uiInfo.rects, rt::g_session.quadLastRects, sizeof(uiInfo.rects));
+    uiInfo.sourceAlphaCoverage = rt::g_session.quadLastAlphaCoverage;
+    flicker::ObserveUi(
+        (const uint8_t*)rt::g_session.previewDibBits,
+        rt::g_session.previewDibWidth,
+        rt::g_session.previewDibHeight,
+        rt::g_session.previewDibGeneration,
+        (uint64_t)frameCount,
+        uiInfo);
+
+    // D3D12 projection and quad layers were staged into one persistent DIB.
+    // Paint that completed frame exactly once to eliminate inter-layer flicker.
+    if (rt::g_session.usesD3D12 && projectionCount > 0) {
+        // Inspect the exact fully composed DIB immediately before WM_PAINT. This
+        // is the simulator-visible output, after projection and quad layers, and
+        // uses the existing readback rather than adding another GPU stall.
+        flicker::ObservePreview(
+            (const uint8_t*)rt::g_session.previewDibBits,
+            rt::g_session.previewDibWidth,
+            rt::g_session.previewDibHeight,
+            rt::g_session.previewDibGeneration,
+            (uint64_t)frameCount);
+        presentD3D12FrameSurface(rt::g_session);
     }
 
     // MCP Integration - write frame status BEFORE Present (Present may block on D3D12)
@@ -5028,7 +5405,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         Log("[SimXR] xrEndFrame: WARNING - No projection layers found!");
     }
 
-    inEndFrame = false;
+    inEndFrame.clear(std::memory_order_release);
     return XR_SUCCESS;
 }
 
@@ -5131,6 +5508,7 @@ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrRefe
     if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
     static uintptr_t nextSpace = 100;
     *space = (XrSpace)(nextSpace++);
+    rt::g_refSpaceTypes[*space] = (int)info->referenceSpaceType;
     Logf("[SimXR] xrCreateReferenceSpace: type=%d space=%p", info->referenceSpaceType, *space);
     return XR_SUCCESS;
 }
@@ -5181,10 +5559,26 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
             location->pose.position = {0, 0, 0};
         }
     } else {
-        // Default for non-controller spaces (identity pose)
-        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-        location->pose.orientation = {0, 0, 0, 1};
-        location->pose.position = {0, 0, 0};
+        // Reference spaces (VIEW / LOCAL / STAGE). Report fully-tracked: a real
+        // runtime sets the *_TRACKED_BIT whenever tracking is live, and UEVR's
+        // "first valid poses" gate requires those bits before it will submit.
+        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                  XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                                  XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                                  XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+
+        auto typeIt = rt::g_refSpaceTypes.find(space);
+        int spaceType = (typeIt != rt::g_refSpaceTypes.end()) ? typeIt->second : 0;
+        if (spaceType == XR_REFERENCE_SPACE_TYPE_VIEW) {
+            // VIEW space located against LOCAL/STAGE == the current head pose, so
+            // HMD orientation/position actually track (yaw/pitch/roll from MCP).
+            location->pose.orientation = rt::QuatFromYawPitchRoll(rt::g_headYaw, rt::g_headPitch, rt::g_headRoll);
+            location->pose.position = rt::g_headPos;
+        } else {
+            // LOCAL / STAGE are fixed reference frames -> identity.
+            location->pose.orientation = {0, 0, 0, 1};
+            location->pose.position = {0, 0, 0};
+        }
     }
     return XR_SUCCESS;
 }

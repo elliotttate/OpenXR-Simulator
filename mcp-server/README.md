@@ -9,6 +9,7 @@ A Model Context Protocol (MCP) server that provides tools for diagnosing OpenXR 
 - **Log Analysis**: Read and analyze simulator logs for debugging
 - **Issue Diagnosis**: Automated analysis of common OpenXR problems
 - **Session Monitoring**: Track session state and head tracking
+- **UI Flicker Detection**: Inspect quad-layer continuity independently from world/projection motion
 
 ## Installation
 
@@ -62,6 +63,16 @@ Parameters:
 ### `get_frame_info`
 Get detailed information about the current frame including timing, resolution, format, and head tracking state.
 
+### `get_ui_flicker_status`
+Read UI-only quad submission, GPU readback, fresh composition, cached recomposition, and omission counters. When an incident exists, optionally returns a contact sheet cropped to the projected UI rectangle in both eyes.
+
+### `capture_ui_flicker_window`
+Force a rolling pre/post UI-only capture even when automatic thresholds remain clean.
+
+Parameters:
+- `timeout`: Seconds to wait for a valid quad capture - default: 5.0
+- `max_frames`: Maximum contact-sheet frames - default: 12
+
 ### `read_logs`
 Read recent entries from the OpenXR Simulator log file.
 
@@ -95,6 +106,8 @@ The MCP server uses the following files in `%LOCALAPPDATA%\OpenXR-Simulator\`:
 - `screenshot.bmp` - Captured screenshots
 - `screenshot_request.json` - Screenshot request trigger
 - `runtime_status.json` - Current frame status
+- `ui_flicker_status.json` - UI-only continuity and temporal status
+- `ui_flicker_incidents\` - UI-rectangle pre/post evidence packets
 
 ## How It Works
 
