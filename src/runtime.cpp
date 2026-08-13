@@ -125,6 +125,7 @@ inline UINT D3D12CalcSubresource(UINT MipSlice, UINT ArraySlice, UINT PlaneSlice
 
 // Simple logging (debug output + file log)
 static FILE* g_LogFile = nullptr;
+static std::mutex g_LogMutex;
 static void EnsureLogFile() {
     if (g_LogFile) return;
     char base[MAX_PATH]{};
@@ -138,11 +139,30 @@ static void EnsureLogFile() {
         snprintf(path, sizeof(path), ".\\openxr_simulator.log");
     }
     g_LogFile = _fsopen(path, "a", _SH_DENYNO);
+    if (g_LogFile) {
+        // Logging runs on the application's OpenXR thread. A forced disk flush
+        // for every diagnostic line turns harmless verbose logging into several
+        // milliseconds of xrEndFrame latency, especially on frames that submit
+        // projection plus UI layers. Keep a sizeable stdio buffer and flush at
+        // most once per second; normal process shutdown still flushes it too.
+        setvbuf(g_LogFile, nullptr, _IOFBF, 64 * 1024);
+    }
 }
 static void Log(const char* msg) {
     OutputDebugStringA(msg);
+    std::lock_guard<std::mutex> guard(g_LogMutex);
     EnsureLogFile();
-    if (g_LogFile) { fputs(msg, g_LogFile); if (msg[0] && msg[strlen(msg)-1] != '\n') fputc('\n', g_LogFile); fflush(g_LogFile);} }
+    if (g_LogFile) {
+        fputs(msg, g_LogFile);
+        if (msg[0] && msg[strlen(msg)-1] != '\n') fputc('\n', g_LogFile);
+        static ULONGLONG lastFlushMs = 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (lastFlushMs == 0 || nowMs - lastFlushMs >= 1000) {
+            fflush(g_LogFile);
+            lastFlushMs = nowMs;
+        }
+    }
+}
 static void Log(const std::string& msg) { Log(msg.c_str()); }
 static void Logf(const char* fmt, ...) {
     char buf[2048];
@@ -332,6 +352,14 @@ struct Session {
     UINT quadReadbackPitch{0};
     uint32_t quadReadbackW{0};
     uint32_t quadReadbackH{0};
+    ComPtr<ID3D12CommandAllocator> quadCmdAlloc;
+    ComPtr<ID3D12GraphicsCommandList> quadCmdList;
+    bool quadReadbackPending{false};
+    UINT64 quadReadbackPendingFenceValue{0};
+    DXGI_FORMAT quadReadbackPendingFormat{DXGI_FORMAT_UNKNOWN};
+    uint64_t quadReadbackSubmitted{0};
+    uint64_t quadReadbackCompleted{0};
+    uint64_t quadReadbackBusySkips{0};
     // Last successful quad readback. UI readback is intentionally slower than
     // projection preview readback, so this cache must be re-applied whenever a
     // new projection overwrites the composed DIB.
@@ -357,6 +385,14 @@ struct Session {
     ComPtr<ID3D12Fence> previewFence;
     HANDLE previewFenceEvent{nullptr};
     UINT64 previewFenceValue{0};
+    // Projection preview readback is submitted on the private preview queue and
+    // consumed on a later XR frame. The desktop mirror must never make the
+    // application's xrEndFrame wait for this fence.
+    bool previewReadbackPending{false};
+    UINT64 previewReadbackPendingFenceValue{0};
+    uint64_t previewReadbackSubmitted{0};
+    uint64_t previewReadbackCompleted{0};
+    uint64_t previewReadbackBusySkips{0};
 
     // Blit resources
     ComPtr<ID3D11VertexShader> blitVS;
@@ -844,11 +880,37 @@ static void GetPreviewClientSize(rt::Session& s, int srcW, int srcH, int& outW, 
 }
 
 static void ResetD3D12PreviewResources(rt::Session& s) {
+    // Destruction/resizing is rare and is the one path where an outstanding
+    // asynchronous diagnostic copy must be retired before releasing resources.
+    const UINT64 outstandingFence = std::max(
+        s.previewReadbackPending ? s.previewReadbackPendingFenceValue : 0ull,
+        s.quadReadbackPending ? s.quadReadbackPendingFenceValue : 0ull);
+    if (outstandingFence != 0 && s.previewFence && s.previewFenceEvent &&
+        s.previewFence->GetCompletedValue() < outstandingFence) {
+        s.previewFence->SetEventOnCompletion(outstandingFence, s.previewFenceEvent);
+        WaitForSingleObject(s.previewFenceEvent, 1000);
+    }
+    s.previewReadbackPending = false;
+    s.previewReadbackPendingFenceValue = 0;
+    s.previewReadbackSubmitted = 0;
+    s.previewReadbackCompleted = 0;
+    s.previewReadbackBusySkips = 0;
+    s.quadReadbackPending = false;
+    s.quadReadbackPendingFenceValue = 0;
+    s.quadReadbackPendingFormat = DXGI_FORMAT_UNKNOWN;
+    s.quadReadbackSubmitted = 0;
+    s.quadReadbackCompleted = 0;
+    s.quadReadbackBusySkips = 0;
     s.previewRT12.Reset();
     s.previewReadback12.Reset();
+    s.quadReadback12.Reset();
     s.previewReadbackPitch = 0;
+    s.quadReadbackPitch = 0;
+    s.quadReadbackW = s.quadReadbackH = 0;
     s.previewCmdAlloc.Reset();
     s.previewCmdList.Reset();
+    s.quadCmdAlloc.Reset();
+    s.quadCmdList.Reset();
     s.previewFence.Reset();
     s.previewFenceValue = 0;
     s.previewQueue12.Reset();
@@ -939,11 +1001,21 @@ static bool PaintD3D12FrameSurface(HWND hWnd, HDC hdc) {
         bar = {dstX + dstW, dstY, clientW, dstY + dstH};
         FillRect(hdc, &bar, black);
     }
-    SetStretchBltMode(hdc, HALFTONE);
-    SetBrushOrgEx(hdc, 0, 0, nullptr);
-    StretchBlt(hdc, dstX, dstY, dstW, dstH,
-               s.previewMemDC, 0, 0,
-               (int)s.previewDibWidth, (int)s.previewDibHeight, SRCCOPY);
+    // The common side-by-side window is already the DIB's natural size. Sending
+    // that through HALFTONE StretchBlt needlessly runs a multi-megapixel scaler
+    // on the OpenXR application thread (WM_PAINT is pumped by xrWaitFrame).
+    // BitBlt is a straight surface copy and removes several milliseconds from
+    // every preview refresh. Use the cheaper COLORONCOLOR path only when the user
+    // has actually resized the window.
+    if (dstW == (int)s.previewDibWidth && dstH == (int)s.previewDibHeight) {
+        BitBlt(hdc, dstX, dstY, dstW, dstH,
+               s.previewMemDC, 0, 0, SRCCOPY);
+    } else {
+        SetStretchBltMode(hdc, COLORONCOLOR);
+        StretchBlt(hdc, dstX, dstY, dstW, dstH,
+                   s.previewMemDC, 0, 0,
+                   (int)s.previewDibWidth, (int)s.previewDibHeight, SRCCOPY);
+    }
     return true;
 }
 
@@ -2628,10 +2700,13 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
     Log("[SimXR] ============================================");
     rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
     rt::PushState(s, XR_SESSION_STATE_VISIBLE);
-    // Only push FOCUSED if window is actually active/focused
-    if (rt::g_session.hwnd && rt::g_session.isFocused) {
-        rt::PushState(s, XR_SESSION_STATE_FOCUSED);
-    }
+    // A simulator has no physical HMD focus hand-off. The preview window is created
+    // lazily by xrWaitFrame, while several clients (including BetterVR) wait for
+    // FOCUSED before entering their frame loop. Conditioning FOCUSED on that not-yet-
+    // created window deadlocks a clean launch. Report input focus immediately; the
+    // window activation handler may still move between VISIBLE/FOCUSED later.
+    rt::g_session.isFocused = true;
+    rt::PushState(s, XR_SESSION_STATE_FOCUSED);
     return XR_SUCCESS; 
 }
 static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) { Log("[SimXR] xrEndSession"); rt::PushState(s, XR_SESSION_STATE_STOPPING); rt::PushState(s, XR_SESSION_STATE_IDLE); return XR_SUCCESS; }
@@ -3277,6 +3352,9 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         s.d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(s.previewCmdAlloc.GetAddressOf()));
         s.d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.previewCmdAlloc.Get(), nullptr, IID_PPV_ARGS(s.previewCmdList.GetAddressOf()));
         s.previewCmdList->Close();
+        s.d3d12Device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(s.quadCmdAlloc.GetAddressOf()));
+        s.d3d12Device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s.quadCmdAlloc.Get(), nullptr, IID_PPV_ARGS(s.quadCmdList.GetAddressOf()));
+        s.quadCmdList->Close();
         // Fence
         s.d3d12Device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(s.previewFence.GetAddressOf()));
         s.previewFenceValue = 1;
@@ -3580,8 +3658,11 @@ static void presentD3D12FrameSurface(rt::Session& s) {
         s.previewDibGeneration == s.previewPresentedGeneration) {
         return;
     }
+    // Queue WM_PAINT and return. RDW_UPDATENOW made the application's
+    // xrEndFrame synchronously StretchBlt the full stereo DIB; xrWaitFrame's
+    // message pump will service this invalidation before the next frame.
     if (RedrawWindow(s.hwnd, nullptr, nullptr,
-                     RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE)) {
+                     RDW_INVALIDATE | RDW_NOERASE)) {
         s.previewPresentedGeneration = s.previewDibGeneration;
     }
 }
@@ -3607,6 +3688,50 @@ static void blitD3D12ToPreview(rt::Session& s,
         return;
     }
 
+    // Consume a previously submitted readback only after its fence has completed.
+    // One or more frames of desktop-preview latency is harmless; stalling the XR
+    // application's render thread here is not.
+    if (s.previewReadbackPending &&
+        s.previewFence->GetCompletedValue() >= s.previewReadbackPendingFenceValue) {
+        const UINT completedWidth = s.previewWidth;
+        const UINT completedHeight = s.previewHeight;
+        const DXGI_FORMAT completedFormat = s.previewFormat;
+        void* mapped = nullptr;
+        D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * completedHeight };
+        HRESULT mapHr = s.previewReadback12->Map(0, &readRange, &mapped);
+        if (SUCCEEDED(mapHr) && mapped) {
+            if (ensureD3D12FrameSurface(s, completedWidth, completedHeight)) {
+                const bool srcIsRGBA =
+                    (completedFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                     completedFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                     completedFormat == DXGI_FORMAT_R8G8B8A8_TYPELESS);
+                const uint8_t* src = (const uint8_t*)mapped;
+                uint8_t* dst = (uint8_t*)s.previewDibBits;
+                const size_t packedPitch = (size_t)completedWidth * 4;
+                for (UINT row = 0; row < completedHeight; ++row) {
+                    const uint8_t* srcRow = src + (size_t)row * s.previewReadbackPitch;
+                    uint8_t* dstRow = dst + (size_t)row * packedPitch;
+                    if (!srcIsRGBA) {
+                        memcpy(dstRow, srcRow, packedPitch);
+                    } else {
+                        for (UINT x = 0; x < completedWidth; ++x) {
+                            dstRow[x * 4 + 0] = srcRow[x * 4 + 2];
+                            dstRow[x * 4 + 1] = srcRow[x * 4 + 1];
+                            dstRow[x * 4 + 2] = srcRow[x * 4 + 0];
+                            dstRow[x * 4 + 3] = srcRow[x * 4 + 3];
+                        }
+                    }
+                }
+                ++s.previewDibGeneration;
+                ++s.projectionDibGeneration;
+            }
+            D3D12_RANGE writeRange = { 0, 0 };
+            s.previewReadback12->Unmap(0, &writeRange);
+        }
+        s.previewReadbackPending = false;
+        ++s.previewReadbackCompleted;
+    }
+
     // Throttle the preview paint to ~30Hz: the GPU readback + GDI paint below couple the
     // XR frame loop to the (60Hz, DWM-throttled) desktop, capping high-FPS apps. The
     // preview only exists for humans, so skipping frames here never affects the app.
@@ -3621,10 +3746,11 @@ static void blitD3D12ToPreview(rt::Session& s,
         s_lastPreviewPaint = now;
     }
 
-    // Wait for previous frame to finish
-    if (s.previewFence->GetCompletedValue() < s.previewFenceValue - 1) {
-        s.previewFence->SetEventOnCompletion(s.previewFenceValue - 1, s.previewFenceEvent);
-        WaitForSingleObject(s.previewFenceEvent, 1000);
+    // Retain the last good DIB if the diagnostic copy is unusually slow. The
+    // preview drops an update instead of delaying application rendering.
+    if (s.previewReadbackPending) {
+        ++s.previewReadbackBusySkips;
+        return;
     }
 
     ID3D12Resource* renderTarget = s.previewRT12.Get();
@@ -3802,51 +3928,16 @@ static void blitD3D12ToPreview(rt::Session& s,
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     s.previewCmdList->ResourceBarrier(1, &barrier);
 
-    // Execute and wait for completion (we need the readback data immediately)
+    // Execute asynchronously. A later XR frame maps this readback only after the
+    // fence is complete, so desktop preview work cannot block xrEndFrame.
     s.previewCmdList->Close();
     ID3D12CommandList* cmdLists[] = { s.previewCmdList.Get() };
     s.previewQueue12->ExecuteCommandLists(1, cmdLists);
-    s.previewQueue12->Signal(s.previewFence.Get(), s.previewFenceValue);
-    if (s.previewFence->GetCompletedValue() < s.previewFenceValue) {
-        s.previewFence->SetEventOnCompletion(s.previewFenceValue, s.previewFenceEvent);
-        WaitForSingleObject(s.previewFenceEvent, 1000);
-    }
+    s.previewReadbackPendingFenceValue = s.previewFenceValue;
+    s.previewQueue12->Signal(s.previewFence.Get(), s.previewReadbackPendingFenceValue);
+    s.previewReadbackPending = true;
+    ++s.previewReadbackSubmitted;
     s.previewFenceValue++;
-
-    // Map the GPU readback into the persistent top-down BGRA DIB. Quad layers are
-    // blended into this same surface later in xrEndFrame, then it is painted once.
-    void* mapped = nullptr;
-    D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * rtHeight };
-    hr = s.previewReadback12->Map(0, &readRange, &mapped);
-    if (SUCCEEDED(hr) && mapped) {
-        if (ensureD3D12FrameSurface(s, rtWidth, rtHeight)) {
-            const bool srcIsRGBA =
-                (rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                 rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                 rtDesc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS);
-            const uint8_t* src = (const uint8_t*)mapped;
-            uint8_t* dst = (uint8_t*)s.previewDibBits;
-            const size_t packedPitch = (size_t)rtWidth * 4;
-            for (UINT row = 0; row < rtHeight; ++row) {
-                const uint8_t* srcRow = src + (size_t)row * s.previewReadbackPitch;
-                uint8_t* dstRow = dst + (size_t)row * packedPitch;
-                if (!srcIsRGBA) {
-                    memcpy(dstRow, srcRow, packedPitch);
-                } else {
-                    for (UINT x = 0; x < rtWidth; ++x) {
-                        dstRow[x * 4 + 0] = srcRow[x * 4 + 2];
-                        dstRow[x * 4 + 1] = srcRow[x * 4 + 1];
-                        dstRow[x * 4 + 2] = srcRow[x * 4 + 0];
-                        dstRow[x * 4 + 3] = srcRow[x * 4 + 3];
-                    }
-                }
-            }
-            ++s.previewDibGeneration;
-            ++s.projectionDibGeneration;
-        }
-        D3D12_RANGE writeRange = { 0, 0 };
-        s.previewReadback12->Unmap(0, &writeRange);
-    }
 
     // Process window messages
     MSG msg;
@@ -3854,7 +3945,11 @@ static void blitD3D12ToPreview(rt::Session& s,
 
     static int blitCount = 0;
     if (++blitCount % 60 == 1) {
-        Logf("[SimXR] blitD3D12ToPreview: staged L[%u] R[%u] (%ux%u)", leftIdx, rightIdx, rtWidth, rtHeight);
+        Logf("[SimXR] blitD3D12ToPreview: staged L[%u] R[%u] (%ux%u), async submitted=%llu completed=%llu busySkips=%llu",
+             leftIdx, rightIdx, rtWidth, rtHeight,
+             (unsigned long long)s.previewReadbackSubmitted,
+             (unsigned long long)s.previewReadbackCompleted,
+             (unsigned long long)s.previewReadbackBusySkips);
     }
 }
 
@@ -3862,10 +3957,12 @@ static void blitD3D12ToPreview(rt::Session& s,
 static bool g_presentPending = false;
 
 static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj, bool skipPresent = false) {
-    Log("[SimXR] ============================================");
-    Logf("[SimXR] presentProjection called: viewCount=%u, skipPresent=%d", proj.viewCount, (int)skipPresent);
-    Log("[SimXR] RENDERING FRAME TO PREVIEW WINDOW");
-    Log("[SimXR] ============================================");
+    static uint64_t projectionCallCount = 0;
+    const bool logProjection = ++projectionCallCount <= 5 || projectionCallCount % 120 == 1;
+    if (logProjection) {
+        Logf("[SimXR] presentProjection #%llu: viewCount=%u skipPresent=%d",
+             (unsigned long long)projectionCallCount, proj.viewCount, (int)skipPresent);
+    }
     if (proj.viewCount < 1) {
         Log("[SimXR] presentProjection: No views, returning");
         return;
@@ -4550,7 +4647,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // Screenshots use the readback buffer that was just filled by blitD3D12ToPreview
             mcp::CheckScreenshotRequest();
             if (mcp::g_screenshotRequested && mcp::g_screenshotLayer == "projection" &&
-                s.previewRT12 && s.previewCmdAlloc && s.previewCmdList) {
+                s.previewRT12 && s.previewCmdAlloc && s.previewCmdList && !s.previewReadbackPending) {
                 mcp::CaptureScreenshotD3D12(s.d3d12Device.Get(), s.previewQueue12.Get(),
                                              s.previewRT12.Get(),
                                              s.previewCmdAlloc.Get(), s.previewCmdList.Get(),
@@ -4774,31 +4871,72 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad,
     if (s.usesD3D12) {
         if (texIdx >= chain.images12.size() || !chain.images12[texIdx]) return;
         if (chain.imageStates12.size() <= texIdx) return;
-        if (!s.previewCmdList || !s.previewCmdAlloc || !s.previewQueue12 || !s.previewFence || !s.hwnd) return;
+        if (!s.quadCmdList || !s.quadCmdAlloc || !s.previewQueue12 || !s.previewFence || !s.hwnd) return;
 
-        // Throttle to ~10Hz: this synchronous GPU readback + GDI blend costs tens of ms at
-        // VR resolutions. At 30Hz the throttle stops helping once the app drops below
-        // 30 FPS (every frame passes the gate, and the ~40ms tax then HOLDS the app at
-        // ~20 FPS - a self-sustaining trap). 10Hz keeps the worst-case tax under ~30%
-        // of frame time even for a struggling app; the preview is only for humans.
+        // Complete an earlier quad copy without ever waiting on the application
+        // thread. One-frame-old UI is fine for a diagnostic mirror; a synchronous
+        // multi-megapixel GPU readback in xrEndFrame is not.
+        if (s.quadReadbackPending &&
+            s.previewFence->GetCompletedValue() >= s.quadReadbackPendingFenceValue) {
+            const uint32_t completedW = s.quadReadbackW;
+            const uint32_t completedH = s.quadReadbackH;
+            void* qmapped = nullptr;
+            D3D12_RANGE rr = { 0, (SIZE_T)s.quadReadbackPitch * completedH };
+            if (SUCCEEDED(s.quadReadback12->Map(0, &rr, &qmapped)) && qmapped) {
+                s.quadCachedPixels.resize((size_t)completedW * completedH * 4);
+                for (uint32_t y = 0; y < completedH; ++y) {
+                    memcpy(s.quadCachedPixels.data() + (size_t)y * completedW * 4,
+                           (const uint8_t*)qmapped + (size_t)y * s.quadReadbackPitch,
+                           (size_t)completedW * 4);
+                }
+                D3D12_RANGE noWrite = { 0, 0 };
+                s.quadReadback12->Unmap(0, &noWrite);
+
+                mcp::StoreQuadLayerPixels(s.quadCachedPixels.data(), completedW, completedH);
+                if (mcp::g_screenshotRequested && mcp::g_screenshotLayer == "quad") {
+                    mcp::CaptureQuadScreenshot();
+                    std::string p = mcp::GetSimulatorDataPath() + "\\screenshot_quad.bmp";
+                    std::wstring wp(p.begin(), p.end());
+                    ui::NotifyScreenshotSaved(wp);
+                }
+
+                s.quadCachedW = completedW;
+                s.quadCachedH = completedH;
+                s.quadCachedFormat = s.quadReadbackPendingFormat;
+                s.quadCacheValid = true;
+                s.uiFrameFreshReadback = true;
+            }
+            s.quadReadbackPending = false;
+            s.quadReadbackPendingFenceValue = 0;
+            ++s.quadReadbackCompleted;
+        }
+
+        // Every fresh projection replaces the entire DIB, so restore UI exactly
+        // once from the newest completed cache. This keeps the flicker fix while
+        // the next GPU readback proceeds independently.
+        if (projectionRefreshed && s.quadCacheValid && !s.quadCachedPixels.empty()) {
+            compositeQuadGDI(s, quad,
+                s.quadCachedPixels.data(), s.quadCachedW, s.quadCachedH,
+                s.quadCachedFormat, !s.uiFrameFreshReadback);
+        }
+
+        if (s.quadReadbackPending) {
+            ++s.quadReadbackBusySkips;
+            return;
+        }
+
+        // Sample the source UI at 10 Hz. Cached UI is still recomposed on every
+        // 30 Hz projection refresh, so this controls source latency rather than
+        // visible continuity.
         {
-            static LARGE_INTEGER s_lastQuadPaint = {};
+            static LARGE_INTEGER s_lastQuadSubmit = {};
             static LARGE_INTEGER s_qpcFreqQuad = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
-            if (s_lastQuadPaint.QuadPart != 0 &&
-                (double)(now.QuadPart - s_lastQuadPaint.QuadPart) / (double)s_qpcFreqQuad.QuadPart < (1.0 / 10.0)) {
-                // A new projection readback replaces the entire composed DIB.
-                // Restore the most recent UI pixels even when a fresh GPU quad
-                // readback is throttled, otherwise the UI appears for one frame
-                // and disappears for the next two projection refreshes.
-                if (projectionRefreshed && s.quadCacheValid && !s.quadCachedPixels.empty()) {
-                    compositeQuadGDI(s, quad,
-                        s.quadCachedPixels.data(), s.quadCachedW, s.quadCachedH,
-                        s.quadCachedFormat, true);
-                }
+            if (s_lastQuadSubmit.QuadPart != 0 &&
+                (double)(now.QuadPart - s_lastQuadSubmit.QuadPart) / (double)s_qpcFreqQuad.QuadPart < (1.0 / 10.0)) {
                 return;
             }
-            s_lastQuadPaint = now;
+            s_lastQuadSubmit = now;
         }
 
         const uint32_t qw = chain.width, qh = chain.height;
@@ -4821,13 +4959,8 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad,
             s.quadReadbackPitch = qpitch; s.quadReadbackW = qw; s.quadReadbackH = qh;
         }
 
-        // Copy quad texture -> readback (reusing the preview cmd list; it is idle after blitD3D12ToPreview).
-        if (s.previewFence->GetCompletedValue() < s.previewFenceValue - 1) {
-            s.previewFence->SetEventOnCompletion(s.previewFenceValue - 1, s.previewFenceEvent);
-            WaitForSingleObject(s.previewFenceEvent, 1000);
-        }
-        if (FAILED(s.previewCmdAlloc->Reset())) return;
-        if (FAILED(s.previewCmdList->Reset(s.previewCmdAlloc.Get(), nullptr))) return;
+        if (FAILED(s.quadCmdAlloc->Reset())) return;
+        if (FAILED(s.quadCmdList->Reset(s.quadCmdAlloc.Get(), nullptr))) return;
 
         ID3D12Resource* quadTex = chain.images12[texIdx].Get();
         auto& quadState = chain.imageStates12[texIdx];
@@ -4835,7 +4968,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad,
             D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             b.Transition.pResource = res; b.Transition.StateBefore = before; b.Transition.StateAfter = after;
             b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            s.previewCmdList->ResourceBarrier(1, &b);
+            s.quadCmdList->ResourceBarrier(1, &b);
         };
         const D3D12_RESOURCE_STATES qstate = quadState;
         if (qstate != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier12(quadTex, qstate, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -4847,55 +4980,18 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad,
         dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = qpitch;
         D3D12_TEXTURE_COPY_LOCATION src = {}; src.pResource = quadTex;
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
-        s.previewCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        s.quadCmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
         if (qstate != D3D12_RESOURCE_STATE_COPY_SOURCE) barrier12(quadTex, D3D12_RESOURCE_STATE_COPY_SOURCE, qstate);
-        s.previewCmdList->Close();
-        ID3D12CommandList* lists[] = { s.previewCmdList.Get() };
+        s.quadCmdList->Close();
+        ID3D12CommandList* lists[] = { s.quadCmdList.Get() };
         s.previewQueue12->ExecuteCommandLists(1, lists);
-        s.previewQueue12->Signal(s.previewFence.Get(), s.previewFenceValue);
-        if (s.previewFence->GetCompletedValue() < s.previewFenceValue) {
-            s.previewFence->SetEventOnCompletion(s.previewFenceValue, s.previewFenceEvent);
-            WaitForSingleObject(s.previewFenceEvent, 1000);
-        }
+        s.quadReadbackPendingFenceValue = s.previewFenceValue;
+        s.previewQueue12->Signal(s.previewFence.Get(), s.quadReadbackPendingFenceValue);
+        s.quadReadbackPending = true;
+        s.quadReadbackPendingFormat = chain.format;
+        ++s.quadReadbackSubmitted;
         s.previewFenceValue++;
-
-        void* qmapped = nullptr;
-        D3D12_RANGE rr = { 0, (SIZE_T)qpitch * qh };
-        if (FAILED(s.quadReadback12->Map(0, &rr, &qmapped)) || !qmapped) return;
-
-        // Pack the quad pixels into a contiguous top-down RGBA buffer for GDI.
-        std::vector<uint8_t> qpix((size_t)qw * qh * 4);
-        for (uint32_t y = 0; y < qh; ++y) {
-            memcpy(qpix.data() + (size_t)y * qw * 4, (const uint8_t*)qmapped + (size_t)y * qpitch, (size_t)qw * 4);
-        }
-        D3D12_RANGE noWrite = { 0, 0 };
-        s.quadReadback12->Unmap(0, &noWrite);
-
-        // Match the OpenGL path: expose the actual D3D12 quad texture to MCP
-        // diagnostics, and defer quad-only screenshot requests until this layer
-        // has been read back.
-        mcp::StoreQuadLayerPixels(qpix.data(), qw, qh);
-        if (mcp::g_screenshotRequested && mcp::g_screenshotLayer == "quad") {
-            mcp::CaptureQuadScreenshot();
-            std::string p = mcp::GetSimulatorDataPath() + "\\screenshot_quad.bmp";
-            std::wstring wp(p.begin(), p.end());
-            ui::NotifyScreenshotSaved(wp);
-        }
-
-        s.quadCachedPixels = qpix;
-        s.quadCachedW = qw;
-        s.quadCachedH = qh;
-        s.quadCachedFormat = chain.format;
-        s.quadCacheValid = true;
-        s.uiFrameFreshReadback = true;
-        // Only blend onto a clean projection generation. When the 10 Hz quad
-        // readback happens between 30 Hz projection refreshes, cache it now and
-        // apply it on the next clean projection rather than double-alpha-blending
-        // over the UI already present in the persistent DIB.
-        if (projectionRefreshed) {
-            compositeQuadGDI(s, quad, qpix.data(), qw, qh, chain.format, false);
-        }
         return;
     }
 
@@ -5222,6 +5318,9 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         return XR_SUCCESS;
     }
 
+    LARGE_INTEGER endFrameStart{};
+    QueryPerformanceCounter(&endFrameStart);
+
     static int frameCount = 0;
     frameCount++;
 
@@ -5315,6 +5414,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
             presentProjection(rt::g_session, *proj, hasOverlays);  // skipPresent if overlays pending
         }
     }
+    LARGE_INTEGER afterProjection{};
+    QueryPerformanceCounter(&afterProjection);
     const bool projectionRefreshed =
         rt::g_session.projectionDibGeneration != projectionGenerationBefore;
 
@@ -5337,6 +5438,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
                 break;
         }
     }
+    LARGE_INTEGER afterOverlays{};
+    QueryPerformanceCounter(&afterOverlays);
 
     flicker::UiFrameInfo uiInfo;
     uiInfo.quadLayers = (uint32_t)quadCount;
@@ -5369,6 +5472,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
             (uint64_t)frameCount);
         presentD3D12FrameSurface(rt::g_session);
     }
+    LARGE_INTEGER afterDetectionAndPaint{};
+    QueryPerformanceCounter(&afterDetectionAndPaint);
 
     // MCP Integration - write frame status BEFORE Present (Present may block on D3D12)
     mcp::WriteFrameStatus(frameCount, rt::g_session.previewWidth, rt::g_session.previewHeight,
@@ -5389,7 +5494,10 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
 
         if (s.usesD3D12) {
             // D3D12 GDI-based path: blitD3D12ToPreview already painted via GDI, nothing to do
-            Log("[SimXR] Deferred D3D12: GDI blit already done in blitD3D12ToPreview");
+            static uint64_t deferredD3D12Count = 0;
+            if (++deferredD3D12Count <= 5 || deferredD3D12Count % 120 == 1) {
+                Log("[SimXR] Deferred D3D12: composed GDI preview already staged");
+            }
         } else if (s.previewSwapchain) {
             s.previewSwapchain->Present(1, 0);
         }
@@ -5403,6 +5511,38 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
 
     if (projectionCount == 0 && shouldLog) {
         Log("[SimXR] xrEndFrame: WARNING - No projection layers found!");
+    }
+
+    LARGE_INTEGER endFrameFinish{};
+    QueryPerformanceCounter(&endFrameFinish);
+    {
+        static LARGE_INTEGER frequency = []() {
+            LARGE_INTEGER value{};
+            QueryPerformanceFrequency(&value);
+            return value;
+        }();
+        static uint64_t timingFrames = 0;
+        static double projectionMs = 0.0;
+        static double overlayMs = 0.0;
+        static double detectPaintMs = 0.0;
+        static double remainderMs = 0.0;
+        static double totalMs = 0.0;
+        const auto elapsedMs = [&](const LARGE_INTEGER& begin, const LARGE_INTEGER& end) {
+            return 1000.0 * (double)(end.QuadPart - begin.QuadPart) / (double)frequency.QuadPart;
+        };
+        projectionMs += elapsedMs(endFrameStart, afterProjection);
+        overlayMs += elapsedMs(afterProjection, afterOverlays);
+        detectPaintMs += elapsedMs(afterOverlays, afterDetectionAndPaint);
+        remainderMs += elapsedMs(afterDetectionAndPaint, endFrameFinish);
+        totalMs += elapsedMs(endFrameStart, endFrameFinish);
+        if (++timingFrames == 300) {
+            Logf("[SimXR] xrEndFrame timing avg300: total=%.3fms projection=%.3f overlay=%.3f detectPaint=%.3f status=%.3f",
+                 totalMs / timingFrames, projectionMs / timingFrames,
+                 overlayMs / timingFrames, detectPaintMs / timingFrames,
+                 remainderMs / timingFrames);
+            timingFrames = 0;
+            projectionMs = overlayMs = detectPaintMs = remainderMs = totalMs = 0.0;
+        }
     }
 
     inEndFrame.clear(std::memory_order_release);

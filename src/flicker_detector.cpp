@@ -144,8 +144,11 @@ void AtomicWrite(const std::filesystem::path& path, const std::string& contents)
         file.write(contents.data(), (std::streamsize)contents.size());
         file.flush();
     }
-    MoveFileExW(temporary.c_str(), path.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    // Rename atomically without forcing a physical disk flush on the OpenXR
+    // render thread. Readers still never observe a partial JSON file, while the
+    // simulator avoids paying storage latency for status published several
+    // times per second.
+    MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 uint8_t Luma(const uint8_t* bgra) {
