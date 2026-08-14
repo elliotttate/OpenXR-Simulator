@@ -85,7 +85,7 @@ inline void RefreshCommandsDue() {
 
 inline bool g_screenshotRequested = false;
 inline std::string g_screenshotEye = "both";
-inline std::string g_screenshotLayer = "projection";  // "projection", "quad", or "all"
+inline std::string g_screenshotLayer = "projection";  // "projection", "projection_native", "quad", or "all"
 inline std::atomic_uint64_t g_runtimeFrameCount{};
 inline uint64_t g_screenshotRequestFrame = 0;
 inline uint64_t g_screenshotAfterSync = 0;

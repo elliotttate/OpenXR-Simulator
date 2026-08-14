@@ -717,6 +717,9 @@ static bool g_anaglyphPreview = false;
 // wobbles wrong direction" symptom that's hard to miss.
 static bool  g_poseSweepEnabled  = false;
 static float g_poseSweepStartT   = 0.0f;
+static float g_poseSweepBaseYaw  = 0.0f;
+static float g_poseSweepBasePitch = 0.0f;
+static float g_poseSweepBaseRoll = 0.0f;
 static float g_poseSweepYawAmp   = 0.5f;   // radians (~28 deg)
 static float g_poseSweepPitchAmp = 0.3f;   // radians (~17 deg)
 static float g_poseSweepRollAmp  = 0.3f;   // radians (~17 deg)
@@ -952,9 +955,14 @@ static void GetEffectiveHeadAngles(float& yaw, float& pitch, float& roll) {
     const float t = (float)GetTickCount64() * 0.001f - g_poseSweepStartT;
     const float TWO_PI = 6.2831853f;
     const float w = TWO_PI * g_poseSweepFreq;
-    yaw   = g_poseSweepYawAmp   * sinf(w * t);
-    pitch = g_poseSweepPitchAmp * sinf(w * t + 1.0f);
-    roll  = g_poseSweepRollAmp  * sinf(w * t + 2.0f);
+    // Every axis begins at the existing head pose and returns there when the
+    // sweep is disabled.  The old phase offsets started pitch at 84% and roll
+    // at 91% of their amplitudes, creating a large one-frame camera snap that
+    // looked like a stereo-mode transition.  Harmonics still exercise all
+    // three axes without that discontinuity.
+    yaw   = g_poseSweepBaseYaw   + g_poseSweepYawAmp   * sinf(w * t);
+    pitch = g_poseSweepBasePitch + g_poseSweepPitchAmp * sinf(2.0f * w * t);
+    roll  = g_poseSweepBaseRoll  + g_poseSweepRollAmp  * sinf(3.0f * w * t);
 }
 
 // Angles are passed in, not sampled here, so both eyes of a frame come from one
@@ -1430,7 +1438,11 @@ static void ComputePreviewRTSize(rt::Session& s, int& outW, int& outH) {
         (double)kPreviewMaxWidth / (std::max)(1, clientW),
         (double)kPreviewMaxHeight / (std::max)(1, clientH),
     });
-    outW = (std::max)(1, (int)std::lround(clientW * scale));
+    // Stereo capture/debug tooling splits this surface into equal eye halves.
+    // Window clients can be odd-width (for example 1533 px after a manual
+    // resize), so keep the internal mirror even without changing the window.
+    outW = (std::max)(2, (int)std::lround(clientW * scale));
+    outW &= ~1;
     outH = (std::max)(1, (int)std::lround(clientH * scale));
 }
 
@@ -5011,6 +5023,11 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         mcp::PoseSweepCommand sweep = mcp::CheckPoseSweepCommand();
         if (sweep.valid) {
             const float DEG2RAD = 3.14159265f / 180.0f;
+            if (sweep.enabled && !rt::g_poseSweepEnabled) {
+                rt::g_poseSweepBaseYaw = rt::g_headYaw;
+                rt::g_poseSweepBasePitch = rt::g_headPitch;
+                rt::g_poseSweepBaseRoll = rt::g_headRoll;
+            }
             rt::g_poseSweepEnabled  = sweep.enabled;
             rt::g_poseSweepYawAmp   = sweep.yawAmpDeg   * DEG2RAD;
             rt::g_poseSweepPitchAmp = sweep.pitchAmpDeg * DEG2RAD;
@@ -6533,8 +6550,11 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
     D3D12_RANGE readRange = { 0, (SIZE_T)s.previewReadbackPitch * f.rtHeight };
     if (FAILED(f.readback->Map(0, &readRange, &mapped)) || !mapped) return;
 
+    const bool nativeProjectionCapture =
+        mcp::g_screenshotRequested &&
+        mcp::g_screenshotLayer == "projection_native";
     bool paintedPreview = false;
-    HDC windowDC = GetDC(s.hwnd);
+    HDC windowDC = nativeProjectionCapture ? nullptr : GetDC(s.hwnd);
     if (windowDC) {
         RECT cr{};
         GetClientRect(s.hwnd, &cr);
@@ -6563,6 +6583,16 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
 
     saveD3D12Screenshot((const uint8_t*)mapped, f.rtWidth, f.rtHeight,
                         s.previewReadbackPitch, f.frame, f.geometry);
+
+    // A native diagnostic frame intentionally uses the eye-pair aspect rather
+    // than the desktop window aspect.  It is evidence, not a mirror frame: do
+    // not flash that differently-sized surface in the window or feed it to the
+    // visible/UI detectors as though the user had seen it.
+    if (nativeProjectionCapture) {
+        D3D12_RANGE writeRange = { 0, 0 };
+        f.readback->Unmap(0, &writeRange);
+        return;
+    }
 
     // The burst records the frame that was just shown, described by the metadata that
     // frame was recorded with rather than by whatever the head is doing now.
@@ -7241,14 +7271,28 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
         // converts whatever the app submitted into it.
         const DXGI_FORMAT displayFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-        const auto viewMode = ui::g_uiState.viewMode;
-        const auto layout = ui::g_uiState.displayLayout;
+        auto viewMode = ui::g_uiState.viewMode;
+        auto layout = ui::g_uiState.displayLayout;
         int targetWidth = (int)width;
         int targetHeight = (int)height;
         if (!s.usesD3D12) {
             // D3D11: backbuffer size = current window client area. The eyes
             // get letterboxed into it (no DXGI scaling = no aspect squish).
             rt::GetPreviewClientSize(s, (int)width, (int)height, targetWidth, targetHeight);
+        } else if (
+            mcp::g_screenshotRequested &&
+            mcp::g_screenshotLayer == "projection_native"
+        ) {
+            // The desktop mirror follows the window's aspect and is deliberately
+            // capped for performance.  That is ideal for live viewing, but it
+            // squashes an SBS submission when the window is wider than the eye
+            // pair and makes stereo/oracle measurements ambiguous.  On explicit
+            // request, render one diagnostic frame at the source eye resolution.
+            // The next ordinary frame restores the inexpensive capped surface.
+            targetWidth = (int)width * 2;
+            targetHeight = (int)height;
+            viewMode = ui::ViewMode::BothEyes;
+            layout = ui::DisplayLayout::SideBySide;
         } else {
             // D3D12 (GDI path): the offscreen RT is the client area and the eyes are
             // drawn into their zoomed rect inside it, so the scaling pass does the
