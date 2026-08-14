@@ -4,15 +4,16 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue)](https://github.com)
 [![OpenXR](https://img.shields.io/badge/OpenXR-1.0-green)](https://www.khronos.org/openxr/)
 
-A lightweight OpenXR runtime that enables VR applications to run in a desktop window for development and testing without requiring a physical VR headset. Supports D3D11, D3D12, and OpenGL graphics backends.
+A lightweight OpenXR runtime that enables VR applications to run in a desktop window for development and testing without requiring a physical VR headset. Supports D3D11, D3D12, Vulkan and OpenGL graphics backends.
 
 ![KAJUqBgmzewBPq9YkMDsm5AwsucqBaUY6gw2eMLX](https://github.com/user-attachments/assets/4dd804e1-13f4-46eb-a540-7c5cb77bf09c)
 
 ## 🎯 Features
 
-- **Multi-API Support** - Supports D3D11, D3D12, and OpenGL graphics backends
+- **Multi-API Support** - Supports D3D11, D3D12, Vulkan and OpenGL graphics backends
 - **Desktop VR Preview** - Run VR applications in a resizable desktop window with side-by-side stereo view
 - **Live XR Performance** - Title-bar FPS and frametime are measured from stereo `xrEndFrame` submissions, not window repaints; press F3 for rolling p50/p95 frametimes
+- **Headset Emulation** - Reproduces the measured per-eye FOV, panel resolution and IPD of ten popular headsets (Quest 2/3/Pro, Index, Vive Pro 2, Reverb G2, PS VR2, PICO 4, Bigscreen Beyond)
 - **Mouse & Keyboard Controls** - Navigate the virtual space using standard input devices
 - **Proper sRGB Handling** - Automatic gamma correction for accurate color reproduction
 - **Unity & Unreal Compatible** - Tested with Unity's OpenXR plugin and Unreal Engine (via UEVR)
@@ -52,7 +53,8 @@ Once registered, any OpenXR application will automatically use the simulator:
    - **Mouse**: Look around (hold right-click)
    - **WASD**: Move forward/backward/strafe
    - **Q/E**: Move up/down
-   - **Shift**: Move faster
+   - **Shift**: Hold to move faster
+   - **, / .**: Slower/faster movement
    - **ESC**: Release mouse capture
    - **F3**: Show detailed XR p50/p95 frametime statistics in the title bar
 
@@ -93,7 +95,7 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 
 - **Instance & Session Management** - Handles OpenXR instance creation and session lifecycle
 - **Swapchain Rendering** - Creates swapchains for D3D11, D3D12, and OpenGL that applications render into
-- **View Composition** - Blits stereo views to a desktop window (D3D11: DXGI swapchain, D3D12: GDI-based readback, OpenGL: pixel buffer readback)
+- **View Composition** - Blits stereo views to a desktop window (D3D11: DXGI swapchain, D3D12: GPU downscale to window size then readback, OpenGL: pixel buffer readback)
 - **Input Simulation** - Converts mouse/keyboard input to head pose and controller data
 
 ### Supported Features
@@ -101,6 +103,7 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 - ✅ Core OpenXR 1.0 specification
 - ✅ D3D11 graphics binding (`XR_KHR_D3D11_enable`)
 - ✅ D3D12 graphics binding (`XR_KHR_D3D12_enable`)
+- ✅ Vulkan graphics binding (`XR_KHR_vulkan_enable` and `XR_KHR_vulkan_enable2`)
 - ✅ OpenGL graphics binding (`XR_KHR_opengl_enable`)
 - ✅ Win32 time conversion (`XR_KHR_win32_convert_performance_counter_time`)
 - ✅ Multiple swapchain formats (sRGB, UNORM, HDR, typeless, depth)
@@ -110,9 +113,34 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 - ✅ Basic action system for input
 - ✅ Screenshot capture (D3D11, D3D12, and OpenGL)
 
+### Vulkan sessions
+
+The compositor is D3D12 whatever the app binds. A Vulkan session's swapchain images are
+D3D12 committed resources created `SHARED`, imported into the app's own `VkDevice` through
+`VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT`, and handed back as `VkImage`s — so the
+app renders in Vulkan and the preview, quad layers, screenshots and burst capture read the
+same pixels as `ID3D12Resource`s with no second code path. `xrGetVulkanGraphicsDevice2KHR`
+returns the `VkPhysicalDevice` whose `deviceLUID` matches the DXGI adapter the compositor
+runs on, which is what makes the shared-handle import legal.
+
+`xrEnumerateSwapchainFormats` reports `VkFormat` values under a Vulkan session. Images are
+handed over in `VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` (depth:
+`VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL`) and must be released in the same layout,
+as the spec requires — an app renders straight into an acquired image with no barrier of its
+own, so the runtime owes it that layout and never changes it afterwards.
+
+The app's `VkQueue` and the compositor's D3D12 queue are ordered by one shared `ID3D12Fence`
+imported as a timeline `VkSemaphore`, driven by a single strictly increasing counter that
+each side signals in turn. `SIMXR_VK_NO_TIMELINE=1` falls back to CPU waits, which is correct
+but serialises the frame — useful when a driver's timeline import misbehaves.
+
+Colour resources carry `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS` (no DCC, so the bytes
+Vulkan wrote are readable through a D3D12 SRV), depth uses a typeless DXGI format, and both
+set `D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT` explicitly. Those three come from BetterVR's
+own Vulkan/D3D12 bridge and are there for AMD.
+
 ### Limitations
 
-- ❌ No Vulkan support (D3D11, D3D12, and OpenGL only)
 - ❌ No hand tracking
 - ❌ No haptic feedback
 - ❌ No foveated rendering
@@ -120,14 +148,36 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 
 ## 🎮 Configuration
 
-### Field of View
+Settings are changed from the menu bar and persist across restarts in
+`%LOCALAPPDATA%\OpenXR-Simulator\settings.json`. Delete the file to go back to
+defaults.
 
-The default FOV is set to 70° for comfortable desktop viewing. To modify, edit the FOV value in `src/runtime.cpp`:
+### Headset Profiles
 
-```cpp
-// In xrLocateViews_runtime function
-views[i].fov = { -0.7f, 0.7f, 0.7f, -0.7f }; // tan(35°) ≈ 0.7
-```
+Pick a headset from **FOV → Headset Profile** to preset the per-eye frustum, the
+panel resolution reported to `xrEnumerateViewConfigurationViews`, and a nominal
+IPD. The values are measured ones from the
+[HMD Geometry Database](https://risa2000.github.io/hmdgdb/). Add a profile by
+appending a row to `ui::kHeadsetSpecs` in
+[ui_enhancements.h](src/ui_enhancements.h); the enum, menu and settings keys
+follow from the table.
+
+### Movement Speed
+
+WASD/QE move the head at 3 m/s by default, and holding **Shift** multiplies that
+by 4. Both numbers are set from **Tools → Movement Speed**: presets from 0.5 to
+10 m/s, `,` and `.` to step off them, and a submenu for the Shift multiplier.
+
+### Mirror Rate
+
+The preview window is a mirror of what the headset would show, and drawing it costs
+the app a little time on every frame it updates. **Tools → Mirror Rate** caps how
+often that happens: **60 Hz** by default, or 30/15 Hz, **Every Frame**, or **Off** to
+freeze the mirror entirely while the application keeps running normally. Lower is
+cheaper — turning it off leaves the runtime costing essentially nothing per frame,
+which is worth doing while profiling the application itself. It applies to every
+backend, and a screenshot request always forces a fresh frame through regardless of
+the setting.
 
 ### Window Size
 
@@ -180,6 +230,10 @@ reg query "HKLM\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"
 
 ### Performance issues
 
+- Turn **Tools → Mirror Rate** down, or **Off**. Mirroring the eyes to the window is
+  the only per-frame work the runtime does that scales with resolution.
+- Leave `SIMXR_VERBOSE` unset. Setting it makes the runtime log every frame, and each
+  line is flushed to disk — useful when diagnosing a frame, expensive as a default.
 - Reduce swapchain resolution in your application
 - Disable MSAA if enabled
 - Close other GPU-intensive applications
@@ -204,6 +258,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - [Khronos Group](https://www.khronos.org/) for the OpenXR specification
 - [OpenXR SDK](https://github.com/KhronosGroup/OpenXR-SDK) for headers and loader interfaces
+- [HMD Geometry Database](https://risa2000.github.io/hmdgdb/) by risa2000 for the
+  headset profile FOV data
 - Unity OpenXR Plugin team for compatibility testing
 - Community contributors and testers
 
@@ -215,7 +271,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🗺️ Roadmap
 
-- [ ] Vulkan graphics binding (`XR_KHR_vulkan_enable`)
 - [ ] Linux support
 - [ ] Configurable controller emulation
 - [ ] Multi-monitor support

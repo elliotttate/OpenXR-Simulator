@@ -14,6 +14,7 @@ Features:
 
 import asyncio
 import base64
+import ctypes
 import json
 import os
 import re
@@ -41,7 +42,10 @@ except ImportError:
 # Configuration
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
 SIMULATOR_DIR = Path(LOCALAPPDATA) / "OpenXR-Simulator"
-LOG_FILE = SIMULATOR_DIR / "openxr_simulator.log"
+# The runtime writes one log per process, openxr_simulator.<pid>.log, so there is no
+# single fixed log path -- resolve the newest match instead. Older builds wrote a
+# plain openxr_simulator.log; the glob covers both.
+LOG_GLOB = "openxr_simulator*.log"
 SCREENSHOT_REQUEST_FILE = SIMULATOR_DIR / "screenshot_request.json"
 # Runtime may write any of these formats — we'll pick whichever shows up most recently after the request.
 SCREENSHOT_OUTPUT_CANDIDATES = (
@@ -55,6 +59,9 @@ SCREENSHOT_OUTPUT_CANDIDATES = (
 # image readable while staying small.
 SCREENSHOT_MAX_WIDTH = 1280
 SCREENSHOT_JPEG_QUALITY = 70
+# Width the stereo disparity search downscales to before matching. The search is
+# O(shifts x pixels), so running it at full preview resolution overruns the MCP timeout.
+STEREO_ANALYSIS_MAX_WIDTH = 1280
 FRAME_INFO_FILE = SIMULATOR_DIR / "frame_info.json"
 STATUS_FILE = SIMULATOR_DIR / "runtime_status.json"
 FLICKER_STATUS_FILE = SIMULATOR_DIR / "flicker_status.json"
@@ -82,13 +89,68 @@ def ensure_simulator_dir():
     SIMULATOR_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def current_log_file() -> Optional[Path]:
+    """Newest per-process simulator log, or None if the simulator never ran."""
+    try:
+        logs = sorted(SIMULATOR_DIR.glob(LOG_GLOB), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return None
+    return logs[-1] if logs else None
+
+
+def log_owner_pid(path: Path) -> Optional[int]:
+    """PID encoded in openxr_simulator.<pid>.log, or None for the legacy name."""
+    match = re.fullmatch(r"openxr_simulator\.(\d+)\.log", path.name)
+    return int(match.group(1)) if match else None
+
+
+def _pid_alive(pid: int) -> bool:
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def runtime_is_live() -> bool:
+    """
+    Whether an application currently has the simulator runtime loaded.
+
+    The status and log files outlive the process that wrote them, so without this
+    check a long-dead session still reports FOCUSED. The owning PID comes from the
+    log filename; PID reuse can in principle produce a false positive.
+    """
+    log = current_log_file()
+    if log is None:
+        return False
+    pid = log_owner_pid(log)
+    return _pid_alive(pid) if pid is not None else False
+
+
+def status_age_seconds() -> Optional[float]:
+    """Seconds since the runtime last refreshed runtime_status.json."""
+    try:
+        return round(time.time() - STATUS_FILE.stat().st_mtime, 1)
+    except OSError:
+        return None
+
+
 def read_log_file(lines: int = 100, filter_pattern: Optional[str] = None) -> str:
     """Read the last N lines from the simulator log file."""
-    if not LOG_FILE.exists():
+    log_file = current_log_file()
+    if log_file is None:
         return "Log file not found. The OpenXR Simulator may not have been run yet."
 
     try:
-        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
             all_lines = f.readlines()
 
         # Get last N lines
@@ -114,18 +176,24 @@ def parse_log_for_diagnostics() -> dict[str, Any]:
         "warnings": [],
         "last_activity": None,
         "graphics_api": "Unknown",
-        "head_tracking": {"position": None, "orientation": None}
+        "head_tracking": {"position": None, "orientation": None},
+        "runtime_live": runtime_is_live(),
+        "log_file": None,
     }
 
-    if not LOG_FILE.exists():
+    log_file = current_log_file()
+    if log_file is None:
         return diagnostics
+    diagnostics["log_file"] = log_file.name
 
     try:
-        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
 
-        # Extract session state
-        state_matches = re.findall(r"session state -> (\w+)", content)
+        # Extract session state. The runtime logs transitions as
+        # "PushState: Session <handle> -> FOCUSED"; the second pattern is the legacy form.
+        state_matches = (re.findall(r"PushState: Session \d+ -> (\w+)", content)
+                         or re.findall(r"session state -> (\w+)", content))
         if state_matches:
             diagnostics["session_state"] = state_matches[-1]
 
@@ -154,16 +222,26 @@ def parse_log_for_diagnostics() -> dict[str, Any]:
         warning_matches = re.findall(r"\[SimXR\].*?WARNING.*", content, re.IGNORECASE)
         diagnostics["warnings"] = warning_matches[-10:]  # Last 10 warnings
 
-        # Extract graphics API
-        if "D3D12" in content:
-            diagnostics["graphics_api"] = "D3D12"
-        elif "D3D11" in content:
-            diagnostics["graphics_api"] = "D3D11"
+        # Extract graphics API from the binding the session actually chose. A plain
+        # substring test always says D3D12, because the extension list names every API.
+        api_match = re.findall(r"xrCreateSession: SUCCESS \((\w+)", content)
+        if api_match:
+            diagnostics["graphics_api"] = api_match[-1]
 
         # Get file modification time as last activity
         diagnostics["last_activity"] = datetime.fromtimestamp(
-            LOG_FILE.stat().st_mtime
+            log_file.stat().st_mtime
         ).isoformat()
+
+        # Head pose lives in the status file, not the log. Both sources throttle their
+        # frame counter (the log stops at 10 then logs every 60th, the status file
+        # rewrites every 30th), so the larger of the two is the closer estimate.
+        status = read_status_file()
+        if status:
+            tracking = status.get("head_tracking") or {}
+            if tracking.get("position") is not None:
+                diagnostics["head_tracking"] = tracking
+            diagnostics["frame_count"] = max(diagnostics["frame_count"], int(status.get("frame_count", 0)))
 
     except Exception as e:
         diagnostics["parse_error"] = str(e)
@@ -259,6 +337,15 @@ def to_jpeg(image_bytes: bytes, max_width: int = SCREENSHOT_MAX_WIDTH,
     return out.getvalue()
 
 
+def read_status_file() -> Optional[dict[str, Any]]:
+    """Raw runtime_status.json contents, or None if it is absent or unreadable."""
+    try:
+        with open(STATUS_FILE, "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def build_flicker_contact_sheet(incident_dir: Path, max_frames: int = 8) -> Optional[bytes]:
     """Build an in-memory JPEG from simulator-composed preview frames for LLM review."""
     from io import BytesIO
@@ -292,15 +379,20 @@ def build_flicker_contact_sheet(incident_dir: Path, max_frames: int = 8) -> Opti
 
 def get_frame_info() -> dict[str, Any]:
     """Get current frame information from the runtime status file."""
-    if STATUS_FILE.exists():
-        try:
-            with open(STATUS_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            return {"error": f"Failed to read status: {e}"}
+    status = read_status_file()
+    if status is None:
+        if STATUS_FILE.exists():
+            return {"error": "Failed to read runtime_status.json"}
+        # Fall back to parsing from log
+        return parse_log_for_diagnostics()
 
-    # Fall back to parsing from log
-    return parse_log_for_diagnostics()
+    # The runtime leaves the last frame's status behind when it exits, so a caller
+    # that just reads session_state would see FOCUSED long after the app is gone.
+    status["runtime_live"] = runtime_is_live()
+    status["status_age_seconds"] = status_age_seconds()
+    if not status["runtime_live"]:
+        status["stale"] = "No process currently has the simulator runtime loaded; this is the last frame of a finished session."
+    return status
 
 
 def analyze_openxr_issue(symptoms: str) -> dict[str, Any]:
@@ -402,6 +494,16 @@ def _validate_stereo_from_screenshot(image_bytes: bytes) -> dict[str, Any]:
     from io import BytesIO
     from PIL import Image, ImageOps
     img = Image.open(BytesIO(image_bytes)).convert("L")  # grayscale for matching
+
+    # The preview is 2880x1584; a 121-step shift search over that takes long enough to
+    # blow the MCP request timeout. Match on a downscaled copy and convert the measured
+    # disparity back to full-resolution pixels at the end.
+    full_w = img.size[0]
+    if full_w > STEREO_ANALYSIS_MAX_WIDTH:
+        scale = STEREO_ANALYSIS_MAX_WIDTH / full_w
+        img = img.resize((STEREO_ANALYSIS_MAX_WIDTH, max(1, round(img.size[1] * scale))), Image.BILINEAR)
+    else:
+        scale = 1.0
     w, h = img.size
     # Heuristic: simulator preview is side-by-side at the top, but on
     # FORCE_STEREO games the simulator outputs the eye halves stacked.
@@ -413,7 +515,7 @@ def _validate_stereo_from_screenshot(image_bytes: bytes) -> dict[str, Any]:
     ]
 
     def _shift_search(left, right, max_shift):
-        """Return (best_dx, score) where dx<0 means right shifted left."""
+        """Return (best_dx, score, contrast) where dx<0 means right shifted left."""
         import numpy as np
         L = np.asarray(left,  dtype=np.float32)
         R = np.asarray(right, dtype=np.float32)
@@ -424,7 +526,9 @@ def _validate_stereo_from_screenshot(image_bytes: bytes) -> dict[str, Any]:
         x0, x1 = (cw - win_w) // 2, (cw - win_w) // 2 + win_w
         L_win = L[y0:y1, x0:x1]
         best_dx, best_score = 0, float("inf")
-        for dx in range(-max_shift, max_shift + 1):
+        # Smallest shift first, so a featureless window that matches equally well at
+        # every offset reports 0 rather than whichever offset happened to come first.
+        for dx in sorted(range(-max_shift, max_shift + 1), key=abs):
             xa, xb = x0 + dx, x1 + dx
             if xa < 0 or xb > cw: continue
             R_win = R[y0:y1, xa:xb]
@@ -432,7 +536,7 @@ def _validate_stereo_from_screenshot(image_bytes: bytes) -> dict[str, Any]:
             diff = np.mean((L_win - R_win) ** 2)
             if diff < best_score:
                 best_score, best_dx = diff, dx
-        return best_dx, best_score
+        return best_dx, best_score, float(L_win.std())
 
     try:
         import numpy as np  # noqa: F401
@@ -443,15 +547,33 @@ def _validate_stereo_from_screenshot(image_bytes: bytes) -> dict[str, Any]:
     for name, L, R in layouts:
         if L.size != R.size:  # uneven crop — skip
             continue
-        dx, score = _shift_search(L, R, max_shift=min(60, L.size[0] // 6))
-        results[name] = {"disparity_px": dx, "score": float(score)}
+        dx, score, contrast = _shift_search(L, R, max_shift=min(60, L.size[0] // 6))
+        results[name] = {"disparity_px": dx, "score": float(score), "contrast": round(contrast, 2)}
 
-    # Pick the layout with the lowest score (most-confident match).
     if not results:
         return {"error": "Could not split image into eye halves"}
-    best_layout = min(results, key=lambda k: results[k]["score"])
-    dx = results[best_layout]["disparity_px"]
-    layout_w = (w // 2) if best_layout == "side_by_side" else w
+
+    # Pick the layout with the most confident match. Comparing raw MSE would always
+    # favour the flattest split -- halving a side-by-side preview the wrong way leaves
+    # two featureless windows that match perfectly at any offset -- so only layouts
+    # with actual detail in the match window are eligible, ranked by MSE relative to
+    # that detail.
+    MIN_CONTRAST = 2.0  # 8-bit levels of std dev
+    usable = {k: v for k, v in results.items() if v["contrast"] >= MIN_CONTRAST}
+    if not usable:
+        return {
+            "verdict": "INCONCLUSIVE_NO_FEATURES",
+            "diagnosis": ("The match window is a flat area in both eyes, so no disparity can be "
+                          "measured. Capture a frame with visible geometry in the centre of view."),
+            "all_layouts": results,
+        }
+    best_layout = min(usable, key=lambda k: usable[k]["score"] / usable[k]["contrast"])
+    # Back to full-resolution pixels so the numbers mean the same thing regardless of
+    # how far the analysis copy was downscaled.
+    dx = round(results[best_layout]["disparity_px"] / scale)
+    for entry in results.values():
+        entry["disparity_px"] = round(entry["disparity_px"] / scale)
+    layout_w = (full_w // 2) if best_layout == "side_by_side" else full_w
 
     # Heuristic verdict:
     #  - |dx| within [2, 30] px on a 1280-wide eye -> typical IPD parallax (PASS)
@@ -715,16 +837,20 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="set_headset_profile",
-            description=("Apply a named headset preset (FOV + IPD together). "
-                         "Useful for quickly testing whether the app handles "
-                         "asymmetric Quest/Index lens profiles correctly. "
-                         "Available: quest2, quest3, index, default (revert)."),
+            description=("Apply a named headset preset (FOV + IPD together), using "
+                         "the per-eye frustum each headset's runtime actually "
+                         "reports. Useful for quickly testing whether the app "
+                         "handles asymmetric lens profiles correctly. Available: "
+                         "quest2, quest3, questpro, index, vivepro2, reverbg2, "
+                         "psvr2, pico4, beyond, generic/default (revert)."),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "enum": ["quest2", "quest3", "index", "default", "clear"],
+                        "enum": ["quest2", "quest3", "questpro", "index", "vivepro2",
+                                 "reverbg2", "psvr2", "pico4", "beyond",
+                                 "generic", "default", "clear"],
                     }
                 },
                 "required": ["name"]
@@ -780,7 +906,8 @@ async def list_tools() -> list[Tool]:
             name="validate_stereo",
             description=("Capture the current stereo preview and run a disparity "
                          "analysis. Returns: verdict (PASS / FAIL_NO_PARALLAX / "
-                         "FAIL_EXCESSIVE_PARALLAX), measured horizontal pixel "
+                         "FAIL_EXCESSIVE_PARALLAX / INCONCLUSIVE_NO_FEATURES when the "
+                         "centre of view is a flat area), measured horizontal pixel "
                          "disparity, expected range, and a diagnostic hint."),
             inputSchema={
                 "type": "object",
@@ -1082,8 +1209,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         )]
 
     elif name == "get_session_state":
+        # On a live session the status file is refreshed every 30 frames and leads the
+        # log. Once the app exits it freezes at the last rendered frame, while the log
+        # keeps the teardown transitions -- so prefer the log for a finished session.
         diagnostics = parse_log_for_diagnostics()
-        state = diagnostics.get("session_state", "Unknown")
+        status = read_status_file() or {}
+        if diagnostics.get("runtime_live"):
+            state = status.get("session_state") or diagnostics.get("session_state", "Unknown")
+        else:
+            state = diagnostics.get("session_state") or status.get("session_state", "Unknown")
 
         state_descriptions = {
             "IDLE": "Session created but not yet started",
@@ -1096,9 +1230,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             "Unknown": "State unknown - check if runtime is active"
         }
 
+        text = f"Session State: {state}\n\n{state_descriptions.get(state, '')}"
+        if state != "Unknown" and not diagnostics.get("runtime_live"):
+            age = status_age_seconds()
+            age_note = f" (last updated {age:.0f}s ago)" if age is not None else ""
+            text += f"\n\nNOTE: no process currently has the runtime loaded -- this is the final state of a finished session{age_note}."
         return [TextContent(
             type="text",
-            text=f"Session State: {state}\n\n{state_descriptions.get(state, '')}"
+            text=text
         )]
 
     elif name == "get_head_tracking":
@@ -1127,11 +1266,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         else:
             output += "Position: Default (0.0, 1.7, 0.0)\n"
 
+        # The runtime reports orientation as Euler angles in radians; only fall back to
+        # "identity" when it published no angles at all.
+        angles = {k: tracking[k] for k in ("yaw", "pitch", "roll") if tracking.get(k) is not None}
         if tracking.get("orientation"):
             o = tracking["orientation"]
             output += f"Orientation (quaternion): ({o.get('x', 0):.3f}, {o.get('y', 0):.3f}, {o.get('z', 0):.3f}, {o.get('w', 1):.3f})\n"
+        elif angles:
+            output += "Orientation: " + ", ".join(
+                f"{k} {_deg(v):.1f} deg" for k, v in angles.items()
+            ) + "\n"
         else:
             output += "Orientation: Default (identity)\n"
+
+        if not info.get("runtime_live", True):
+            output += "\nNOTE: no process currently has the runtime loaded -- these are the last values of a finished session.\n"
 
         output += "\nControls:\n"
         output += "  - Mouse: Look around (click preview window to capture)\n"
@@ -1145,11 +1294,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
     elif name == "clear_logs":
         try:
-            if LOG_FILE.exists():
-                LOG_FILE.unlink()
+            # One log per process, and the live runtime holds its own open -- delete what
+            # we can and name what we could not.
+            removed, held = [], []
+            for log in SIMULATOR_DIR.glob(LOG_GLOB):
+                try:
+                    log.unlink()
+                    removed.append(log.name)
+                except OSError:
+                    held.append(log.name)
+
+            text = f"Cleared {len(removed)} log file(s)." if removed else "No log files to clear."
+            if held:
+                text += f" Still in use by a running process: {', '.join(held)}."
             return [TextContent(
                 type="text",
-                text="Log file cleared successfully."
+                text=text
             )]
         except Exception as e:
             return [TextContent(

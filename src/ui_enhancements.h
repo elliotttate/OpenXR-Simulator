@@ -7,6 +7,12 @@
 #include <string>
 #include <functional>
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+
+#include "json.h"
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
@@ -35,10 +41,6 @@ enum MenuCommand {
     ID_FOV_110 = 1203,
     ID_FOV_SYMMETRIC = 1204,
     ID_FOV_ASYMMETRIC = 1205,
-    ID_PROFILE_GENERIC = 1210,
-    ID_PROFILE_QUEST2 = 1211,
-    ID_PROFILE_QUEST3 = 1212,
-    ID_PROFILE_INDEX = 1213,
     ID_IPD_0 = 1220,
     ID_IPD_58 = 1221,
     ID_IPD_64 = 1222,
@@ -62,7 +64,24 @@ enum MenuCommand {
 
     // Help
     ID_HELP_CONTROLS = 1501,
-    ID_HELP_ABOUT = 1502
+    ID_HELP_ABOUT = 1502,
+
+    // One id per kHeadsetSpecs entry, in table order.
+    ID_PROFILE_FIRST = 1600,
+    ID_PROFILE_LAST = 1663,
+
+    // Movement speed. The two blocks hold one id per kMoveSpeedPresets /
+    // kMoveBoostPresets entry, in table order.
+    ID_MOVE_SLOWER = 1701,
+    ID_MOVE_FASTER = 1702,
+    ID_MOVE_SPEED_FIRST = 1710,
+    ID_MOVE_SPEED_LAST = 1725,
+    ID_MOVE_BOOST_FIRST = 1730,
+    ID_MOVE_BOOST_LAST = 1745,
+
+    // One id per kPreviewRatePresets entry, in table order.
+    ID_PREVIEW_RATE_FIRST = 1750,
+    ID_PREVIEW_RATE_LAST = 1765
 };
 
 // View mode enum
@@ -79,12 +98,19 @@ enum class DisplayLayout {
     Anaglyph
 };
 
-// Headset profile enum
+// Headset profile enum. Values index kHeadsetSpecs, so the two must stay in
+// the same order.
 enum class HeadsetProfile {
     GenericSymmetric,
     Quest2,
     Quest3,
-    ValveIndex
+    QuestPro,
+    ValveIndex,
+    VivePro2,
+    ReverbG2,
+    PSVR2,
+    Pico4,
+    BigscreenBeyond
 };
 
 // UI State
@@ -93,10 +119,20 @@ struct UIState {
     DisplayLayout displayLayout = DisplayLayout::SideBySide;
     HeadsetProfile headsetProfile = HeadsetProfile::Quest3;
     bool showStats = false;
-    float zoomLevel = 1.0f;  // 0.25 = 25%, 0.5 = 50%, 1.0 = 100%, etc.
-    bool fitToWindow = false; // If true, auto-fit zoom to window size
-    int windowWidth = 1280;
-    int windowHeight = 720;
+
+    // Zoom scales the image inside the window; it never resizes the window. zoomLevel is
+    // an absolute content scale (1.0 = one panel pixel per screen pixel) and pan offsets
+    // the scaled image from centred, in client pixels. With fitToWindow set the scale
+    // comes from the window instead and pan is pinned to 0.
+    float zoomLevel = 1.0f;
+    bool fitToWindow = true;
+    float panX = 0.0f;
+    float panY = 0.0f;
+
+    // Client size the preview window was last left at. 0 until the window has existed
+    // once, which is what makes the first run fall back to the panel's shape.
+    int windowWidth = 0;
+    int windowHeight = 0;
 
     // FOV settings
     int fovDegrees = 90;     // FOV in degrees for generic symmetric mode
@@ -105,9 +141,105 @@ struct UIState {
 
     // Render options
     bool showFullRender = false;  // If true, show full swapchain instead of imageRect crop
+
+    // Head movement (WASD/QE) in meters per second, and what holding Shift
+    // multiplies it by.
+    float moveSpeed = 3.0f;
+    float moveBoost = 4.0f;
+
+    // How often the mirror window is allowed to update, in Hz. Mirroring is not free -
+    // it composites the eyes, reads them back and repaints the window - and none of that
+    // buys anything above the rate a monitor shows. 0 freezes the mirror (the app still
+    // runs normally); kPreviewRateEveryFrame follows the app.
+    int previewFps = 60;
 };
 
 inline UIState g_uiState;
+
+// Last FPS the render loop measured. Shared so a title refresh triggered from
+// outside the loop (a menu toggle, say) can keep the FPS field rather than
+// blanking it until the next tick.
+inline int g_lastFps = 0;
+
+// Everything that varies per headset, in one table.
+//
+// panelWidth/panelHeight is the native per-eye panel resolution: what
+// xrEnumerateViewConfigurationViews recommends, and the shape the preview maps each
+// eye onto. The second is the one that matters -- see "Why the preview used to look
+// stretched" in BETTERVR.md.
+//
+// The frustum half-angles are in degrees, following the XrFovf sign convention. Both
+// eyes are transcribed from the HMD Geometry Database
+// (https://risa2000.github.io/hmdgdb/), which records what each headset's runtime
+// actually reports. Real hardware is not exactly mirrored, so each eye carries its own
+// measured values rather than one being derived from the other.
+struct EyeFov {
+    float angleLeft, angleRight, angleUp, angleDown;
+};
+
+struct HeadsetSpec {
+    const char*    id;          // settings key and MCP set_headset_profile name
+    const wchar_t* shortName;   // title bar
+    const wchar_t* menuLabel;
+    uint32_t       panelWidth;
+    uint32_t       panelHeight;
+    int            ipdMm;       // nominal default, not the database's per-session value
+    EyeFov         eye[2];      // [0] = left, [1] = right
+};
+
+// GenericSymmetric takes its FOV from g_uiState.fovDegrees, so its angles are unused.
+inline constexpr HeadsetSpec kHeadsetSpecs[] = {
+    { "generic",  L"Generic",    L"&Generic Symmetric", 1440, 1440, 64,
+      {{   0.00f,  0.00f,  0.00f,   0.00f }, {   0.00f,  0.00f,  0.00f,   0.00f }} },
+    { "quest2",   L"Quest 2",    L"Meta Quest &2",      1832, 1920, 64,
+      {{ -52.00f, 45.00f, 48.00f, -50.00f }, { -45.00f, 52.00f, 48.00f, -50.00f }} },
+    { "quest3",   L"Quest 3",    L"Meta Quest &3",      2064, 2208, 64,
+      {{ -54.00f, 40.00f, 43.98f, -54.27f }, { -40.00f, 54.00f, 43.98f, -54.27f }} },
+    { "questpro", L"Quest Pro",  L"Meta Quest &Pro",    1800, 1920, 64,
+      {{ -54.00f, 39.86f, 42.00f, -53.57f }, { -39.86f, 54.00f, 42.00f, -53.57f }} },
+    { "index",    L"Index",      L"Valve &Index",       1440, 1600, 63,
+      {{ -54.00f, 42.98f, 54.63f, -54.52f }, { -42.95f, 54.06f, 54.66f, -54.50f }} },
+    { "vivepro2", L"Vive Pro 2", L"HTC &Vive Pro 2",    2448, 2448, 63,
+      {{ -58.26f, 39.94f, 48.21f, -48.11f }, { -39.89f, 58.26f, 48.44f, -48.20f }} },
+    { "reverbg2", L"Reverb G2",  L"HP &Reverb G2",      2160, 2160, 64,
+      {{ -49.37f, 42.14f, 45.53f, -45.35f }, { -42.17f, 49.48f, 45.78f, -45.05f }} },
+    { "psvr2",    L"PS VR2",     L"&Sony PS VR2",       2000, 2040, 64,
+      {{ -61.50f, 43.45f, 53.04f, -53.04f }, { -43.45f, 61.50f, 53.04f, -53.04f }} },
+    { "pico4",    L"PICO 4",     L"PIC&O 4",            2160, 2160, 64,
+      {{ -52.00f, 52.00f, 52.00f, -52.00f }, { -52.00f, 52.00f, 52.00f, -52.00f }} },
+    { "beyond",   L"Beyond",     L"&Bigscreen Beyond",  2560, 2560, 64,
+      {{ -48.97f, 39.58f, 38.01f, -50.52f }, { -40.02f, 48.56f, 38.13f, -50.43f }} },
+};
+
+inline constexpr int kHeadsetProfileCount =
+    (int)(sizeof(kHeadsetSpecs) / sizeof(kHeadsetSpecs[0]));
+
+static_assert(kHeadsetProfileCount <= ID_PROFILE_LAST - ID_PROFILE_FIRST + 1,
+              "kHeadsetSpecs outgrew the reserved menu id block");
+
+inline const HeadsetSpec& GetHeadsetSpec(HeadsetProfile profile) {
+    int i = (int)profile;
+    if (i < 0 || i >= kHeadsetProfileCount) i = 0;
+    return kHeadsetSpecs[i];
+}
+
+inline const HeadsetSpec& GetActiveHeadsetSpec() {
+    return GetHeadsetSpec(g_uiState.headsetProfile);
+}
+
+// Index into kHeadsetSpecs, or -1 when `s` names no known profile.
+inline int FindHeadsetSpec(const char* s) {
+    for (int i = 0; i < kHeadsetProfileCount; ++i) {
+        if (strcmp(s, kHeadsetSpecs[i].id) == 0) return i;
+    }
+    return -1;
+}
+
+inline void GetHeadsetPanelResolution(uint32_t& width, uint32_t& height) {
+    const HeadsetSpec& spec = GetActiveHeadsetSpec();
+    width = spec.panelWidth;
+    height = spec.panelHeight;
+}
 
 inline int GetIpdMillimeters() {
     return (int)(g_uiState.ipdMeters * 1000.0f + 0.5f);
@@ -124,25 +256,8 @@ inline void AdjustIpdMillimeters(int deltaMm) {
 
 inline void SetHeadsetProfile(HeadsetProfile profile) {
     g_uiState.headsetProfile = profile;
-
-    switch (profile) {
-        case HeadsetProfile::GenericSymmetric:
-            g_uiState.useAsymmetricFov = false;
-            SetIpdMillimeters(64);
-            break;
-        case HeadsetProfile::Quest2:
-            g_uiState.useAsymmetricFov = true;
-            SetIpdMillimeters(64);
-            break;
-        case HeadsetProfile::Quest3:
-            g_uiState.useAsymmetricFov = true;
-            SetIpdMillimeters(64);
-            break;
-        case HeadsetProfile::ValveIndex:
-            g_uiState.useAsymmetricFov = true;
-            SetIpdMillimeters(63);
-            break;
-    }
+    g_uiState.useAsymmetricFov = (profile != HeadsetProfile::GenericSymmetric);
+    SetIpdMillimeters(GetHeadsetSpec(profile).ipdMm);
 }
 
 inline void SetSymmetricViews() {
@@ -158,26 +273,318 @@ inline void SetAsymmetricViews() {
 }
 
 inline const wchar_t* GetHeadsetProfileShortName() {
-    switch (g_uiState.headsetProfile) {
-        case HeadsetProfile::GenericSymmetric: return L"Generic";
-        case HeadsetProfile::Quest2: return L"Quest 2";
-        case HeadsetProfile::Quest3: return L"Quest 3";
-        case HeadsetProfile::ValveIndex: return L"Index";
-    }
-    return L"Generic";
+    return GetActiveHeadsetSpec().shortName;
+}
+
+inline bool IsHeadsetProfileCommand(int cmd) {
+    return cmd >= ID_PROFILE_FIRST && cmd < ID_PROFILE_FIRST + kHeadsetProfileCount;
 }
 
 inline bool IsFovSettingsCommand(int cmd) {
     return cmd == ID_FOV_70 || cmd == ID_FOV_90 || cmd == ID_FOV_110 ||
            cmd == ID_FOV_SYMMETRIC || cmd == ID_FOV_ASYMMETRIC ||
-           cmd == ID_PROFILE_GENERIC || cmd == ID_PROFILE_QUEST2 ||
-           cmd == ID_PROFILE_QUEST3 || cmd == ID_PROFILE_INDEX;
+           IsHeadsetProfileCommand(cmd);
 }
 
 inline bool IsIpdSettingsCommand(int cmd) {
     return cmd == ID_IPD_0 || cmd == ID_IPD_58 || cmd == ID_IPD_64 ||
            cmd == ID_IPD_70 || cmd == ID_IPD_80 ||
            cmd == ID_IPD_DECREASE || cmd == ID_IPD_INCREASE;
+}
+
+// ---------------------------------------------------------------------------
+// Head movement speed
+// ---------------------------------------------------------------------------
+
+struct MoveSpeedPreset { float mps;    const wchar_t* label; };
+struct MoveBoostPreset { float factor; const wchar_t* label; };
+
+inline constexpr MoveSpeedPreset kMoveSpeedPresets[] = {
+    {  0.5f, L"0.&5 m/s (Inspect)" },
+    {  1.0f, L"&1 m/s (Walk)" },
+    {  3.0f, L"&3 m/s (Default)" },
+    {  5.0f, L"&5 m/s (Brisk)" },
+    { 10.0f, L"1&0 m/s (Room-scale sweep)" },
+};
+
+inline constexpr MoveBoostPreset kMoveBoostPresets[] = {
+    {  2.0f, L"&2\x00D7" },
+    {  4.0f, L"&4\x00D7" },
+    { 10.0f, L"1&0\x00D7" },
+};
+
+inline constexpr int kMoveSpeedPresetCount =
+    (int)(sizeof(kMoveSpeedPresets) / sizeof(kMoveSpeedPresets[0]));
+inline constexpr int kMoveBoostPresetCount =
+    (int)(sizeof(kMoveBoostPresets) / sizeof(kMoveBoostPresets[0]));
+
+static_assert(kMoveSpeedPresetCount <= ID_MOVE_SPEED_LAST - ID_MOVE_SPEED_FIRST + 1,
+              "kMoveSpeedPresets outgrew the reserved menu id block");
+static_assert(kMoveBoostPresetCount <= ID_MOVE_BOOST_LAST - ID_MOVE_BOOST_FIRST + 1,
+              "kMoveBoostPresets outgrew the reserved menu id block");
+
+// Wide enough to cover a slow crawl around a controller model and a dash across
+// a large play space, without letting a stuck key throw the head to infinity.
+constexpr float kMinMoveSpeed = 0.05f;
+constexpr float kMaxMoveSpeed = 50.0f;
+
+inline void SetMoveSpeed(float mps) {
+    g_uiState.moveSpeed = (std::max)(kMinMoveSpeed, (std::min)(kMaxMoveSpeed, mps));
+}
+
+// The , and . keys scale rather than add, so a notch feels the same at 0.5 m/s
+// as it does at 10.
+inline void ScaleMoveSpeed(float factor) {
+    SetMoveSpeed(g_uiState.moveSpeed * factor);
+}
+
+// Meters per second for this frame. `boosted` is the Shift key.
+inline float GetMoveSpeed(bool boosted) {
+    return boosted ? g_uiState.moveSpeed * g_uiState.moveBoost : g_uiState.moveSpeed;
+}
+
+inline bool IsMoveSpeedCommand(int cmd) {
+    return cmd >= ID_MOVE_SPEED_FIRST && cmd < ID_MOVE_SPEED_FIRST + kMoveSpeedPresetCount;
+}
+
+inline bool IsMoveBoostCommand(int cmd) {
+    return cmd >= ID_MOVE_BOOST_FIRST && cmd < ID_MOVE_BOOST_FIRST + kMoveBoostPresetCount;
+}
+
+// ---------------------------------------------------------------------------
+// Mirror rate
+// ---------------------------------------------------------------------------
+
+// Sentinel for "no cap", kept well above any real refresh rate so the comparison in
+// PreviewFrameDue never has to special-case it.
+inline constexpr int kPreviewRateEveryFrame = 10000;
+
+struct PreviewRatePreset { int fps; const wchar_t* label; };
+inline constexpr PreviewRatePreset kPreviewRatePresets[] = {
+    { kPreviewRateEveryFrame, L"&Every Frame (no cap)" },
+    { 60, L"&60 Hz" },
+    { 30, L"&30 Hz" },
+    { 15, L"1&5 Hz" },
+    {  0, L"&Off (freeze mirror)" },
+};
+inline constexpr int kPreviewRatePresetCount =
+    (int)(sizeof(kPreviewRatePresets) / sizeof(kPreviewRatePresets[0]));
+
+static_assert(kPreviewRatePresetCount <= ID_PREVIEW_RATE_LAST - ID_PREVIEW_RATE_FIRST + 1,
+              "kPreviewRatePresets outgrew the reserved menu id block");
+
+inline bool IsPreviewRateCommand(int cmd) {
+    return cmd >= ID_PREVIEW_RATE_FIRST && cmd < ID_PREVIEW_RATE_FIRST + kPreviewRatePresetCount;
+}
+
+// Whether the mirror is allowed to update on this frame. Called once per frame from
+// xrEndFrame; the answer has to hold for the whole frame, since the eye composite and the
+// quad layers of one frame have to be recorded together or not at all.
+inline bool PreviewFrameDue() {
+    const int fps = g_uiState.previewFps;
+    if (fps <= 0) return false;
+    if (fps >= kPreviewRateEveryFrame) return true;
+
+    static LARGE_INTEGER freq = []() { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    static long long nextTick = 0;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart < nextTick) return false;
+    const long long period = freq.QuadPart / fps;
+    // Re-base rather than accumulate when we have fallen more than a period behind, so a
+    // stall (or a rate change) cannot leave a backlog that fires on every frame after it.
+    if (nextTick == 0 || now.QuadPart - nextTick > period) nextTick = now.QuadPart + period;
+    else nextTick += period;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Zoom and pan
+//
+// Both are properties of the image, not of the window: zooming in scales the eyes
+// inside whatever size the user dragged the window to and lets the window clip the
+// overflow, the way an image viewer does.
+// ---------------------------------------------------------------------------
+
+// What the preview is currently showing, as the render path last measured it. Zoom and
+// pan are expressed against these, so the input handlers need them as much as the blit
+// does -- the runtime republishes them before acting on a wheel or a drag.
+struct PreviewGeometry {
+    int clientW = 0, clientH = 0;    // preview window client area
+    int contentW = 0, contentH = 0;  // the eyes' layout at 1:1
+};
+
+inline PreviewGeometry g_previewGeom;
+
+// Where the content lands in the client area, in client pixels.
+struct PreviewRect { float x, y, w, h; };
+
+// Anything below a tenth stops being a preview; anything above 8x is past the point
+// where one panel pixel covers a screen tile.
+constexpr float kMinZoom = 0.1f;
+constexpr float kMaxZoom = 8.0f;
+
+// ---------------------------------------------------------------------------
+// Settings persistence
+//
+// The runtime is a DLL with no dependable shutdown hook -- the preview window
+// deliberately never posts a quit message, and hosts get killed outright -- so
+// every change writes the file instead of waiting for an exit that may not come.
+// ---------------------------------------------------------------------------
+
+inline const char* ViewModeName(ViewMode m) {
+    switch (m) {
+        case ViewMode::LeftEyeOnly:  return "left";
+        case ViewMode::RightEyeOnly: return "right";
+        case ViewMode::BothEyes:     break;
+    }
+    return "both";
+}
+
+inline ViewMode ViewModeFromName(const char* s, ViewMode def) {
+    if (strcmp(s, "left") == 0)  return ViewMode::LeftEyeOnly;
+    if (strcmp(s, "right") == 0) return ViewMode::RightEyeOnly;
+    if (strcmp(s, "both") == 0)  return ViewMode::BothEyes;
+    return def;
+}
+
+inline const char* DisplayLayoutName(DisplayLayout l) {
+    switch (l) {
+        case DisplayLayout::OverUnder: return "over_under";
+        case DisplayLayout::Anaglyph:  return "anaglyph";
+        case DisplayLayout::SideBySide: break;
+    }
+    return "side_by_side";
+}
+
+inline DisplayLayout DisplayLayoutFromName(const char* s, DisplayLayout def) {
+    if (strcmp(s, "over_under") == 0)   return DisplayLayout::OverUnder;
+    if (strcmp(s, "anaglyph") == 0)     return DisplayLayout::Anaglyph;
+    if (strcmp(s, "side_by_side") == 0) return DisplayLayout::SideBySide;
+    return def;
+}
+
+inline const char* HeadsetProfileName(HeadsetProfile p) {
+    return GetHeadsetSpec(p).id;
+}
+
+inline HeadsetProfile HeadsetProfileFromName(const char* s, HeadsetProfile def) {
+    int i = FindHeadsetSpec(s);
+    return i < 0 ? def : (HeadsetProfile)i;
+}
+
+// Empty until LoadSettings() runs, which makes every SaveSettings() before that
+// a no-op -- startup can't write defaults over a file it hasn't read yet.
+inline std::string g_settingsPath;
+inline std::string g_lastSettingsJson;
+
+inline std::string SerializeSettings() {
+    char buf[768];
+    snprintf(buf, sizeof(buf),
+        "{\n"
+        "  \"view_mode\": \"%s\",\n"
+        "  \"layout\": \"%s\",\n"
+        "  \"headset_profile\": \"%s\",\n"
+        "  \"asymmetric_fov\": %s,\n"
+        "  \"fov_degrees\": %d,\n"
+        "  \"ipd_mm\": %d,\n"
+        "  \"zoom_mode\": \"%s\",\n"
+        "  \"zoom_scale\": %.3f,\n"
+        "  \"window_width\": %d,\n"
+        "  \"window_height\": %d,\n"
+        "  \"full_render\": %s,\n"
+        "  \"show_stats\": %s,\n"
+        "  \"move_speed\": %.2f,\n"
+        "  \"move_boost\": %.2f,\n"
+        "  \"preview_fps\": %d\n"
+        "}\n",
+        ViewModeName(g_uiState.viewMode),
+        DisplayLayoutName(g_uiState.displayLayout),
+        HeadsetProfileName(g_uiState.headsetProfile),
+        g_uiState.useAsymmetricFov ? "true" : "false",
+        g_uiState.fovDegrees,
+        GetIpdMillimeters(),
+        g_uiState.fitToWindow ? "fit" : "scale",
+        g_uiState.zoomLevel,
+        g_uiState.windowWidth,
+        g_uiState.windowHeight,
+        g_uiState.showFullRender ? "true" : "false",
+        g_uiState.showStats ? "true" : "false",
+        g_uiState.moveSpeed,
+        g_uiState.moveBoost,
+        g_uiState.previewFps);
+    return buf;
+}
+
+inline void SaveSettings() {
+    if (g_settingsPath.empty()) return;
+
+    std::string json = SerializeSettings();
+    if (json == g_lastSettingsJson) return;
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, g_settingsPath.c_str(), "w") != 0 || !f) return;
+    fwrite(json.data(), 1, json.size(), f);
+    fclose(f);
+    g_lastSettingsJson = std::move(json);
+}
+
+inline void ApplySettingsJson(const char* text) {
+    json::Object o(text);
+
+    // Profile first: it resets FOV symmetry and IPD, so the saved values for
+    // those have to land after it.
+    std::string profile = o.string("headset_profile");
+    if (!profile.empty()) {
+        SetHeadsetProfile(HeadsetProfileFromName(profile.c_str(), g_uiState.headsetProfile));
+    }
+
+    g_uiState.viewMode = ViewModeFromName(
+        o.string("view_mode").c_str(), g_uiState.viewMode);
+    g_uiState.displayLayout = DisplayLayoutFromName(
+        o.string("layout").c_str(), g_uiState.displayLayout);
+
+    g_uiState.useAsymmetricFov = o.boolean("asymmetric_fov", g_uiState.useAsymmetricFov);
+    g_uiState.fovDegrees = (std::max)(30, (std::min)(170,
+        o.number("fov_degrees", g_uiState.fovDegrees)));
+    SetIpdMillimeters(o.number("ipd_mm", GetIpdMillimeters()));
+
+    // Renamed from "zoom"/"fit_to_window", which meant a window size rather than an
+    // image scale. A file written by that build falls back to the defaults here.
+    g_uiState.fitToWindow = (o.string("zoom_mode", "fit") != "scale");
+    g_uiState.zoomLevel = (std::max)(kMinZoom, (std::min)(kMaxZoom,
+        o.number("zoom_scale", g_uiState.zoomLevel)));
+
+    // Left unclamped: the desktop this was saved on may not be the one it reopens on,
+    // so the caller fits it to the current work area instead.
+    g_uiState.windowWidth = (std::max)(0, o.number("window_width", g_uiState.windowWidth));
+    g_uiState.windowHeight = (std::max)(0, o.number("window_height", g_uiState.windowHeight));
+    g_uiState.showFullRender = o.boolean("full_render", g_uiState.showFullRender);
+    g_uiState.showStats = o.boolean("show_stats", g_uiState.showStats);
+
+    SetMoveSpeed(o.number("move_speed", g_uiState.moveSpeed));
+    g_uiState.moveBoost = (std::max)(1.0f, (std::min)(50.0f,
+        o.number("move_boost", g_uiState.moveBoost)));
+
+    g_uiState.previewFps = (std::max)(0, (std::min)(kPreviewRateEveryFrame,
+        (int)o.number("preview_fps", g_uiState.previewFps)));
+}
+
+// Restore saved settings from `dataDir` and arm SaveSettings().
+inline void LoadSettings(const std::string& dataDir) {
+    CreateDirectoryA(dataDir.c_str(), nullptr);
+    std::string path = dataDir + "\\settings.json";
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "rb") == 0 && f) {
+        char buf[2048];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+        ApplySettingsJson(buf);
+    }
+
+    g_settingsPath = std::move(path);
 }
 
 // Dark mode colors
@@ -253,10 +660,10 @@ inline HMENU CreateAppMenu() {
     AppendMenuW(fovMenu, MF_SEPARATOR, 0, nullptr);
 
     HMENU profileMenu = CreatePopupMenu();
-    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_GENERIC, L"&Generic Symmetric");
-    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_QUEST2, L"Quest &2");
-    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_QUEST3, L"Quest &3");
-    AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_INDEX, L"Valve &Index");
+    for (int i = 0; i < kHeadsetProfileCount; ++i) {
+        if (i == 1) AppendMenuW(profileMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(profileMenu, MF_STRING, ID_PROFILE_FIRST + i, kHeadsetSpecs[i].menuLabel);
+    }
     AppendMenuW(fovMenu, MF_POPUP, (UINT_PTR)profileMenu, L"Headset &Profile");
 
     HMENU ipdMenu = CreatePopupMenu();
@@ -280,6 +687,30 @@ inline HMENU CreateAppMenu() {
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_RESET_VIEW, L"&Reset View\tHome");
     AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_TOGGLE_STATS, L"Show &Statistics\tF3");
+    AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
+
+    HMENU moveMenu = CreatePopupMenu();
+    AppendMenuW(moveMenu, MF_STRING, ID_MOVE_SLOWER, L"Slo&wer\t,");
+    AppendMenuW(moveMenu, MF_STRING, ID_MOVE_FASTER, L"&Faster\t.");
+    AppendMenuW(moveMenu, MF_SEPARATOR, 0, nullptr);
+    for (int i = 0; i < kMoveSpeedPresetCount; ++i) {
+        AppendMenuW(moveMenu, MF_STRING, ID_MOVE_SPEED_FIRST + i, kMoveSpeedPresets[i].label);
+    }
+    AppendMenuW(moveMenu, MF_SEPARATOR, 0, nullptr);
+
+    HMENU boostMenu = CreatePopupMenu();
+    for (int i = 0; i < kMoveBoostPresetCount; ++i) {
+        AppendMenuW(boostMenu, MF_STRING, ID_MOVE_BOOST_FIRST + i, kMoveBoostPresets[i].label);
+    }
+    AppendMenuW(moveMenu, MF_POPUP, (UINT_PTR)boostMenu, L"S&hift Multiplier");
+
+    AppendMenuW(toolsMenu, MF_POPUP, (UINT_PTR)moveMenu, L"&Movement Speed");
+
+    HMENU rateMenu = CreatePopupMenu();
+    for (int i = 0; i < kPreviewRatePresetCount; ++i) {
+        AppendMenuW(rateMenu, MF_STRING, ID_PREVIEW_RATE_FIRST + i, kPreviewRatePresets[i].label);
+    }
+    AppendMenuW(toolsMenu, MF_POPUP, (UINT_PTR)rateMenu, L"Mirror &Rate");
     AppendMenuW(menuBar, MF_POPUP, (UINT_PTR)toolsMenu, L"&Tools");
 
     // Help Menu
@@ -328,14 +759,16 @@ inline void UpdateMenuState(HMENU menu) {
     CheckMenuItem(menu, ID_FOV_110, (!g_uiState.useAsymmetricFov && g_uiState.fovDegrees == 110) ? MF_CHECKED : MF_UNCHECKED);
 
     // Headset profile checks
-    CheckMenuItem(menu, ID_PROFILE_GENERIC,
-        g_uiState.headsetProfile == HeadsetProfile::GenericSymmetric ? MF_CHECKED : MF_UNCHECKED);
-    CheckMenuItem(menu, ID_PROFILE_QUEST2,
-        g_uiState.headsetProfile == HeadsetProfile::Quest2 ? MF_CHECKED : MF_UNCHECKED);
-    CheckMenuItem(menu, ID_PROFILE_QUEST3,
-        g_uiState.headsetProfile == HeadsetProfile::Quest3 ? MF_CHECKED : MF_UNCHECKED);
-    CheckMenuItem(menu, ID_PROFILE_INDEX,
-        g_uiState.headsetProfile == HeadsetProfile::ValveIndex ? MF_CHECKED : MF_UNCHECKED);
+    for (int i = 0; i < kHeadsetProfileCount; ++i) {
+        CheckMenuItem(menu, ID_PROFILE_FIRST + i,
+            (int)g_uiState.headsetProfile == i ? MF_CHECKED : MF_UNCHECKED);
+    }
+
+    // Mirror rate checks
+    for (int i = 0; i < kPreviewRatePresetCount; ++i) {
+        CheckMenuItem(menu, ID_PREVIEW_RATE_FIRST + i,
+            g_uiState.previewFps == kPreviewRatePresets[i].fps ? MF_CHECKED : MF_UNCHECKED);
+    }
 
     // IPD checks
     int ipdMm = GetIpdMillimeters();
@@ -348,6 +781,19 @@ inline void UpdateMenuState(HMENU menu) {
     // Full render toggle
     CheckMenuItem(menu, ID_VIEW_FULL_RENDER,
         g_uiState.showFullRender ? MF_CHECKED : MF_UNCHECKED);
+
+    // Movement speed checks. Nothing is checked once , or . has walked the
+    // speed off a preset, which is the honest answer.
+    for (int i = 0; i < kMoveSpeedPresetCount; ++i) {
+        CheckMenuItem(menu, ID_MOVE_SPEED_FIRST + i,
+            fabsf(g_uiState.moveSpeed - kMoveSpeedPresets[i].mps) < 0.005f
+                ? MF_CHECKED : MF_UNCHECKED);
+    }
+    for (int i = 0; i < kMoveBoostPresetCount; ++i) {
+        CheckMenuItem(menu, ID_MOVE_BOOST_FIRST + i,
+            fabsf(g_uiState.moveBoost - kMoveBoostPresets[i].factor) < 0.005f
+                ? MF_CHECKED : MF_UNCHECKED);
+    }
 }
 
 // Show controls help dialog
@@ -361,16 +807,20 @@ inline void ShowControlsDialog(HWND parent) {
         L"Movement (WASD):\n"
         L"  W/S - Forward/Backward\n"
         L"  A/D - Strafe Left/Right\n"
-        L"  Q/E - Up/Down\n\n"
+        L"  Q/E - Up/Down\n"
+        L"  Shift - Hold to move faster\n"
+        L"  , / . - Slower/Faster\n"
+        L"  Tools \x2192 Movement Speed - Presets and Shift multiplier\n\n"
         L"View Controls:\n"
         L"  B - Both eyes\n"
         L"  L - Left eye only\n"
         L"  R - Right eye only\n\n"
-        L"Zoom:\n"
+        L"Zoom (scales the image, not the window):\n"
         L"  F - Fit to window\n"
-        L"  1-4 - Zoom presets (25%-100%)\n"
+        L"  1-4 - Zoom presets (25%-100% of panel resolution)\n"
         L"  +/- - Zoom in/out\n"
-        L"  Mouse wheel - Zoom\n\n"
+        L"  Mouse wheel - Zoom at the cursor\n"
+        L"  Middle-drag - Pan while zoomed in\n\n"
         L"FOV:\n"
         L"  5 - 70\x00B0 (Narrow)\n"
         L"  6 - 90\x00B0 (Normal)\n"
@@ -384,7 +834,7 @@ inline void ShowControlsDialog(HWND parent) {
         L"Other:\n"
         L"  F12 - Screenshot\n"
         L"  F3 - Toggle stats\n"
-        L"  Home - Reset view";
+        L"  Home - Reset view (head pose, zoom and pan)";
 
     MessageBoxW(parent, helpText, L"Controls", MB_OK | MB_ICONINFORMATION);
 }
@@ -405,31 +855,30 @@ inline void ShowAboutDialog(HWND parent) {
     MessageBoxW(parent, aboutText, L"About OpenXR Simulator", MB_OK | MB_ICONINFORMATION);
 }
 
-// Calculate the preview window size based on source size and zoom
-// NOTE: srcWidth and srcHeight are the dimensions of a SINGLE EYE swapchain
+// The client size to open the preview window at, from a SINGLE EYE source laid out for
+// the current view mode. Only ever the starting shape: zoom scales the image inside the
+// window, so nothing resizes the window afterwards except a layout change.
 inline void CalculateWindowSize(int srcWidth, int srcHeight, int& outWidth, int& outHeight) {
-    float zoom = g_uiState.fitToWindow ? 0.5f : g_uiState.zoomLevel;
-
     switch (g_uiState.viewMode) {
         case ViewMode::BothEyes:
             if (g_uiState.displayLayout == DisplayLayout::SideBySide) {
                 // Two eyes side by side: double the width
-                outWidth = (int)(srcWidth * 2 * zoom);
-                outHeight = (int)(srcHeight * zoom);
+                outWidth = srcWidth * 2;
+                outHeight = srcHeight;
             } else if (g_uiState.displayLayout == DisplayLayout::OverUnder) {
                 // Two eyes stacked: double the height
-                outWidth = (int)(srcWidth * zoom);
-                outHeight = (int)(srcHeight * 2 * zoom);
+                outWidth = srcWidth;
+                outHeight = srcHeight * 2;
             } else { // Anaglyph - both eyes overlap in same frame
-                outWidth = (int)(srcWidth * zoom);
-                outHeight = (int)(srcHeight * zoom);
+                outWidth = srcWidth;
+                outHeight = srcHeight;
             }
             break;
         case ViewMode::LeftEyeOnly:
         case ViewMode::RightEyeOnly:
             // Single eye: just use the single eye dimensions
-            outWidth = (int)(srcWidth * zoom);
-            outHeight = (int)(srcHeight * zoom);
+            outWidth = srcWidth;
+            outHeight = srcHeight;
             break;
     }
 
@@ -438,10 +887,93 @@ inline void CalculateWindowSize(int srcWidth, int srcHeight, int& outWidth, int&
     outHeight = (std::max)(outHeight, 240);
 }
 
-// Adjust zoom level
-inline void AdjustZoom(float delta) {
+// Scale at which the whole image just fits the window.
+inline float FitScale() {
+    const PreviewGeometry& g = g_previewGeom;
+    if (g.contentW <= 0 || g.contentH <= 0 || g.clientW <= 0 || g.clientH <= 0) return 1.0f;
+    return (std::min)((float)g.clientW / (float)g.contentW,
+                      (float)g.clientH / (float)g.contentH);
+}
+
+// D3D viewport coordinates are bounded to +-32768, and on a headset whose panel pair is
+// already 5120 wide the image's own size crosses that well before kMaxZoom does. Cap the
+// scale rather than hand the rasterizer a rect it cannot address.
+inline float MaxZoom() {
+    const int span = (std::max)(g_previewGeom.contentW, g_previewGeom.contentH);
+    if (span <= 0) return kMaxZoom;
+    return (std::min)(kMaxZoom, 32000.0f / (float)span);
+}
+
+// The scale the preview is drawn at, whichever mode is active.
+inline float EffectiveScale() {
+    return g_uiState.fitToWindow ? FitScale()
+                                 : (std::min)(g_uiState.zoomLevel, MaxZoom());
+}
+
+// Keep the image covering the window: there is nothing to pan while it is smaller than
+// the client area, and once it is larger its edges may not come inside it.
+inline void ClampPan() {
+    const PreviewGeometry& g = g_previewGeom;
+    const float scale = EffectiveScale();
+    const float maxX = (std::max)(0.0f, ((float)g.contentW * scale - (float)g.clientW) * 0.5f);
+    const float maxY = (std::max)(0.0f, ((float)g.contentH * scale - (float)g.clientH) * 0.5f);
+    g_uiState.panX = (std::max)(-maxX, (std::min)(maxX, g_uiState.panX));
+    g_uiState.panY = (std::max)(-maxY, (std::min)(maxY, g_uiState.panY));
+}
+
+inline PreviewRect ComputePreviewRect() {
+    const PreviewGeometry& g = g_previewGeom;
+    if (g.contentW <= 0 || g.contentH <= 0 || g.clientW <= 0 || g.clientH <= 0) {
+        return { 0.0f, 0.0f, (float)(std::max)(g.clientW, 1), (float)(std::max)(g.clientH, 1) };
+    }
+
+    if (g_uiState.fitToWindow) {
+        g_uiState.panX = g_uiState.panY = 0.0f;
+    } else {
+        ClampPan();
+    }
+
+    const float scale = EffectiveScale();
+    PreviewRect r;
+    r.w = (float)g.contentW * scale;
+    r.h = (float)g.contentH * scale;
+    r.x = ((float)g.clientW - r.w) * 0.5f + g_uiState.panX;
+    r.y = ((float)g.clientH - r.h) * 0.5f + g_uiState.panY;
+    return r;
+}
+
+// Move to an absolute scale, keeping whatever sits under (anchorX, anchorY) in the client
+// area where it is. Leaving "fit to window" therefore starts from the scale the window was
+// already showing, so the first step is one notch rather than a jump.
+inline void ZoomAbout(float scale, float anchorX, float anchorY) {
+    const PreviewRect before = ComputePreviewRect();
+    const float u = before.w > 0.0f ? (anchorX - before.x) / before.w : 0.5f;
+    const float v = before.h > 0.0f ? (anchorY - before.y) / before.h : 0.5f;
+
     g_uiState.fitToWindow = false;
-    g_uiState.zoomLevel = (std::max)(0.1f, (std::min)(2.0f, g_uiState.zoomLevel + delta));
+    g_uiState.zoomLevel = (std::max)(kMinZoom, (std::min)(MaxZoom(), scale));
+
+    const PreviewGeometry& g = g_previewGeom;
+    const float w = (float)g.contentW * g_uiState.zoomLevel;
+    const float h = (float)g.contentH * g_uiState.zoomLevel;
+    g_uiState.panX = (anchorX - u * w) - ((float)g.clientW - w) * 0.5f;
+    g_uiState.panY = (anchorY - v * h) - ((float)g.clientH - h) * 0.5f;
+    ClampPan();
+}
+
+// Zoom about the middle of the window, for the menu items and the keyboard.
+inline void SetZoom(float scale) {
+    ZoomAbout(scale, (float)g_previewGeom.clientW * 0.5f, (float)g_previewGeom.clientH * 0.5f);
+}
+
+// Steps scale rather than add, so a notch feels the same at 25% as it does at 400%.
+inline void ZoomBy(float factor) {
+    SetZoom(EffectiveScale() * factor);
+}
+
+inline void SetFitToWindow() {
+    g_uiState.fitToWindow = true;
+    g_uiState.panX = g_uiState.panY = 0.0f;
 }
 
 // Handle menu commands - returns true if handled
@@ -488,44 +1020,33 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
             needsResize = true;
             break;
 
-        // Zoom presets
+        // Zoom presets. These scale the image, so the window is left alone.
         case ID_ZOOM_FIT:
-            g_uiState.fitToWindow = true;
-            needsResize = true;
+            SetFitToWindow();
             break;
 
         case ID_ZOOM_25:
-            g_uiState.fitToWindow = false;
-            g_uiState.zoomLevel = 0.25f;
-            needsResize = true;
+            SetZoom(0.25f);
             break;
 
         case ID_ZOOM_50:
-            g_uiState.fitToWindow = false;
-            g_uiState.zoomLevel = 0.50f;
-            needsResize = true;
+            SetZoom(0.50f);
             break;
 
         case ID_ZOOM_75:
-            g_uiState.fitToWindow = false;
-            g_uiState.zoomLevel = 0.75f;
-            needsResize = true;
+            SetZoom(0.75f);
             break;
 
         case ID_ZOOM_100:
-            g_uiState.fitToWindow = false;
-            g_uiState.zoomLevel = 1.0f;
-            needsResize = true;
+            SetZoom(1.0f);
             break;
 
         case ID_ZOOM_IN:
-            AdjustZoom(0.1f);
-            needsResize = true;
+            ZoomBy(1.25f);
             break;
 
         case ID_ZOOM_OUT:
-            AdjustZoom(-0.1f);
-            needsResize = true;
+            ZoomBy(1.0f / 1.25f);
             break;
 
         // FOV options
@@ -557,26 +1078,6 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
 
         case ID_FOV_ASYMMETRIC:
             SetAsymmetricViews();
-            settingsChanged = true;
-            break;
-
-        case ID_PROFILE_GENERIC:
-            SetHeadsetProfile(HeadsetProfile::GenericSymmetric);
-            settingsChanged = true;
-            break;
-
-        case ID_PROFILE_QUEST2:
-            SetHeadsetProfile(HeadsetProfile::Quest2);
-            settingsChanged = true;
-            break;
-
-        case ID_PROFILE_QUEST3:
-            SetHeadsetProfile(HeadsetProfile::Quest3);
-            settingsChanged = true;
-            break;
-
-        case ID_PROFILE_INDEX:
-            SetHeadsetProfile(HeadsetProfile::ValveIndex);
             settingsChanged = true;
             break;
 
@@ -632,8 +1133,7 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
 
         case ID_TOOLS_TOGGLE_STATS: {
             g_uiState.showStats = !g_uiState.showStats;
-            // Refresh the menu checkmark and force an immediate title-bar
-            // update so the user sees the stats appear/disappear right away.
+            SaveSettings();
             HMENU menuT = GetMenu(hwnd);
             if (menuT) UpdateMenuState(menuT);
             return true;
@@ -648,8 +1148,32 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
             ShowAboutDialog(hwnd);
             return true;
 
+        // Movement speed
+        case ID_MOVE_SLOWER:
+            ScaleMoveSpeed(1.0f / 1.25f);
+            break;
+
+        case ID_MOVE_FASTER:
+            ScaleMoveSpeed(1.25f);
+            break;
+
         default:
-            return false;
+            if (IsMoveSpeedCommand(cmd)) {
+                SetMoveSpeed(kMoveSpeedPresets[cmd - ID_MOVE_SPEED_FIRST].mps);
+                break;
+            }
+            if (IsMoveBoostCommand(cmd)) {
+                g_uiState.moveBoost = kMoveBoostPresets[cmd - ID_MOVE_BOOST_FIRST].factor;
+                break;
+            }
+            if (IsPreviewRateCommand(cmd)) {
+                g_uiState.previewFps = kPreviewRatePresets[cmd - ID_PREVIEW_RATE_FIRST].fps;
+                break;
+            }
+            if (!IsHeadsetProfileCommand(cmd)) return false;
+            SetHeadsetProfile((HeadsetProfile)(cmd - ID_PROFILE_FIRST));
+            settingsChanged = true;
+            break;
     }
 
     if (needsResize && resizeCallback) {
@@ -659,6 +1183,8 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
     if (settingsChanged && settingsChangedCallback) {
         settingsChangedCallback(cmd);
     }
+
+    SaveSettings();
 
     // Update menu checkmarks
     HMENU menu = GetMenu(hwnd);
@@ -713,12 +1239,15 @@ inline bool HandleKeyboardShortcut(HWND hwnd, WPARAM vk,
             return HandleMenuCommand(hwnd, ID_IPD_DECREASE, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_OEM_6:
             return HandleMenuCommand(hwnd, ID_IPD_INCREASE, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
+        case VK_OEM_COMMA:
+            return HandleMenuCommand(hwnd, ID_MOVE_SLOWER, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
+        case VK_OEM_PERIOD:
+            return HandleMenuCommand(hwnd, ID_MOVE_FASTER, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_F1:
             ShowControlsDialog(hwnd);
             return true;
         case VK_F3:
-            g_uiState.showStats = !g_uiState.showStats;
-            return true;
+            return HandleMenuCommand(hwnd, ID_TOOLS_TOGGLE_STATS, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_F12:
             if (screenshotCallback) screenshotCallback();
             return true;
@@ -729,14 +1258,12 @@ inline bool HandleKeyboardShortcut(HWND hwnd, WPARAM vk,
     return false;
 }
 
-// Handle mouse wheel for zoom
-inline bool HandleMouseWheel(HWND hwnd, short delta,
-    std::function<void()> resizeCallback = nullptr) {
-
-    float zoomDelta = (delta > 0) ? 0.05f : -0.05f;
-    AdjustZoom(zoomDelta);
-
-    if (resizeCallback) resizeCallback();
+// Handle mouse wheel for zoom. Anchored on the cursor, so scrolling over a detail walks
+// into it instead of into the middle of the image. `anchor` is in client pixels; the
+// caller is responsible for having published the current geometry.
+inline bool HandleMouseWheel(HWND hwnd, short delta, float anchorX, float anchorY) {
+    ZoomAbout(EffectiveScale() * (delta > 0 ? 1.1f : 1.0f / 1.1f), anchorX, anchorY);
+    SaveSettings();
 
     HMENU menu = GetMenu(hwnd);
     if (menu) UpdateMenuState(menu);
@@ -794,11 +1321,12 @@ inline void UpdateWindowTitle(HWND hwnd, const StatsInfo* stats = nullptr) {
     if (g_uiState.viewMode == ViewMode::LeftEyeOnly) viewModeStr = L"Left Eye";
     else if (g_uiState.viewMode == ViewMode::RightEyeOnly) viewModeStr = L"Right Eye";
 
+    // "Fit" still carries the scale it settled on: it is what +/- steps away from.
     wchar_t zoomStr[32];
     if (g_uiState.fitToWindow) {
-        wcscpy_s(zoomStr, L"Fit");
+        swprintf_s(zoomStr, L"Fit (%d%%)", (int)(FitScale() * 100.0f + 0.5f));
     } else {
-        swprintf_s(zoomStr, L"%d%%", (int)(g_uiState.zoomLevel * 100));
+        swprintf_s(zoomStr, L"%d%%", (int)(g_uiState.zoomLevel * 100.0f + 0.5f));
     }
 
     wchar_t base[512];
@@ -815,9 +1343,10 @@ inline void UpdateWindowTitle(HWND hwnd, const StatsInfo* stats = nullptr) {
     wchar_t statsSuffix[256] = L"";
     if (g_uiState.showStats && stats) {
         swprintf_s(statsSuffix,
-            L"  |  XR p50 %.1f ms p95 %.1f ms (%u)  Src %dx%d  Win %dx%d  Head (%.2f,%.2f,%.2f) Yaw %.0f° Pitch %.0f°",
+            L"  |  XR p50 %.1f ms p95 %.1f ms (%u)  Src %dx%d  Win %dx%d  Spd %.2g m/s  Head (%.2f,%.2f,%.2f) Yaw %.0f° Pitch %.0f°",
             stats->p50FrameMs, stats->p95FrameMs, stats->projectionTimingSamples,
             stats->sourceW, stats->sourceH, stats->clientW, stats->clientH,
+            g_uiState.moveSpeed,
             stats->headX, stats->headY, stats->headZ,
             stats->yawDeg, stats->pitchDeg);
     }
