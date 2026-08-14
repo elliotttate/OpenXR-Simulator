@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -38,6 +39,38 @@ struct Sample {
     float brightFractionRight = 0.0f;
 };
 
+// RenderDoc's application API is append-only. Requesting 1.1.0 and declaring
+// the stable pointer layout through TriggerMultiFrameCapture avoids a build-time
+// dependency while still using the official RENDERDOC_GetAPI entry point.
+using RenderDocSetCapturePath = void(__cdecl*)(const char*);
+using RenderDocTriggerMultiFrameCapture = void(__cdecl*)(uint32_t);
+struct RenderDocApi110 {
+    void* getApiVersion;
+    void* setCaptureOptionU32;
+    void* setCaptureOptionF32;
+    void* getCaptureOptionU32;
+    void* getCaptureOptionF32;
+    void* setFocusToggleKeys;
+    void* setCaptureKeys;
+    void* getOverlayBits;
+    void* maskOverlayBits;
+    void* removeHooks;
+    void* unloadCrashHandler;
+    RenderDocSetCapturePath setCaptureFilePathTemplate;
+    void* getCaptureFilePathTemplate;
+    void* getNumCaptures;
+    void* getCapture;
+    void* triggerCapture;
+    void* isTargetControlConnected;
+    void* launchReplayUi;
+    void* setActiveWindow;
+    void* startFrameCapture;
+    void* isFrameCapturing;
+    void* endFrameCapture;
+    RenderDocTriggerMultiFrameCapture triggerMultiFrameCapture;
+};
+using RenderDocGetApi = int(__cdecl*)(int, void**);
+
 struct State {
     std::mutex mutex;
     uint64_t lastGeneration = 0;
@@ -52,6 +85,9 @@ struct State {
     uint64_t failedPaints = 0;
     uint64_t duplicateGenerationPaints = 0;
     uint64_t asymmetricBrightSamples = 0;
+    uint64_t renderDocTriggerAttempts = 0;
+    uint64_t renderDocTriggerSuccesses = 0;
+    uint64_t lastRenderDocTriggerFrame = 0;
     uint64_t lastPaintGeneration = 0;
     uint64_t anomalyCount = 0;
     uint64_t incidentCount = 0;
@@ -115,6 +151,40 @@ std::filesystem::path DataRoot() {
     const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, MAX_PATH);
     std::filesystem::path root = length > 0 && length < MAX_PATH ? buffer : L".";
     return root / L"OpenXR-Simulator";
+}
+
+bool TryTriggerRenderDocCapture(State& state, uint64_t frame) {
+    char enabled[8] = {};
+    if (GetEnvironmentVariableA("BVR_RENDERDOC_AUTO_CAPTURE", enabled, sizeof(enabled)) == 0 ||
+        enabled[0] == '0') return false;
+    if (state.lastRenderDocTriggerFrame != 0 && frame - state.lastRenderDocTriggerFrame < 60)
+        return false;
+
+    ++state.renderDocTriggerAttempts;
+    HMODULE module = GetModuleHandleW(L"renderdoc.dll");
+    if (!module) return false;
+    auto getApi = reinterpret_cast<RenderDocGetApi>(GetProcAddress(module, "RENDERDOC_GetAPI"));
+    if (!getApi) return false;
+    RenderDocApi110* api = nullptr;
+    if (getApi(10100, reinterpret_cast<void**>(&api)) != 1 || !api ||
+        !api->triggerMultiFrameCapture) return false;
+
+    char captureTemplate[32768] = {};
+    if (GetEnvironmentVariableA("BVR_RENDERDOC_CAPTURE_TEMPLATE", captureTemplate,
+            sizeof(captureTemplate)) > 0 && api->setCaptureFilePathTemplate) {
+        api->setCaptureFilePathTemplate(captureTemplate);
+    }
+    char frameCountText[32] = {};
+    uint32_t frameCount = 3;
+    if (GetEnvironmentVariableA("BVR_RENDERDOC_CAPTURE_FRAMES", frameCountText,
+            sizeof(frameCountText)) > 0) {
+        frameCount = std::clamp<uint32_t>(
+            static_cast<uint32_t>(std::strtoul(frameCountText, nullptr, 10)), 1, 10);
+    }
+    api->triggerMultiFrameCapture(frameCount);
+    state.lastRenderDocTriggerFrame = frame;
+    ++state.renderDocTriggerSuccesses;
+    return true;
 }
 
 uint64_t UnixTimeMs() {
@@ -358,6 +428,9 @@ void WriteStatus(const State& state, const Sample* sample, uint64_t frame) {
          << ",\n  \"asymmetricBrightSamples\": " << state.asymmetricBrightSamples
          << ",\n  \"consecutiveAsymmetricBright\": " << state.consecutiveAsymmetricBright
          << ",\n  \"maxConsecutiveAsymmetricBright\": " << state.maxConsecutiveAsymmetricBright
+         << ",\n  \"renderDocTriggerAttempts\": " << state.renderDocTriggerAttempts
+         << ",\n  \"renderDocTriggerSuccesses\": " << state.renderDocTriggerSuccesses
+         << ",\n  \"lastRenderDocTriggerFrame\": " << state.lastRenderDocTriggerFrame
          << ",\n  \"anomalyCount\": " << state.anomalyCount
          << ",\n  \"incidentCount\": " << state.incidentCount
          << ",\n  \"lastReason\": \"" << JsonEscape(state.lastReason) << "\""
@@ -379,6 +452,7 @@ void WriteStatus(const State& state, const Sample* sample, uint64_t frame) {
 void BeginIncident(State& state, const std::string& reason, uint64_t frame, bool force = false) {
     if (reason != "MANUAL_CAPTURE") ++state.anomalyCount;
     state.lastReason = reason;
+    if (reason != "MANUAL_CAPTURE") TryTriggerRenderDocCapture(state, frame);
     if (!state.activeIncidentDirectory.empty() ||
         (!force && state.lastIncidentFrame != 0 && frame - state.lastIncidentFrame < kIncidentCooldownFrames)) return;
 
@@ -533,6 +607,11 @@ void ObserveSubmission(uint64_t frame, uint32_t projectionLayers, uint32_t total
         const std::filesystem::path request = DataRoot() / L"flicker_capture_request.json";
         if (GetFileAttributesW(request.c_str()) != INVALID_FILE_ATTRIBUTES && DeleteFileW(request.c_str())) {
             BeginIncident(state, "MANUAL_CAPTURE", frame, true);
+        }
+        const std::filesystem::path renderDocRequest = DataRoot() / L"renderdoc_capture_request.json";
+        if (GetFileAttributesW(renderDocRequest.c_str()) != INVALID_FILE_ATTRIBUTES &&
+            DeleteFileW(renderDocRequest.c_str())) {
+            TryTriggerRenderDocCapture(state, frame);
         }
     }
     if (state.totalSubmissions % 15 == 0 || !hasProjection) {
