@@ -158,9 +158,13 @@ uint8_t Luma(const uint8_t* bgra) {
 Sample Downsample(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t frame) {
     Sample sample;
     sample.frame = frame;
-    sample.width = std::min(width, 640u);
+    // Detection runs on the application's xrEndFrame thread. A 320-wide signal
+    // retains far more spatial detail than the temporal/luma classifier needs
+    // while cutting sampling and history comparisons to one quarter of their
+    // previous cost.
+    sample.width = std::min(width, 320u);
     sample.height = std::max(1u, (uint32_t)std::llround((double)height * sample.width / std::max(1u, width)));
-    sample.height = std::min(sample.height, 360u);
+    sample.height = std::min(sample.height, 180u);
     sample.bgra.resize((size_t)sample.width * sample.height * 4);
 
     double sum = 0.0, sumLeft = 0.0, sumRight = 0.0;
@@ -194,8 +198,11 @@ Sample CropUi(const uint8_t* bgra, uint32_t width, uint32_t height,
               const int32_t rects[2][4], uint64_t frame) {
     Sample sample;
     sample.frame = frame;
-    sample.width = 512;
-    sample.height = 144;
+    // The UI detector only needs presence/absence and coarse temporal shape.
+    // Keep paired eye crops, but avoid scanning 74k pixels on every composed
+    // diagnostic preview update.
+    sample.width = 256;
+    sample.height = 72;
     sample.bgra.assign((size_t)sample.width * sample.height * 4, 0);
 
     double sum[2] = {};
@@ -209,12 +216,12 @@ Sample CropUi(const uint8_t* bgra, uint32_t width, uint32_t height,
         for (uint32_t y = 0; y < sample.height; ++y) {
             const uint32_t sourceY = (uint32_t)std::min<int64_t>(
                 ry1 - 1, ry0 + (int64_t)y * (ry1 - ry0) / sample.height);
-            for (uint32_t x = 0; x < 256; ++x) {
+            for (uint32_t x = 0; x < 128; ++x) {
                 const uint32_t sourceX = (uint32_t)std::min<int64_t>(
-                    rx1 - 1, rx0 + (int64_t)x * (rx1 - rx0) / 256);
+                    rx1 - 1, rx0 + (int64_t)x * (rx1 - rx0) / 128);
                 const uint8_t* source = bgra + ((size_t)sourceY * width + sourceX) * 4;
                 uint8_t* destination = sample.bgra.data() +
-                    ((size_t)y * sample.width + eye * 256 + x) * 4;
+                    ((size_t)y * sample.width + eye * 128 + x) * 4;
                 memcpy(destination, source, 4);
                 sum[eye] += Luma(source) / 255.0;
                 ++count[eye];
@@ -536,14 +543,11 @@ void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
         const Sample& previous = state.history.back();
         const bool blankNow = current.mean < 0.015f || current.mean > 0.985f;
         const bool blankBefore = previous.mean < 0.015f || previous.mean > 0.985f;
-        const float meanJump = std::abs(current.mean - previous.mean);
         const float eyeAsymmetry = std::abs(current.temporalLeft - current.temporalRight);
         // Black-to-visible is the expected startup transition. A return to a
         // blank frame after several visible samples is the actionable case.
         if (blankNow && !blankBefore && state.visiblePreviewSamples >= 5)
             reason = "VISIBLE_TO_BLANK_FRAME";
-        else if (current.temporal > 0.16f) reason = "LARGE_VISIBLE_TEMPORAL_JUMP";
-        else if (meanJump > 0.10f && current.temporal > 0.08f) reason = "VISIBLE_LUMA_FLASH";
         else if (std::max(current.temporalLeft, current.temporalRight) > 0.12f && eyeAsymmetry > 0.08f)
             reason = "ASYMMETRIC_EYE_FLASH";
         else if (state.history.size() >= 2 && current.temporal > 0.08f &&
@@ -638,8 +642,6 @@ void ObserveUi(const uint8_t* bgra, uint32_t width, uint32_t height,
             if (state.history.size() >= 2 && current.temporal > 0.055f &&
                 TemporalBetween(current, state.history[state.history.size() - 2]) < 0.025f) {
                 reason = "ALTERNATING_UI_REGION";
-            } else if (current.temporal > 0.18f) {
-                reason = "LARGE_UI_REGION_FLASH";
             } else if (std::max(current.temporalLeft, current.temporalRight) > 0.12f && asymmetry > 0.08f) {
                 reason = "ASYMMETRIC_UI_EYE_FLASH";
             }

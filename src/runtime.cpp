@@ -3652,7 +3652,7 @@ static void presentD3D12FrameSurface(rt::Session& s) {
         return;
     }
     // The XR loop may be 90+ Hz while the intentionally throttled preview DIB
-    // changes at ~30 Hz. Repainting an identical generation adds GDI churn and
+    // changes at ~15 Hz. Repainting an identical generation adds GDI churn and
     // can expose transient clears without producing any new visible content.
     if (s.previewDibGeneration == 0 ||
         s.previewDibGeneration == s.previewPresentedGeneration) {
@@ -3732,15 +3732,17 @@ static void blitD3D12ToPreview(rt::Session& s,
         ++s.previewReadbackCompleted;
     }
 
-    // Throttle the preview paint to ~30Hz: the GPU readback + GDI paint below couple the
-    // XR frame loop to the (60Hz, DWM-throttled) desktop, capping high-FPS apps. The
-    // preview only exists for humans, so skipping frames here never affects the app.
+    // Throttle the diagnostic desktop preview to ~15Hz: the GPU readback, CPU
+    // copy, overlay blend, flicker scan, and GDI paint otherwise couple the XR
+    // frame loop to the desktop and consume more than a millisecond of a 90Hz
+    // application's frame budget. Submission continuity is still inspected at
+    // application rate, while visible-output and UI crops are sampled at 15Hz.
     {
         static LARGE_INTEGER s_lastPreviewPaint = {};
         static LARGE_INTEGER s_qpcFreq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
         LARGE_INTEGER now; QueryPerformanceCounter(&now);
         if (s_lastPreviewPaint.QuadPart != 0 &&
-            (double)(now.QuadPart - s_lastPreviewPaint.QuadPart) / (double)s_qpcFreq.QuadPart < (1.0 / 30.0)) {
+            (double)(now.QuadPart - s_lastPreviewPaint.QuadPart) / (double)s_qpcFreq.QuadPart < (1.0 / 15.0)) {
             return;
         }
         s_lastPreviewPaint = now;
@@ -4819,7 +4821,7 @@ static void compositeQuadGDI(rt::Session& s, const XrCompositionLayerQuad* quad,
         ? (float)((double)alphaNonzero / (double)((uint64_t)qw * qh)) : 1.0f;
 
     // Overlay composition can change the displayed DIB on a frame where the
-    // 30 Hz projection readback was intentionally skipped. Treat it as a new
+    // 15 Hz projection readback was intentionally skipped. Treat it as a new
     // visible generation so the detector cannot miss overlay-induced flicker.
     if (frameSurfaceChanged) ++s.previewDibGeneration;
     if (frameSurfaceChanged) {
@@ -4926,7 +4928,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad,
         }
 
         // Sample the source UI at 10 Hz. Cached UI is still recomposed on every
-        // 30 Hz projection refresh, so this controls source latency rather than
+        // 15 Hz projection refresh, so this controls source latency rather than
         // visible continuity.
         {
             static LARGE_INTEGER s_lastQuadSubmit = {};
