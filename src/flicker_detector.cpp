@@ -60,6 +60,7 @@ struct Sample {
     float brightFractionLeft = 0.0f;
     float brightFractionRight = 0.0f;
     PreviewFrameInfo frameInfo{};
+    float uiStereoMaskFraction = 0.0f;
 };
 
 // The classifier metrics without the pixels: what the status JSON needs, small
@@ -78,6 +79,7 @@ Sample MetricsOnly(const Sample& sample) {
     metrics.brightFractionLeft = sample.brightFractionLeft;
     metrics.brightFractionRight = sample.brightFractionRight;
     metrics.frameInfo = sample.frameInfo;
+    metrics.uiStereoMaskFraction = sample.uiStereoMaskFraction;
     return metrics;
 }
 
@@ -413,6 +415,58 @@ void CalculateTemporal(Sample& current, const Sample& previous) {
     current.temporalRight = countRight ? (float)(right / countRight) : current.temporal;
 }
 
+void CalculateUiTemporal(Sample& current, const Sample& previous) {
+    if (current.width != previous.width || current.height != previous.height ||
+        current.width < 2 || current.width % 2 != 0 ||
+        current.bgra.size() != previous.bgra.size()) return;
+
+    // CropUi normalizes the projected quad rectangle in each eye to equal-sized
+    // halves. Authored UI therefore has the same prior-frame coordinates and
+    // color in both halves, while the world visible through transparent quad
+    // pixels retains stereo disparity. Build the mask from the previous good
+    // frame so a real one-eye disappearance remains measurable in the current
+    // frame instead of masking itself out.
+    constexpr int kStereoColorTolerance = 12;
+    const uint32_t halfWidth = current.width / 2;
+    double left = 0.0, right = 0.0;
+    uint64_t count = 0;
+    for (uint32_t y = 0; y < current.height; ++y) {
+        for (uint32_t x = 0; x < halfWidth; ++x) {
+            const size_t previousLeftOffset = ((size_t)y * previous.width + x) * 4;
+            const size_t previousRightOffset =
+                ((size_t)y * previous.width + halfWidth + x) * 4;
+            const uint8_t* previousLeft = previous.bgra.data() + previousLeftOffset;
+            const uint8_t* previousRight = previous.bgra.data() + previousRightOffset;
+            bool stereoAligned = true;
+            for (uint32_t channel = 0; channel < 3; ++channel) {
+                if (std::abs((int)previousLeft[channel] - (int)previousRight[channel]) >
+                    kStereoColorTolerance) {
+                    stereoAligned = false;
+                    break;
+                }
+            }
+            if (!stereoAligned) continue;
+
+            const size_t currentLeftOffset = ((size_t)y * current.width + x) * 4;
+            const size_t currentRightOffset =
+                ((size_t)y * current.width + halfWidth + x) * 4;
+            left += std::abs((int)Luma(current.bgra.data() + currentLeftOffset) -
+                             (int)Luma(previousLeft)) / 255.0;
+            right += std::abs((int)Luma(current.bgra.data() + currentRightOffset) -
+                              (int)Luma(previousRight)) / 255.0;
+            ++count;
+        }
+    }
+    const uint64_t eyePixels = (uint64_t)halfWidth * current.height;
+    current.uiStereoMaskFraction = eyePixels ? (float)count / eyePixels : 0.0f;
+    // A tiny correspondence set is not enough evidence for temporal UI
+    // classification. Structural cache/composition counters remain active.
+    if (count < 64) return;
+    current.temporalLeft = (float)(left / count);
+    current.temporalRight = (float)(right / count);
+    current.temporal = (current.temporalLeft + current.temporalRight) * 0.5f;
+}
+
 float TemporalBetween(const Sample& first, const Sample& second) {
     if (first.width != second.width || first.height != second.height ||
         first.bgra.size() != second.bgra.size() || first.bgra.empty()) return 1.0f;
@@ -669,7 +723,8 @@ std::string BuildUiStatusJson(const UiState& state, const Sample* sample, uint64
              << ", \"meanRight\": " << sample->meanRight
              << ", \"temporal\": " << sample->temporal
              << ", \"temporalLeft\": " << sample->temporalLeft
-             << ", \"temporalRight\": " << sample->temporalRight << " }";
+             << ", \"temporalRight\": " << sample->temporalRight
+             << ", \"stereoMaskFraction\": " << sample->uiStereoMaskFraction << " }";
     }
     json << "\n}\n";
     return json.str();
@@ -1310,7 +1365,7 @@ void ObserveUi(const uint8_t* bgra, uint32_t width, uint32_t height,
         generation != state.lastGeneration) {
         state.lastGeneration = generation;
         current = CropUi(bgra, width, height, pitchBytes, info.rects, frame);
-        if (!state.history.empty()) CalculateTemporal(current, state.history.back());
+        if (!state.history.empty()) CalculateUiTemporal(current, state.history.back());
         ++state.uiSamples;
         if (reason.empty() && !state.history.empty()) {
             const float asymmetry = std::abs(current.temporalLeft - current.temporalRight);
