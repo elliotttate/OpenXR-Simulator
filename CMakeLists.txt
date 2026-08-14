@@ -27,8 +27,16 @@ add_library(openxr_simulator SHARED
     src/flicker_detector.cpp
     src/flicker_detector.h
     src/mcp_integration.h
+    src/projection_timing.h
     src/ui_enhancements.h
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(projection_timing_tests tests/projection_timing_tests.cpp)
+    target_include_directories(projection_timing_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME projection_timing COMMAND projection_timing_tests)
+endif()
 
 # Link libraries
 target_link_libraries(openxr_simulator

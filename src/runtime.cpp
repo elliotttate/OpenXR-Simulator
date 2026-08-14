@@ -107,6 +107,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <openxr/openxr_platform.h>
 #include <loader_interfaces.h>
 #include "mcp_integration.h"
+#include "projection_timing.h"
 #include "ui_enhancements.h"
 
 using Microsoft::WRL::ComPtr;
@@ -845,6 +846,8 @@ static FitRect ComputeFitRect(int contentW, int contentH, int dstW, int dstH) {
     return r;
 }
 
+static perf::ProjectionTimingTracker g_projectionTiming;
+
 // Build the stats payload for the title bar (used when "Show Statistics" is on).
 static ui::StatsInfo BuildStatsInfo(rt::Session& s) {
     ui::StatsInfo si;
@@ -859,6 +862,14 @@ static ui::StatsInfo BuildStatsInfo(rt::Session& s) {
     si.yawDeg   = rt::g_headYaw   * RAD2DEG;
     si.pitchDeg = rt::g_headPitch * RAD2DEG;
     si.rollDeg  = rt::g_headRoll  * RAD2DEG;
+    const auto timing = g_projectionTiming.Snapshot(
+        perf::ProjectionTimingTracker::Clock::now());
+    si.projectionTimingActive = timing.active;
+    si.projectionFps = timing.fps;
+    si.latestFrameMs = timing.latestFrameMs;
+    si.p50FrameMs = timing.p50FrameMs;
+    si.p95FrameMs = timing.p95FrameMs;
+    si.projectionTimingSamples = (uint32_t)timing.sampleCount;
     return si;
 }
 
@@ -4368,26 +4379,6 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 }
             }
 
-            // Update window title with FPS
-            static int glTitleFrameCount = 0;
-            static auto glLastTitleUpdate = std::chrono::high_resolution_clock::now();
-            static int glLastFPS = 0;
-            glTitleFrameCount++;
-            auto now = std::chrono::high_resolution_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - glLastTitleUpdate).count();
-            if (elapsed >= 500) {
-                glLastFPS = (int)(glTitleFrameCount * 1000 / elapsed);
-                glTitleFrameCount = 0;
-                glLastTitleUpdate = now;
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, glLastFPS, 0, &si);
-            } else if (ui::g_lastScreenshotTickMs != 0) {
-                // Refresh frequently while a screenshot notice is active so it
-                // appears immediately rather than at the next 500ms tick.
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, glLastFPS, 0, &si);
-            }
-
             // Present (may be deferred if overlays are pending)
             if (!skipPresent) {
                 MSG msg;
@@ -4571,24 +4562,6 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 g_presentPending = true;
             }
 
-            // Update window title with stats
-            static int titleFrameCount = 0;
-            static auto lastTitleUpdate = std::chrono::high_resolution_clock::now();
-            static int lastFPS = 0;
-            titleFrameCount++;
-            auto now = std::chrono::high_resolution_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastTitleUpdate).count();
-            if (elapsed >= 500) {
-                lastFPS = (int)(titleFrameCount * 1000 / elapsed);
-                titleFrameCount = 0;
-                lastTitleUpdate = now;
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, lastFPS, 0, &si);
-            } else if (ui::g_lastScreenshotTickMs != 0) {
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, lastFPS, 0, &si);
-            }
-
             // MCP Integration - check for screenshot requests and capture
             mcp::CheckScreenshotRequest();
             if (mcp::g_screenshotRequested) {
@@ -4630,24 +4603,6 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
             // No Present call here. blitD3D12ToPreview stages the eyes; xrEndFrame
             // paints the completed projection+overlay DIB after all layers.
-
-            // Update window title with FPS stats
-            static int d3d12TitleFrameCount = 0;
-            static auto d3d12LastTitleUpdate = std::chrono::high_resolution_clock::now();
-            static int d3d12LastFPS = 0;
-            d3d12TitleFrameCount++;
-            auto now12 = std::chrono::high_resolution_clock::now();
-            auto elapsed12 = std::chrono::duration_cast<std::chrono::milliseconds>(now12 - d3d12LastTitleUpdate).count();
-            if (elapsed12 >= 500) {
-                d3d12LastFPS = (int)(d3d12TitleFrameCount * 1000 / elapsed12);
-                d3d12TitleFrameCount = 0;
-                d3d12LastTitleUpdate = now12;
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, d3d12LastFPS, 0, &si);
-            } else if (ui::g_lastScreenshotTickMs != 0) {
-                ui::StatsInfo si = rt::BuildStatsInfo(s);
-                ui::UpdateWindowTitle(s.hwnd, d3d12LastFPS, 0, &si);
-            }
 
             // MCP Integration - check for screenshot requests and capture (D3D12)
             // Screenshots use the readback buffer that was just filled by blitD3D12ToPreview
@@ -5363,16 +5318,31 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
 
     // First pass: count layer types to know if we need to defer Present
     int projectionCount = 0, quadCount = 0, cylinderCount = 0, otherCount = 0;
+    bool hasStereoProjection = false;
     for (uint32_t i = 0; i < info->layerCount; ++i) {
         const XrCompositionLayerBaseHeader* base = info->layers[i];
         if (!base) continue;
         switch (base->type) {
-            case XR_TYPE_COMPOSITION_LAYER_PROJECTION: projectionCount++; break;
+            case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
+                projectionCount++;
+                const auto* projection =
+                    reinterpret_cast<const XrCompositionLayerProjection*>(base);
+                if (projection->views && projection->viewCount >= 2 &&
+                    projection->views[0].subImage.imageRect.extent.width > 0 &&
+                    projection->views[0].subImage.imageRect.extent.height > 0 &&
+                    projection->views[1].subImage.imageRect.extent.width > 0 &&
+                    projection->views[1].subImage.imageRect.extent.height > 0) {
+                    hasStereoProjection = true;
+                }
+                break;
+            }
             case XR_TYPE_COMPOSITION_LAYER_QUAD: quadCount++; break;
             case (XrStructureType)37: cylinderCount++; break; // XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR
             default: otherCount++; break;
         }
     }
+    const auto projectionTimingNow = perf::ProjectionTimingTracker::Clock::now();
+    rt::g_projectionTiming.Observe(hasStereoProjection, projectionTimingNow);
     flicker::ObserveSubmission((uint64_t)frameCount, (uint32_t)projectionCount,
                                info->layerCount);
 
@@ -5525,6 +5495,15 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
             s.previewSwapchain->Present(1, 0);
         }
         g_presentPending = false;
+    }
+
+    // Keep the measurement visible without drawing into the eye images (and
+    // therefore without contaminating screenshots or flicker/color analysis).
+    // F3 / Tools > Show Statistics adds p50/p95 and the rolling sample count.
+    if (rt::g_session.hwnd &&
+        rt::g_projectionTiming.ShouldRefreshTitle(projectionTimingNow)) {
+        ui::StatsInfo stats = rt::BuildStatsInfo(rt::g_session);
+        ui::UpdateWindowTitle(rt::g_session.hwnd, &stats);
     }
 
     if (shouldLog && (quadCount > 0 || cylinderCount > 0)) {

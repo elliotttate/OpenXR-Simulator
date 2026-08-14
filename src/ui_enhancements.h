@@ -763,6 +763,14 @@ struct StatsInfo {
     int  clientW = 0, clientH = 0;   // preview window client dims
     float headX = 0, headY = 0, headZ = 0;
     float yawDeg = 0, pitchDeg = 0, rollDeg = 0;
+    // Measured once per xrEndFrame that contains a valid stereo projection.
+    // This is deliberately independent of desktop repaint/readback cadence.
+    bool projectionTimingActive = false;
+    double projectionFps = 0.0;
+    double latestFrameMs = 0.0;
+    double p50FrameMs = 0.0;
+    double p95FrameMs = 0.0;
+    uint32_t projectionTimingSamples = 0;
 };
 
 // Briefly-shown "Screenshot saved" notice. Set by the capture path; the
@@ -779,8 +787,7 @@ inline void NotifyScreenshotSaved(const std::wstring& path) {
 // Update window title with current state info. When `stats` is non-null and
 // "Show Statistics" is on, the title gains a stats suffix. A recent screenshot
 // notice (within kScreenshotNoticeMs) is prepended.
-inline void UpdateWindowTitle(HWND hwnd, int fps = 0, int frameCount = 0,
-                              const StatsInfo* stats = nullptr) {
+inline void UpdateWindowTitle(HWND hwnd, const StatsInfo* stats = nullptr) {
     wchar_t title[768];
 
     const wchar_t* viewModeStr = L"Both Eyes";
@@ -795,18 +802,21 @@ inline void UpdateWindowTitle(HWND hwnd, int fps = 0, int frameCount = 0,
     }
 
     wchar_t base[512];
-    if (fps > 0) {
-        swprintf_s(base, L"OpenXR Simulator - %s - %s - %s - %dmm - %d FPS",
-                   viewModeStr, zoomStr, GetHeadsetProfileShortName(), GetIpdMillimeters(), fps);
+    if (stats && stats->projectionTimingActive && stats->projectionTimingSamples > 0) {
+        swprintf_s(base,
+            L"OpenXR Simulator - XR %.1f FPS avg | %.1f ms now - %s - %s - %s - %dmm",
+            stats->projectionFps, stats->latestFrameMs,
+            viewModeStr, zoomStr, GetHeadsetProfileShortName(), GetIpdMillimeters());
     } else {
-        swprintf_s(base, L"OpenXR Simulator - %s - %s - %s - %dmm",
+        swprintf_s(base, L"OpenXR Simulator - XR FPS waiting for stereo projection - %s - %s - %s - %dmm",
                    viewModeStr, zoomStr, GetHeadsetProfileShortName(), GetIpdMillimeters());
     }
 
     wchar_t statsSuffix[256] = L"";
     if (g_uiState.showStats && stats) {
         swprintf_s(statsSuffix,
-            L"  |  Src %dx%d  Win %dx%d  Head (%.2f,%.2f,%.2f) Yaw %.0f° Pitch %.0f°",
+            L"  |  XR p50 %.1f ms p95 %.1f ms (%u)  Src %dx%d  Win %dx%d  Head (%.2f,%.2f,%.2f) Yaw %.0f° Pitch %.0f°",
+            stats->p50FrameMs, stats->p95FrameMs, stats->projectionTimingSamples,
             stats->sourceW, stats->sourceH, stats->clientW, stats->clientH,
             stats->headX, stats->headY, stats->headZ,
             stats->yawDeg, stats->pitchDeg);

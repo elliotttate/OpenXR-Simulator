@@ -12,6 +12,7 @@ A lightweight OpenXR runtime that enables VR applications to run in a desktop wi
 
 - **Multi-API Support** - Supports D3D11, D3D12, and OpenGL graphics backends
 - **Desktop VR Preview** - Run VR applications in a resizable desktop window with side-by-side stereo view
+- **Live XR Performance** - Title-bar FPS and frametime are measured from stereo `xrEndFrame` submissions, not window repaints; press F3 for rolling p50/p95 frametimes
 - **Mouse & Keyboard Controls** - Navigate the virtual space using standard input devices
 - **Proper sRGB Handling** - Automatic gamma correction for accurate color reproduction
 - **Unity & Unreal Compatible** - Tested with Unity's OpenXR plugin and Unreal Engine (via UEVR)
@@ -53,6 +54,7 @@ Once registered, any OpenXR application will automatically use the simulator:
    - **Q/E**: Move up/down
    - **Shift**: Move faster
    - **ESC**: Release mouse capture
+   - **F3**: Show detailed XR p50/p95 frametime statistics in the title bar
 
 ### Uninstallation
 
