@@ -2787,7 +2787,11 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
         // Automatic Controller Animation Mode
         // ========================================
         // Press 'M' to toggle automatic motion - controller moves in a pattern
-        static bool autoMotionEnabled = true;  // Start with auto motion ON for testing
+        // Keep tracked controllers stationary unless the user explicitly opts in.
+        // Starting this test animation automatically makes applications with hand
+        // IK sweep their arm through the camera and creates false-positive flicker
+        // incidents in otherwise passive rendering/performance captures.
+        static bool autoMotionEnabled = false;
         static bool mKeyWasPressed = false;
         static float animTime = 0.0f;
 
@@ -5347,6 +5351,11 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         return XR_ERROR_VALIDATION_FAILURE;
     }
 
+    // Poll screenshot requests once per submitted frame, independent of layer
+    // topology.  Previously this only happened inside presentProjection(), so
+    // a quad-only UI frame could never consume a quad screenshot request.
+    mcp::CheckScreenshotRequest();
+
     if (shouldLog) {
         Logf("[SimXR] xrEndFrame: layers=%u", info->layerCount);
     }
@@ -5442,6 +5451,17 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     }
     LARGE_INTEGER afterOverlays{};
     QueryPerformanceCounter(&afterOverlays);
+
+    // A static or quad-only UI may reuse an already completed D3D12 readback.
+    // Fulfil the request from that cache instead of waiting for a projection
+    // frame (or for the source quad to change and schedule another readback).
+    if (rt::g_session.usesD3D12 && mcp::g_screenshotRequested &&
+        mcp::g_screenshotLayer == "quad" && mcp::g_quadLayerCaptured) {
+        mcp::CaptureQuadScreenshot();
+        std::string p = mcp::GetSimulatorDataPath() + "\\screenshot_quad.bmp";
+        std::wstring wp(p.begin(), p.end());
+        ui::NotifyScreenshotSaved(wp);
+    }
 
     flicker::UiFrameInfo uiInfo;
     uiInfo.quadLayers = (uint32_t)quadCount;
