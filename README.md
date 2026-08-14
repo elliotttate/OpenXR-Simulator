@@ -154,13 +154,31 @@ defaults.
 
 ### Headset Profiles
 
-Pick a headset from **FOV → Headset Profile** to preset the per-eye frustum, the
-panel resolution reported to `xrEnumerateViewConfigurationViews`, and a nominal
-IPD. The values are measured ones from the
+Pick a headset from **FOV → Headset Profile** to preset the per-eye frustum,
+physical panel shape, and a nominal IPD. The values are measured ones from the
 [HMD Geometry Database](https://risa2000.github.io/hmdgdb/). Add a profile by
 appending a row to `ui::kHeadsetSpecs` in
 [ui_enhancements.h](src/ui_enhancements.h); the enum, menu and settings keys
 follow from the table.
+
+### Render Resolution
+
+**Tools → Render Resolution** independently chooses the per-eye size reported to
+`xrEnumerateViewConfigurationViews`. The default is **1280x1400 (Performance)**;
+**Headset Native** uses the active profile's panel size, while the other presets
+trade image quality for GPU cost. Restart the OpenXR application after changing
+this setting so it recreates its color and depth swapchains.
+
+For an exact custom size, set `render_width` and `render_height` in
+`%LOCALAPPDATA%\OpenXR-Simulator\settings.json` while the application is closed.
+Values are clamped to the runtime's 4096x4096 maximum; `0` for both selects the
+active headset's native panel resolution.
+
+Render resolution does not determine desktop-preview size. **Zoom → Fill Window**
+(or `F`) scales lower-resolution images up and supersampled images down to cover
+the entire preview client area. Maximizing the window keeps it maximized instead
+of forcing it back to the headset aspect ratio. The numbered zoom modes remain
+available for pixel inspection.
 
 ### Movement Speed
 
@@ -181,12 +199,9 @@ the setting.
 
 ### Window Size
 
-Default preview window is 1920x540 (960x540 per eye). Modify in `runtime.cpp`:
-
-```cpp
-static UINT g_persistentWidth = 1920;  // Total width
-static UINT g_persistentHeight = 540;  // Height
-```
+The preview remembers its client size. In **Fill Window** mode it accepts any
+window or monitor aspect and scales the image to every client pixel; manual zoom
+modes keep the headset-content aspect for predictable pixel inspection.
 
 ### Background Color
 

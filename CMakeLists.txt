@@ -49,6 +49,13 @@ if(BUILD_TESTING)
     add_executable(projection_timing_tests tests/projection_timing_tests.cpp)
     target_include_directories(projection_timing_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME projection_timing COMMAND projection_timing_tests)
+
+    add_executable(ui_resolution_tests tests/ui_resolution_tests.cpp)
+    target_include_directories(ui_resolution_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    if(MSVC)
+        target_compile_options(ui_resolution_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME ui_resolution COMMAND ui_resolution_tests)
 endif()
 
 # Link libraries

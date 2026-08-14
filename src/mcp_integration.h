@@ -6,11 +6,13 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+#include <cwctype>
 #include <atomic>
 
 #include "json.h"
@@ -50,26 +52,80 @@ inline const std::string& GetSimulatorDataPath() {
 // real-time AV filter sits on %LOCALAPPDATA%, and ten of them per frame is milliseconds.
 //
 // The commands come from the MCP server, driven by an agent or a human, so they arrive
-// thousands of frames apart. Watch the directory and only pay for the opens on the frames
-// where something in it actually changed. The 500ms backstop covers the cases the
-// notification cannot: our own writes into the same folder consume one, and the handle
-// goes stale if the folder is deleted and recreated underneath us.
+// thousands of frames apart. Watch the directory, but filter by FILENAME: the runtime
+// itself writes status JSONs and logs into this same folder several times a second, and
+// an unfiltered change notification re-armed the polls on every one of those writes,
+// defeating the point of watching. Only a name matching a command/request file counts.
+// The 500ms backstop covers what the watch cannot: an overflowed notification buffer,
+// and the handle going stale if the folder is deleted and recreated underneath us.
 inline bool g_commandsDue = true;   // poll once on the first frame to drain anything stale
 
+inline bool IsCommandFileName(const wchar_t* name, size_t chars) {
+    wchar_t lowered[96];
+    if (chars == 0 || chars >= sizeof(lowered) / sizeof(lowered[0])) return false;
+    for (size_t i = 0; i < chars; ++i) {
+        lowered[i] = (wchar_t)towlower(name[i]);
+    }
+    lowered[chars] = 0;
+    const std::wstring_view view(lowered, chars);
+    constexpr std::wstring_view commandSuffix = L"_command.json";
+    if (view.size() >= commandSuffix.size() &&
+        view.compare(view.size() - commandSuffix.size(), commandSuffix.size(), commandSuffix) == 0) {
+        return true;
+    }
+    return view.find(L"_request") != std::wstring_view::npos;
+}
+
 inline void RefreshCommandsDue() {
-    static HANDLE watch = INVALID_HANDLE_VALUE;
+    static HANDLE directory = INVALID_HANDLE_VALUE;
+    static HANDLE event = nullptr;
+    static OVERLAPPED overlapped = {};
+    alignas(DWORD) static char buffer[4096];
+    static bool pending = false;
     static ULONGLONG lastPoll = 0;
     static bool init = false;
+
+    const auto rearm = []() {
+        ResetEvent(event);
+        pending = ReadDirectoryChangesW(directory, buffer, sizeof(buffer), FALSE,
+                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                                        nullptr, &overlapped, nullptr) != 0;
+    };
+
     if (!init) {
         init = true;
         CreateDirectoryA(GetSimulatorDataPath().c_str(), nullptr);
-        watch = FindFirstChangeNotificationA(GetSimulatorDataPath().c_str(), FALSE,
-                                             FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE);
+        directory = CreateFileA(GetSimulatorDataPath().c_str(), FILE_LIST_DIRECTORY,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                                nullptr);
+        event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        overlapped.hEvent = event;
+        if (directory != INVALID_HANDLE_VALUE && event) rearm();
     }
 
-    if (watch != INVALID_HANDLE_VALUE && WaitForSingleObject(watch, 0) == WAIT_OBJECT_0) {
-        FindNextChangeNotification(watch);
-        g_commandsDue = true;
+    if (pending && WaitForSingleObject(event, 0) == WAIT_OBJECT_0) {
+        DWORD bytes = 0;
+        bool commandTouched = false;
+        if (GetOverlappedResult(directory, &overlapped, &bytes, FALSE) && bytes > 0) {
+            const char* record = buffer;
+            for (;;) {
+                const FILE_NOTIFY_INFORMATION* info =
+                    reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(record);
+                if (IsCommandFileName(info->FileName, info->FileNameLength / sizeof(wchar_t))) {
+                    commandTouched = true;
+                    break;
+                }
+                if (!info->NextEntryOffset) break;
+                record += info->NextEntryOffset;
+            }
+        } else {
+            // Zero bytes means the buffer overflowed: too many changes to name
+            // them, so assume a command may be among them.
+            commandTouched = true;
+        }
+        rearm();
+        if (commandTouched) g_commandsDue = true;
     }
     const ULONGLONG now = GetTickCount64();
     if (now - lastPoll >= 500) {

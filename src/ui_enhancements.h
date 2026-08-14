@@ -81,7 +81,11 @@ enum MenuCommand {
 
     // One id per kPreviewRatePresets entry, in table order.
     ID_PREVIEW_RATE_FIRST = 1750,
-    ID_PREVIEW_RATE_LAST = 1765
+    ID_PREVIEW_RATE_LAST = 1765,
+
+    // One id per kRenderResolutionPresets entry, in table order.
+    ID_RENDER_RESOLUTION_FIRST = 1770,
+    ID_RENDER_RESOLUTION_LAST = 1799
 };
 
 // View mode enum
@@ -120,10 +124,18 @@ struct UIState {
     HeadsetProfile headsetProfile = HeadsetProfile::Quest3;
     bool showStats = false;
 
-    // Zoom scales the image inside the window; it never resizes the window. zoomLevel is
-    // an absolute content scale (1.0 = one panel pixel per screen pixel) and pan offsets
-    // the scaled image from centred, in client pixels. With fitToWindow set the scale
-    // comes from the window instead and pan is pinned to 0.
+    // Recommended per-eye render size reported to the application. This is deliberately
+    // independent of headset geometry: FOV/IPD can emulate Quest 3 while a lower render
+    // resolution keeps a desktop simulation fast. 0x0 means the active headset's native
+    // panel size. 1280x1400 matches the simulator's pre-native-panel performance posture.
+    int renderWidth = 1280;
+    int renderHeight = 1400;
+
+    // Zoom scales the image inside the window; it never changes the application's render
+    // resolution. zoomLevel is an absolute content scale (1.0 = one panel pixel per screen
+    // pixel) and pan offsets the scaled image from centred, in client pixels. With
+    // fitToWindow set, the compositor stretches the image to the entire client area so a
+    // low or supersampled source occupies the same screen space.
     float zoomLevel = 1.0f;
     bool fitToWindow = true;
     float panX = 0.0f;
@@ -151,7 +163,7 @@ struct UIState {
     // it composites the eyes, reads them back and repaints the window - and none of that
     // buys anything above the rate a monitor shows. 0 freezes the mirror (the app still
     // runs normally); kPreviewRateEveryFrame follows the app.
-    int previewFps = 60;
+    int previewFps = 90;
 };
 
 inline UIState g_uiState;
@@ -163,10 +175,10 @@ inline int g_lastFps = 0;
 
 // Everything that varies per headset, in one table.
 //
-// panelWidth/panelHeight is the native per-eye panel resolution: what
-// xrEnumerateViewConfigurationViews recommends, and the shape the preview maps each
-// eye onto. The second is the one that matters -- see "Why the preview used to look
-// stretched" in BETTERVR.md.
+// panelWidth/panelHeight is the native per-eye panel resolution: the shape the preview
+// uses for headset geometry and the value returned by the "Headset Native" render preset.
+// It is intentionally separate from the configurable render recommendation -- see
+// "Why the preview used to look stretched" in BETTERVR.md.
 //
 // The frustum half-angles are in degrees, following the XrFovf sign convention. Both
 // eyes are transcribed from the HMD Geometry Database
@@ -231,6 +243,67 @@ inline const HeadsetSpec& GetActiveHeadsetSpec() {
 inline int FindHeadsetSpec(const char* s) {
     for (int i = 0; i < kHeadsetProfileCount; ++i) {
         if (strcmp(s, kHeadsetSpecs[i].id) == 0) return i;
+    }
+    return -1;
+}
+
+struct RenderResolutionPreset {
+    int width;
+    int height;
+    const wchar_t* label;
+};
+
+// These are recommendations, not preview-window sizes. Applications may round them for
+// alignment (BetterVR rounds 2064 to 2080, for example), but choosing a lower entry still
+// directly reduces the render target and depth-buffer cost in applications that follow it.
+// The 0x0 entry follows the active headset profile.
+inline constexpr RenderResolutionPreset kRenderResolutionPresets[] = {
+    {    0,    0, L"&Headset Native" },
+    {  960, 1080, L"&960 x 1080 (Low)" },
+    { 1280, 1400, L"&1280 x 1400 (Performance)" },
+    { 1440, 1584, L"&1440 x 1584 (Balanced)" },
+    { 1832, 1920, L"&1832 x 1920 (High)" },
+    { 2064, 2208, L"&2064 x 2208" },
+    { 2560, 2560, L"&2560 x 2560 (Supersample)" },
+};
+
+inline constexpr int kRenderResolutionPresetCount =
+    (int)(sizeof(kRenderResolutionPresets) / sizeof(kRenderResolutionPresets[0]));
+
+static_assert(kRenderResolutionPresetCount <=
+              ID_RENDER_RESOLUTION_LAST - ID_RENDER_RESOLUTION_FIRST + 1,
+              "kRenderResolutionPresets outgrew the reserved menu id block");
+
+inline bool IsRenderResolutionCommand(int cmd) {
+    return cmd >= ID_RENDER_RESOLUTION_FIRST &&
+           cmd < ID_RENDER_RESOLUTION_FIRST + kRenderResolutionPresetCount;
+}
+
+inline void SetRenderResolution(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        g_uiState.renderWidth = 0;
+        g_uiState.renderHeight = 0;
+        return;
+    }
+    g_uiState.renderWidth = (std::max)(320, (std::min)(4096, width));
+    g_uiState.renderHeight = (std::max)(240, (std::min)(4096, height));
+}
+
+inline void GetRenderResolution(uint32_t& width, uint32_t& height) {
+    if (g_uiState.renderWidth > 0 && g_uiState.renderHeight > 0) {
+        width = (uint32_t)g_uiState.renderWidth;
+        height = (uint32_t)g_uiState.renderHeight;
+        return;
+    }
+    const HeadsetSpec& spec = GetActiveHeadsetSpec();
+    width = spec.panelWidth;
+    height = spec.panelHeight;
+}
+
+inline int GetRenderResolutionPresetIndex() {
+    for (int i = 0; i < kRenderResolutionPresetCount; ++i) {
+        if (g_uiState.renderWidth == kRenderResolutionPresets[i].width &&
+            g_uiState.renderHeight == kRenderResolutionPresets[i].height) return i;
     }
     return -1;
 }
@@ -362,6 +435,7 @@ inline constexpr int kPreviewRateEveryFrame = 10000;
 struct PreviewRatePreset { int fps; const wchar_t* label; };
 inline constexpr PreviewRatePreset kPreviewRatePresets[] = {
     { kPreviewRateEveryFrame, L"&Every Frame (no cap)" },
+    { 90, L"&90 Hz" },
     { 60, L"&60 Hz" },
     { 30, L"&30 Hz" },
     { 15, L"1&5 Hz" },
@@ -479,12 +553,14 @@ inline std::string g_settingsPath;
 inline std::string g_lastSettingsJson;
 
 inline std::string SerializeSettings() {
-    char buf[768];
+    char buf[1024];
     snprintf(buf, sizeof(buf),
         "{\n"
         "  \"view_mode\": \"%s\",\n"
         "  \"layout\": \"%s\",\n"
         "  \"headset_profile\": \"%s\",\n"
+        "  \"render_width\": %d,\n"
+        "  \"render_height\": %d,\n"
         "  \"asymmetric_fov\": %s,\n"
         "  \"fov_degrees\": %d,\n"
         "  \"ipd_mm\": %d,\n"
@@ -501,10 +577,12 @@ inline std::string SerializeSettings() {
         ViewModeName(g_uiState.viewMode),
         DisplayLayoutName(g_uiState.displayLayout),
         HeadsetProfileName(g_uiState.headsetProfile),
+        g_uiState.renderWidth,
+        g_uiState.renderHeight,
         g_uiState.useAsymmetricFov ? "true" : "false",
         g_uiState.fovDegrees,
         GetIpdMillimeters(),
-        g_uiState.fitToWindow ? "fit" : "scale",
+        g_uiState.fitToWindow ? "fill" : "scale",
         g_uiState.zoomLevel,
         g_uiState.windowWidth,
         g_uiState.windowHeight,
@@ -539,6 +617,16 @@ inline void ApplySettingsJson(const char* text) {
         SetHeadsetProfile(HeadsetProfileFromName(profile.c_str(), g_uiState.headsetProfile));
     }
 
+    // A missing pair is an older settings file: keep the new performance default. 0x0 is
+    // the explicit "Headset Native" mode; positive custom values are accepted even when
+    // they are not one of the menu presets.
+    const bool hasRenderResolution = o.has("render_width") || o.has("render_height");
+    if (hasRenderResolution) {
+        const int width = o.number("render_width", g_uiState.renderWidth);
+        const int height = o.number("render_height", g_uiState.renderHeight);
+        SetRenderResolution(width, height);
+    }
+
     g_uiState.viewMode = ViewModeFromName(
         o.string("view_mode").c_str(), g_uiState.viewMode);
     g_uiState.displayLayout = DisplayLayoutFromName(
@@ -549,11 +637,13 @@ inline void ApplySettingsJson(const char* text) {
         o.number("fov_degrees", g_uiState.fovDegrees)));
     SetIpdMillimeters(o.number("ipd_mm", GetIpdMillimeters()));
 
-    // Renamed from "zoom"/"fit_to_window", which meant a window size rather than an
-    // image scale. A file written by that build falls back to the defaults here.
-    g_uiState.fitToWindow = (o.string("zoom_mode", "fit") != "scale");
-    g_uiState.zoomLevel = (std::max)(kMinZoom, (std::min)(kMaxZoom,
-        o.number("zoom_scale", g_uiState.zoomLevel)));
+    // The mirror always opens in Fill at 100%: zoom/scale is a transient inspection
+    // tool, and a session that ended zoomed or panned must not pin the next one there.
+    // "zoom_mode"/"zoom_scale" in the file are deliberately ignored on load.
+    g_uiState.fitToWindow = true;
+    g_uiState.zoomLevel = 1.0f;
+    g_uiState.panX = 0.0f;
+    g_uiState.panY = 0.0f;
 
     // Left unclamped: the desktop this was saved on may not be the one it reopens on,
     // so the caller fits it to the current work area instead.
@@ -615,6 +705,156 @@ inline void SetCaptionColor(HWND hwnd, COLORREF color) {
     DwmSetWindowAttribute(hwnd, 35, &color, sizeof(color));
 }
 
+// ---------------------------------------------------------------------------
+// Dark menu bar
+//
+// DWM only darkens the title bar; the classic Win32 menu bar stays white. Two
+// pieces fix that: the undocumented uxtheme ordinals switch the process's
+// popup menus to dark, and the WM_UAH* custom-draw messages DefWindowProc
+// sends for a themed menu bar let us paint the bar itself. Both are the
+// established technique (Notepad++, WinMerge) on Windows 10 1809+; on older
+// systems every call quietly degrades to the light menu.
+// ---------------------------------------------------------------------------
+
+#ifndef WM_UAHDRAWMENU
+#define WM_UAHDRAWMENU     0x0091
+#define WM_UAHDRAWMENUITEM 0x0092
+#endif
+
+// Layouts of the undocumented WM_UAH* payloads, transcribed from the
+// win32-darkmode reference. Only the fields read below matter.
+struct UAHMenu {
+    HMENU hmenu;
+    HDC hdc;
+    DWORD dwFlags;
+};
+
+struct UAHMenuItemMetrics {
+    union {
+        struct { DWORD cx, cy; } rgsizeBar[2];
+        struct { DWORD cx, cy; } rgsizePopup[4];
+    };
+};
+
+struct UAHMenuPopupMetrics {
+    DWORD rgcx[4];
+    DWORD fUpdateMaxWidths : 2;
+};
+
+struct UAHMenuItem {
+    int iPosition;
+    UAHMenuItemMetrics umim;
+    UAHMenuPopupMetrics umpm;
+};
+
+struct UAHDrawMenuItem {
+    DRAWITEMSTRUCT dis;
+    UAHMenu um;
+    UAHMenuItem umi;
+};
+
+inline HBRUSH MenuBarBrush() {
+    static HBRUSH brush = CreateSolidBrush(Colors::Surface);
+    return brush;
+}
+
+inline HBRUSH MenuBarHotBrush() {
+    static HBRUSH brush = CreateSolidBrush(RGB(70, 70, 70));
+    return brush;
+}
+
+// Switch this process's popup menus to dark: SetPreferredAppMode(ForceDark) and
+// FlushMenuThemes, exported from uxtheme by ordinal only. The runtime lives in
+// the host application's process, so this would also darken a Win32 context
+// menu the host opened itself - acceptable for a developer tool, and games do
+// not use Win32 menus.
+inline void EnableDarkPopupMenus() {
+    static bool applied = false;
+    if (applied) return;
+    applied = true;
+    HMODULE uxtheme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!uxtheme) return;
+    // Ordinal 135 is SetPreferredAppMode(enum) on 1903+ and AllowDarkModeForApp(BOOL)
+    // on 1809; the ForceDark value 2 reads as TRUE there, so one call serves both.
+    using SetPreferredAppModeFn = int(WINAPI*)(int);
+    using FlushMenuThemesFn = void(WINAPI*)();
+    auto setPreferredAppMode =
+        (SetPreferredAppModeFn)GetProcAddress(uxtheme, MAKEINTRESOURCEA(135));
+    auto flushMenuThemes =
+        (FlushMenuThemesFn)GetProcAddress(uxtheme, MAKEINTRESOURCEA(136));
+    if (setPreferredAppMode) setPreferredAppMode(2 /* ForceDark */);
+    if (flushMenuThemes) flushMenuThemes();
+}
+
+// Custom-draw the menu bar dark. Returns true when the message was consumed and
+// *result holds the answer; the window procedure handles everything else as usual.
+inline bool HandleDarkMenuMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
+                                  LRESULT* result) {
+    switch (msg) {
+        case WM_UAHDRAWMENU: {
+            if (!GetMenu(hwnd)) return false;
+            const UAHMenu* menu = (const UAHMenu*)lParam;
+            MENUBARINFO mbi = { sizeof(mbi) };
+            if (!menu || !menu->hdc || !GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi)) return false;
+            RECT rcWindow{};
+            GetWindowRect(hwnd, &rcWindow);
+            RECT rc = mbi.rcBar;                       // screen -> window coordinates
+            OffsetRect(&rc, -rcWindow.left, -rcWindow.top);
+            rc.top -= 1;                               // cover the theme's top seam too
+            FillRect(menu->hdc, &rc, MenuBarBrush());
+            *result = TRUE;
+            return true;
+        }
+        case WM_UAHDRAWMENUITEM: {
+            const UAHDrawMenuItem* item = (const UAHDrawMenuItem*)lParam;
+            if (!item || !item->dis.hDC) return false;
+            wchar_t label[256] = {};
+            MENUITEMINFOW mii = { sizeof(mii) };
+            mii.fMask = MIIM_STRING;
+            mii.dwTypeData = label;
+            mii.cch = (UINT)(sizeof(label) / sizeof(label[0]) - 1);
+            GetMenuItemInfoW(item->um.hmenu, (UINT)item->umi.iPosition, TRUE, &mii);
+
+            DWORD textFlags = DT_CENTER | DT_SINGLELINE | DT_VCENTER;
+            if (item->dis.itemState & ODS_NOACCEL) textFlags |= DT_HIDEPREFIX;
+
+            const bool hot = (item->dis.itemState & (ODS_HOTLIGHT | ODS_SELECTED)) != 0;
+            const bool disabled = (item->dis.itemState & (ODS_GRAYED | ODS_DISABLED)) != 0;
+            FillRect(item->dis.hDC, &item->dis.rcItem, hot ? MenuBarHotBrush() : MenuBarBrush());
+            SetBkMode(item->dis.hDC, TRANSPARENT);
+            SetTextColor(item->dis.hDC, disabled ? Colors::TextSecondary : Colors::Text);
+            RECT rcText = item->dis.rcItem;
+            DrawTextW(item->dis.hDC, label, -1, &rcText, textFlags);
+            *result = TRUE;
+            return true;
+        }
+        // DefWindowProc paints a light 1px line between the menu bar and the
+        // client area from these two; let it run, then paint the line dark.
+        case WM_NCPAINT:
+        case WM_NCACTIVATE: {
+            if (!GetMenu(hwnd)) return false;
+            *result = DefWindowProcW(hwnd, msg, wParam, lParam);
+            MENUBARINFO mbi = { sizeof(mbi) };
+            if (!GetMenuBarInfo(hwnd, OBJID_MENU, 0, &mbi)) return true;
+            RECT rcClient{};
+            GetClientRect(hwnd, &rcClient);
+            MapWindowPoints(hwnd, nullptr, (POINT*)&rcClient, 2);
+            RECT rcWindow{};
+            GetWindowRect(hwnd, &rcWindow);
+            OffsetRect(&rcClient, -rcWindow.left, -rcWindow.top);
+            RECT rcLine = rcClient;
+            rcLine.bottom = rcLine.top;
+            rcLine.top -= 1;
+            if (HDC hdc = GetWindowDC(hwnd)) {
+                FillRect(hdc, &rcLine, MenuBarBrush());
+                ReleaseDC(hwnd, hdc);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 // Create the application menu
 inline HMENU CreateAppMenu() {
     HMENU menuBar = CreateMenu();
@@ -637,7 +877,7 @@ inline HMENU CreateAppMenu() {
 
     // Zoom Menu
     HMENU zoomMenu = CreatePopupMenu();
-    AppendMenuW(zoomMenu, MF_STRING, ID_ZOOM_FIT, L"&Fit to Window\tF");
+    AppendMenuW(zoomMenu, MF_STRING, ID_ZOOM_FIT, L"&Fill Window\tF");
     AppendMenuW(zoomMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(zoomMenu, MF_STRING, ID_ZOOM_25, L"25%\t1");
     AppendMenuW(zoomMenu, MF_STRING, ID_ZOOM_50, L"50%\t2");
@@ -687,6 +927,16 @@ inline HMENU CreateAppMenu() {
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_RESET_VIEW, L"&Reset View\tHome");
     AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_TOGGLE_STATS, L"Show &Statistics\tF3");
+    AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
+
+    HMENU renderResolutionMenu = CreatePopupMenu();
+    for (int i = 0; i < kRenderResolutionPresetCount; ++i) {
+        if (i == 1) AppendMenuW(renderResolutionMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(renderResolutionMenu, MF_STRING,
+                    ID_RENDER_RESOLUTION_FIRST + i, kRenderResolutionPresets[i].label);
+    }
+    AppendMenuW(toolsMenu, MF_POPUP, (UINT_PTR)renderResolutionMenu,
+                L"Render &Resolution (per eye, restart app)");
     AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
 
     HMENU moveMenu = CreatePopupMenu();
@@ -770,6 +1020,14 @@ inline void UpdateMenuState(HMENU menu) {
             g_uiState.previewFps == kPreviewRatePresets[i].fps ? MF_CHECKED : MF_UNCHECKED);
     }
 
+    // Render-resolution checks. A custom settings.json value intentionally leaves every
+    // preset unchecked instead of pretending it is the nearest one.
+    const int renderPreset = GetRenderResolutionPresetIndex();
+    for (int i = 0; i < kRenderResolutionPresetCount; ++i) {
+        CheckMenuItem(menu, ID_RENDER_RESOLUTION_FIRST + i,
+            renderPreset == i ? MF_CHECKED : MF_UNCHECKED);
+    }
+
     // IPD checks
     int ipdMm = GetIpdMillimeters();
     CheckMenuItem(menu, ID_IPD_0, ipdMm == 0 ? MF_CHECKED : MF_UNCHECKED);
@@ -815,8 +1073,8 @@ inline void ShowControlsDialog(HWND parent) {
         L"  B - Both eyes\n"
         L"  L - Left eye only\n"
         L"  R - Right eye only\n\n"
-        L"Zoom (scales the image, not the window):\n"
-        L"  F - Fit to window\n"
+        L"Preview Scaling (independent of render resolution):\n"
+        L"  F - Fill the entire window (upscale or downscale)\n"
         L"  1-4 - Zoom presets (25%-100% of panel resolution)\n"
         L"  +/- - Zoom in/out\n"
         L"  Mouse wheel - Zoom at the cursor\n"
@@ -887,7 +1145,8 @@ inline void CalculateWindowSize(int srcWidth, int srcHeight, int& outWidth, int&
     outHeight = (std::max)(outHeight, 240);
 }
 
-// Scale at which the whole image just fits the window.
+// Uniform scale at which the whole image just fits the window. Fill mode can be
+// non-uniform, but this remains the sensible starting point when +/- leaves that mode.
 inline float FitScale() {
     const PreviewGeometry& g = g_previewGeom;
     if (g.contentW <= 0 || g.contentH <= 0 || g.clientW <= 0 || g.clientH <= 0) return 1.0f;
@@ -904,7 +1163,8 @@ inline float MaxZoom() {
     return (std::min)(kMaxZoom, 32000.0f / (float)span);
 }
 
-// The scale the preview is drawn at, whichever mode is active.
+// The representative scale for zoom transitions. Fill mode itself is handled as an exact
+// client rect in ComputePreviewRect because its X and Y scales may differ.
 inline float EffectiveScale() {
     return g_uiState.fitToWindow ? FitScale()
                                  : (std::min)(g_uiState.zoomLevel, MaxZoom());
@@ -929,6 +1189,7 @@ inline PreviewRect ComputePreviewRect() {
 
     if (g_uiState.fitToWindow) {
         g_uiState.panX = g_uiState.panY = 0.0f;
+        return { 0.0f, 0.0f, (float)g.clientW, (float)g.clientH };
     } else {
         ClampPan();
     }
@@ -1170,6 +1431,16 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
                 g_uiState.previewFps = kPreviewRatePresets[cmd - ID_PREVIEW_RATE_FIRST].fps;
                 break;
             }
+            if (IsRenderResolutionCommand(cmd)) {
+                const RenderResolutionPreset& preset =
+                    kRenderResolutionPresets[cmd - ID_RENDER_RESOLUTION_FIRST];
+                SetRenderResolution(preset.width, preset.height);
+                // Resolution changes must affect workload, never the amount of desktop the
+                // preview occupies. Force the independent fill mode when selecting one.
+                SetFitToWindow();
+                settingsChanged = true;
+                break;
+            }
             if (!IsHeadsetProfileCommand(cmd)) return false;
             SetHeadsetProfile((HeadsetProfile)(cmd - ID_PROFILE_FIRST));
             settingsChanged = true;
@@ -1274,6 +1545,7 @@ inline bool HandleMouseWheel(HWND hwnd, short delta, float anchorX, float anchor
 // Apply dark theme to window
 inline void ApplyDarkTheme(HWND hwnd) {
     EnableDarkTitleBar(hwnd);
+    EnableDarkPopupMenus();
     SetCaptionColor(hwnd, Colors::Surface);
     SetWindowBorderColor(hwnd, Colors::Border);
 
@@ -1321,23 +1593,28 @@ inline void UpdateWindowTitle(HWND hwnd, const StatsInfo* stats = nullptr) {
     if (g_uiState.viewMode == ViewMode::LeftEyeOnly) viewModeStr = L"Left Eye";
     else if (g_uiState.viewMode == ViewMode::RightEyeOnly) viewModeStr = L"Right Eye";
 
-    // "Fit" still carries the scale it settled on: it is what +/- steps away from.
+    // Fill is resolution-independent: the source always occupies the whole client area.
     wchar_t zoomStr[32];
     if (g_uiState.fitToWindow) {
-        swprintf_s(zoomStr, L"Fit (%d%%)", (int)(FitScale() * 100.0f + 0.5f));
+        swprintf_s(zoomStr, L"Fill");
     } else {
         swprintf_s(zoomStr, L"%d%%", (int)(g_uiState.zoomLevel * 100.0f + 0.5f));
     }
 
+    uint32_t renderW = 0, renderH = 0;
+    GetRenderResolution(renderW, renderH);
+
     wchar_t base[512];
     if (stats && stats->projectionTimingActive && stats->projectionTimingSamples > 0) {
         swprintf_s(base,
-            L"OpenXR Simulator - XR %.1f FPS avg | %.1f ms now - %s - %s - %s - %dmm",
+            L"OpenXR Simulator - XR %.1f FPS avg | %.1f ms now - %s - %s - %s - %ux%u/eye - %dmm",
             stats->projectionFps, stats->latestFrameMs,
-            viewModeStr, zoomStr, GetHeadsetProfileShortName(), GetIpdMillimeters());
+            viewModeStr, zoomStr, GetHeadsetProfileShortName(), renderW, renderH,
+            GetIpdMillimeters());
     } else {
-        swprintf_s(base, L"OpenXR Simulator - XR FPS waiting for stereo projection - %s - %s - %s - %dmm",
-                   viewModeStr, zoomStr, GetHeadsetProfileShortName(), GetIpdMillimeters());
+        swprintf_s(base, L"OpenXR Simulator - XR FPS waiting for stereo projection - %s - %s - %s - %ux%u/eye - %dmm",
+                   viewModeStr, zoomStr, GetHeadsetProfileShortName(), renderW, renderH,
+                   GetIpdMillimeters());
     }
 
     wchar_t statsSuffix[256] = L"";

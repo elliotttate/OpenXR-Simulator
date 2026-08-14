@@ -366,6 +366,13 @@ static constexpr UINT kQuadConstantCount = 28;
 // the composite be submitted and picked up a frame or two later instead, with the CPU
 // never waiting on the GPU at all.
 static constexpr UINT kPreviewFrames = 3;
+// The desktop window can be maximized on a 4K display, but reading and scanning
+// a full 4K GDI surface on the application's xrEndFrame thread costs more than
+// an entire 90 Hz frame. Keep the mirror's internal surface at a diagnostic-
+// quality 1080p envelope and let the final StretchDIBits scale it to the window.
+// Eye swapchain resolution is untouched; this affects only the desktop mirror.
+static constexpr UINT kPreviewMaxWidth = 1920;
+static constexpr UINT kPreviewMaxHeight = 1080;
 
 struct PreviewFrame12 {
     ComPtr<ID3D12CommandAllocator> alloc;
@@ -481,6 +488,29 @@ struct Session {
     ComPtr<ID3D11Buffer> quadCB;
     // Keyed by (mode << 8) | writeMask; see GetLayerBlendState.
     std::unordered_map<uint32_t, ComPtr<ID3D11BlendState>> layerBlendStates;
+
+    // Reusable staging for the D3D11 mirror. blitViewToHalf and renderQuadLayer used
+    // to create a texture and an SRV per eye/quad on every mirrored frame; these small
+    // caches (two entries rotating, so the two eyes each keep their own) turn that into
+    // a plain copy into an existing texture. A size or format change just recreates.
+    struct TempTexEntry {
+        UINT width = 0, height = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        ComPtr<ID3D11Texture2D> texture;
+        ComPtr<ID3D11ShaderResourceView> srv;
+    };
+    TempTexEntry blitTempCache[2];
+    UINT blitTempNext{0};
+    TempTexEntry quadTempCache[2];
+    UINT quadTempNext{0};
+
+    // OpenGL preview: readback buffers and upload textures reused across frames
+    // instead of being reallocated per frame.
+    std::vector<uint8_t> glEyePixels[2];
+    std::vector<uint8_t> glQuadPixels;
+    ComPtr<ID3D11Texture2D> glEyeTex[2];
+    ComPtr<ID3D11ShaderResourceView> glEyeSrv[2];
+    UINT glEyeTexW{0}, glEyeTexH{0};
 
     // Desktop preview window (no thread - handled on main thread)
     HWND hwnd{nullptr};
@@ -1252,22 +1282,27 @@ static void RefreshPreviewGeometry(HWND hWnd) {
 }
 
 // Where the stereo image lands inside a dstW x dstH target, in that target's pixels.
-// "Fit to Window" gives the letterboxed rect; any other zoom is an absolute content
-// scale placed by the pan offset, which the target then clips.
+// "Fill Window" gives the entire target; any other zoom is an absolute content scale
+// placed by the pan offset, which the target then clips.
 static FitRect ComputePresentRect(int dstW, int dstH) {
     RefreshPreviewGeometry(dstW, dstH);
     const ui::PreviewRect r = ui::ComputePreviewRect();
     return FitRect{ r.x, r.y, r.w, r.h };
 }
 
-// Size of the D3D12 preview's offscreen RT: the window's client area. The scaling pass
-// draws the eyes straight into it, so the per-frame readback stays the window's pixel
-// count rather than the stereo render's, and a zoomed-in image is clipped on the GPU.
+// Size of the D3D12 preview's offscreen RT. It follows the window's aspect and
+// zoom geometry, but is capped independently from a maximized/high-DPI window
+// so desktop debugging cannot consume an extra full frame of CPU time.
 static void ComputePreviewRTSize(rt::Session& s, int& outW, int& outH) {
     int clientW = 0, clientH = 0;
     GetPreviewClientSize(s, 0, 0, clientW, clientH);
-    outW = (std::max)(1, clientW);
-    outH = (std::max)(1, clientH);
+    const double scale = (std::min)({
+        1.0,
+        (double)kPreviewMaxWidth / (std::max)(1, clientW),
+        (double)kPreviewMaxHeight / (std::max)(1, clientH),
+    });
+    outW = (std::max)(1, (int)std::lround(clientW * scale));
+    outH = (std::max)(1, (int)std::lround(clientH * scale));
 }
 
 // Snap the preview window so its client aspect matches the content aspect,
@@ -1276,6 +1311,10 @@ static void ComputePreviewRTSize(rt::Session& s, int& outW, int& outH) {
 // WM_SIZE, and from the render path when the content aspect itself changes.
 static void FitWindowToContentAspect(HWND hWnd) {
     if (!hWnd) return;
+    // Fill mode deliberately permits any window/monitor aspect. The compositor scales the
+    // source to the full client rect, so maximizing must stay maximized instead of being
+    // snapped back to an aspect-correct floating window.
+    if (ui::g_uiState.fitToWindow) return;
 
     RECT cr{};
     if (!GetClientRect(hWnd, &cr)) return;
@@ -1413,6 +1452,12 @@ static void ResetD3D12PreviewResources(rt::Session& s) {
 }
 
 static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Dark menu bar: the WM_UAH* custom-draw messages plus the light seam
+    // DefWindowProc leaves under the bar on WM_NCPAINT/WM_NCACTIVATE.
+    LRESULT darkMenuResult = 0;
+    if (ui::HandleDarkMenuMessage(hWnd, msg, wParam, lParam, &darkMenuResult)) {
+        return darkMenuResult;
+    }
     switch (msg) {
         case WM_CLOSE:
             if (rt::g_session.handle != XR_NULL_HANDLE) {
@@ -1484,6 +1529,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             ui::SaveSettings();
             return 0;
         case WM_SIZING: {
+            // Fill mode accepts arbitrary window shapes and performs the up/downscale in
+            // the preview compositor. Manual zoom mode keeps the aspect-locked inspector
+            // behavior that makes pixel-scale comparisons predictable.
+            if (ui::g_uiState.fitToWindow) break;
+
             // Constrain interactive resize to the current content aspect ratio
             // so the window itself follows the stereo layout (no letterbox).
             int contentW = 0, contentH = 0;
@@ -1593,6 +1643,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             ui::g_uiState.windowWidth = (int)cw;
             ui::g_uiState.windowHeight = (int)ch;
             if (!rt::g_sizingDrag) ui::SaveSettings();
+
+            // Fill mode means exactly that: keep the dimensions Windows assigned, including
+            // a maximized client area, and let ComputePreviewRect cover every pixel.
+            if (ui::g_uiState.fitToWindow) return 0;
 
             // WM_SIZING constrains interactive drags, but maximize, snap, and
             // programmatic resizes bypass it. If the resulting client aspect
@@ -2968,15 +3022,16 @@ static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance, 
         for (uint32_t i = 0; i < 2; ++i) {
             views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
             views[i].next = nullptr;
-            uint32_t panelW = 0, panelH = 0;
-            ui::GetHeadsetPanelResolution(panelW, panelH);
-            views[i].recommendedImageRectWidth = panelW;
-            views[i].recommendedImageRectHeight = panelH;
+            uint32_t renderW = 0, renderH = 0;
+            ui::GetRenderResolution(renderW, renderH);
+            views[i].recommendedImageRectWidth = renderW;
+            views[i].recommendedImageRectHeight = renderH;
             views[i].recommendedSwapchainSampleCount = 1;
             views[i].maxImageRectWidth = 4096; views[i].maxImageRectHeight = 4096; views[i].maxSwapchainSampleCount = 1;
         }
-        Logf("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (%ux%u recommended)",
-             views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight);
+        Logf("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (%ux%u recommended; headset geometry %s)",
+             views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight,
+             ui::HeadsetProfileName(ui::g_uiState.headsetProfile));
     }
     return XR_SUCCESS;
 }
@@ -3694,8 +3749,11 @@ static XrResult XRAPI_PTR xrAcquireSwapchainImage_runtime(XrSwapchain sc, const 
     if (index) *index = i; 
     
     static int acquireCount = 0;
-    if (++acquireCount % 60 == 1) {  // Log every 60 calls
-        Logf("[SimXR] xrAcquireSwapchainImage: sc=%p idx=%u (format=%d, %ux%u)", 
+    ++acquireCount;
+    // First few calls give startup context; the recurring line is verbose-only,
+    // since Log() is deliberately expensive (see its comment).
+    if (acquireCount <= 4 || (g_logVerbose && acquireCount % 60 == 1)) {
+        Logf("[SimXR] xrAcquireSwapchainImage: sc=%p idx=%u (format=%d, %ux%u)",
              sc, i, (int)ch.format, ch.width, ch.height);
     }
     return XR_SUCCESS;
@@ -3716,11 +3774,14 @@ static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const 
 
     static int releaseCount = 0;
     bool shouldLog = (++releaseCount <= 10);
-    if (shouldLog || releaseCount % 60 == 1) {
+    if (shouldLog || (g_logVerbose && releaseCount % 60 == 1)) {
         Logf("[SimXR] xrReleaseSwapchainImage: sc=%p released=%u", sc, ch.lastReleased);
 
-        // DEBUG: Read texture content at release time to verify it has content
-        if (ch.backend == rt::Swapchain::Backend::OpenGL && !ch.imagesGL.empty() && ch.lastReleased < ch.imagesGL.size()) {
+        // DEBUG: Read texture content at release time to verify it has content.
+        // Verbose-only: the probe below runs glFinish plus a full-texture readback,
+        // a periodic multi-millisecond stall no ordinary session should pay for.
+        if (g_logVerbose &&
+            ch.backend == rt::Swapchain::Backend::OpenGL && !ch.imagesGL.empty() && ch.lastReleased < ch.imagesGL.size()) {
             GLuint glTex = ch.imagesGL[ch.lastReleased];
 
             // Check and log current GL context
@@ -4408,17 +4469,39 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
         }
     }
 
+    // Pace on a high-resolution waitable timer. Plain Sleep() rounds up to the
+    // system timer interval — as much as 15.6ms when the host never raised it —
+    // which quietly turned this 90 Hz cap into a ~60 Hz one. The timer is exact
+    // to a fraction of a millisecond regardless of the global timer resolution,
+    // and a short yield loop closes the remainder.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    static HANDLE pacingTimer = CreateWaitableTimerExW(nullptr, nullptr,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     for (;;) {
         LARGE_INTEGER now; QueryPerformanceCounter(&now);
-        double dt = (nextTick - (double)now.QuadPart) / (double)freq.QuadPart;
-        if (dt <= 0.0) break;
-        double ms = dt * 1000.0;
-        if (ms > 5.0) ms = 5.0;
-        if (ms < 0.0) ms = 0.0;
-        Sleep((DWORD)ms);
+        const double remainingSec = (nextTick - (double)now.QuadPart) / (double)freq.QuadPart;
+        if (remainingSec <= 0.0) break;
+        if (pacingTimer && remainingSec > 0.0008) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)((remainingSec - 0.0005) * 1.0e7);   // relative, 100ns units
+            if (SetWaitableTimer(pacingTimer, &due, 0, nullptr, nullptr, FALSE)) {
+                WaitForSingleObject(pacingTimer, 20);
+                continue;
+            }
+        }
+        // Final stretch, or Windows before high-resolution timers: yield rather
+        // than risk oversleeping a whole timer interval.
+        Sleep(remainingSec > 0.002 ? 1 : 0);
     }
     nextTick += periodSec * (double)freq.QuadPart;
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    // After a stall, re-base instead of letting the app run uncapped while
+    // nextTick catches up one period per call.
+    if ((double)now.QuadPart - nextTick > periodSec * (double)freq.QuadPart) {
+        nextTick = (double)now.QuadPart;
+    }
     // Convert QPC to nanoseconds using double to avoid overflow on MSVC
     XrTime nowTime = (XrTime)((double)now.QuadPart * 1000000000.0 / (double)freq.QuadPart);
     s->type = XR_TYPE_FRAME_STATE; s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
@@ -5095,6 +5178,47 @@ static void ensurePreviewWithoutProjection(rt::Session& s) {
     ensurePreviewSized(s, (UINT)targetW, (UINT)targetH, format);
 }
 
+// A cached SRV-only staging texture for the D3D11 mirror. Two entries rotate so the
+// left and right eye each keep theirs; a size or format change just recreates one.
+static ID3D11Texture2D* acquireTempTexture(rt::Session& s, rt::Session::TempTexEntry* cache,
+                                           UINT& next, UINT width, UINT height,
+                                           DXGI_FORMAT format, ID3D11ShaderResourceView** outSrv) {
+    rt::Session::TempTexEntry& entry = cache[next];
+    next = (next + 1) % 2;
+    if (entry.texture && entry.width == width && entry.height == height && entry.format == format) {
+        *outSrv = entry.srv.Get();
+        return entry.texture.Get();
+    }
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    entry = rt::Session::TempTexEntry{};
+    if (FAILED(s.d3d11Device->CreateTexture2D(&desc, nullptr, entry.texture.GetAddressOf()))) {
+        entry = rt::Session::TempTexEntry{};
+        return nullptr;
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = 1;
+    if (FAILED(s.d3d11Device->CreateShaderResourceView(entry.texture.Get(), &srvDesc,
+                                                       entry.srv.GetAddressOf()))) {
+        entry = rt::Session::TempTexEntry{};
+        return nullptr;
+    }
+    entry.width = width;
+    entry.height = height;
+    entry.format = format;
+    *outSrv = entry.srv.Get();
+    return entry.texture.Get();
+}
+
 static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcIndex, uint32_t arraySlice,
                            const XrRect2Di& rect, ID3D11RenderTargetView* rtv,
                            const D3D11_VIEWPORT& vp, ID3D11BlendState* blendState) {
@@ -5176,36 +5300,9 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
         default:
             break; // Already typed or unknown
     }
-    
-    
-    // ALWAYS create a temp texture to avoid SRV/RTV binding conflicts
-    // The app may still have this texture bound as an RTV, and D3D11 will null the SRV if we try to use it directly
-    ComPtr<ID3D11Texture2D> viewTexture;
-    
-    // Always make an SRV-only single-slice, single-sample texture
-    // Use the typed format to avoid CreateShaderResourceView failures
-    D3D11_TEXTURE2D_DESC tempDesc = {};
-    tempDesc.Width = srcDesc.Width;
-    tempDesc.Height = srcDesc.Height;
-    tempDesc.MipLevels = 1;
-    tempDesc.ArraySize = 1;
-    tempDesc.Format = typedFormat;  // Make temp texture in same format as SRV (may be *_SRGB)
-    tempDesc.SampleDesc.Count = 1;
-    tempDesc.SampleDesc.Quality = 0;
-    tempDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    tempDesc.Usage = D3D11_USAGE_DEFAULT;
-    tempDesc.CPUAccessFlags = 0;
-    tempDesc.MiscFlags = 0;
-
-    HRESULT hr = s.d3d11Device->CreateTexture2D(&tempDesc, nullptr, viewTexture.GetAddressOf());
-    if (FAILED(hr)) {
-        Logf("[SimXR] Failed to create temp texture for blit: 0x%08X", hr);
-        return;
-    }
-
     // Copy the correct subresource (handles array slice)
     UINT srcSubresource = D3D11CalcSubresource(0, arraySlice, chain.mipCount);
-    
+
     // Handle imageRect cropping for better visual accuracy
     // Apps can submit sub-rects, and sampling the full texture can show mostly black areas
     // Skip cropping when showFullRender is enabled to show the entire swapchain
@@ -5236,60 +5333,37 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
                       srcDesc.SampleDesc.Count == 1 &&
                       rectValid &&
                       (rectW < srcW || rectH < srcH || rectX != 0 || rectY != 0);
+    // The mirror always samples its own SRV-only copy: the app may still have the
+    // source bound as an RTV, and D3D11 nulls the SRV if it were sampled directly.
+    // The copy lands in a cached texture rather than a freshly created one.
+    const UINT tempW = shouldCrop ? (UINT)rectW : srcDesc.Width;
+    const UINT tempH = shouldCrop ? (UINT)rectH : srcDesc.Height;
+    ID3D11ShaderResourceView* srv = nullptr;
+    ID3D11Texture2D* viewTexture = acquireTempTexture(s, s.blitTempCache, s.blitTempNext,
+                                                      tempW, tempH, typedFormat, &srv);
+    if (!viewTexture) {
+        Log("[SimXR] Failed to create temp texture for blit");
+        return;
+    }
+
     if (shouldCrop) {
-        
-        // Recreate temp texture with rect size for cropped copying
-        tempDesc.Width  = rectW;
-        tempDesc.Height = rectH;
-        tempDesc.Format = typedFormat;  // Ensure format stays correct
-        viewTexture.Reset();
-        HRESULT hr = s.d3d11Device->CreateTexture2D(&tempDesc, nullptr, viewTexture.GetAddressOf());
-        if (FAILED(hr)) {
-            Logf("[SimXR] Failed to create cropped temp texture: 0x%08X", hr);
-            return;
-        }
-        
         // Copy only the specified rect
         D3D11_BOX box{};
         box.left = rectX;
         box.top = rectY;
         box.right = rectX + rectW;
         box.bottom = rectY + rectH;
-        box.front = 0; 
+        box.front = 0;
         box.back = 1;
-        
-        s.d3d11Context->CopySubresourceRegion(viewTexture.Get(), 0, 0, 0, 0, sourceTexture.Get(), srcSubresource, &box);
-        
-        if (rectClamped) {
-            Logf("[SimXR] Applied clamped imageRect: %dx%d from (%d,%d)",
-                 rectW, rectH, rectX, rectY);
-        } else {
-            Logf("[SimXR] Applied imageRect cropping: %dx%d from (%d,%d)",
-                 rectW, rectH, rectX, rectY);
-        }
+        s.d3d11Context->CopySubresourceRegion(viewTexture, 0, 0, 0, 0, sourceTexture.Get(), srcSubresource, &box);
+        LogVf("[SimXR] Applied %s imageRect: %dx%d from (%d,%d)",
+              rectClamped ? "clamped" : "cropped", rectW, rectH, rectX, rectY);
+    } else if (srcDesc.SampleDesc.Count > 1) {
+        // If app used MSAA, resolve it first using the typed format
+        s.d3d11Context->ResolveSubresource(viewTexture, 0, sourceTexture.Get(), srcSubresource, typedFormat);
     } else {
-        // Copy full texture or handle MSAA
-        if (srcDesc.SampleDesc.Count > 1) {
-            // If app used MSAA, resolve it first using the typed format
-            s.d3d11Context->ResolveSubresource(viewTexture.Get(), 0, sourceTexture.Get(), srcSubresource, typedFormat);
-        } else {
-            // Otherwise just copy the full texture
-            s.d3d11Context->CopySubresourceRegion(viewTexture.Get(), 0, 0, 0, 0, sourceTexture.Get(), srcSubresource, nullptr);
-        }
-    }
-
-    // Create Shader Resource View
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = typedFormat; // Use the proper typed format
-    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Texture2D.MipLevels = 1;
-    srvDesc.Texture2D.MostDetailedMip = 0;
-
-    ComPtr<ID3D11ShaderResourceView> srv;
-    hr = s.d3d11Device->CreateShaderResourceView(viewTexture.Get(), &srvDesc, srv.GetAddressOf());
-    if (FAILED(hr)) {
-        Logf("[SimXR] Failed to create SRV: 0x%08X", hr);
-        return;
+        // Otherwise just copy the full texture
+        s.d3d11Context->CopySubresourceRegion(viewTexture, 0, 0, 0, 0, sourceTexture.Get(), srcSubresource, nullptr);
     }
 
     s.d3d11Context->RSSetViewports(1, &vp);
@@ -5298,7 +5372,7 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
     s.d3d11Context->VSSetShader(s.blitVS.Get(), nullptr, 0);
     s.d3d11Context->PSSetShader(s.blitPS.Get(), nullptr, 0);
 
-    ID3D11ShaderResourceView* srvs[] = { srv.Get() };
+    ID3D11ShaderResourceView* srvs[] = { srv };
     s.d3d11Context->PSSetShaderResources(0, 1, srvs);
     ID3D11SamplerState* samplers[] = { s.samplerState.Get() };
     s.d3d11Context->PSSetSamplers(0, 1, samplers);
@@ -5322,11 +5396,11 @@ static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcInd
     s.d3d11Context->PSSetShaderResources(0, 1, nullSRV);
     
     static int debugCount = 0;
-    if (++debugCount % 120 == 1) {
+    if (g_logVerbose && ++debugCount % 120 == 1) {
         Logf("[SimXR] blitViewToHalf: srcIdx=%u slice=%u typedFmt=%d srcFmt=%d",
              srcIndex, arraySlice, typedFormat, srcDesc.Format);
         Logf("[SimXR]   viewport: x=%.0f y=%.0f w=%.0f h=%.0f", vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height);
-        Logf("[SimXR]   srcSize: %ux%u, tempSize: %ux%u", srcDesc.Width, srcDesc.Height, tempDesc.Width, tempDesc.Height);
+        Logf("[SimXR]   srcSize: %ux%u, tempSize: %ux%u", srcDesc.Width, srcDesc.Height, tempW, tempH);
     }
 }
 
@@ -5525,26 +5599,10 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
         bmi.bmiHeader.biBitCount = 32;
         bmi.bmiHeader.biCompression = BI_RGB;
 
-        // Centred, which absorbs a resize that landed after ensurePreviewSized ran: the
-        // image sits in the middle of the new client area for one frame rather than being
-        // stretched. Only then are there borders to paint, so only then is anything else
-        // touched at all.
-        const int dstX = (clientW - (int)f.rtWidth) / 2;
-        const int dstY = (clientH - (int)f.rtHeight) / 2;
-        if (dstX != 0 || dstY != 0) {
-            HBRUSH black = (HBRUSH)GetStockObject(BLACK_BRUSH);
-            RECT top{ 0, 0, clientW, (std::max)(0, dstY) };
-            RECT bottom{ 0, (std::min)(clientH, dstY + (int)f.rtHeight), clientW, clientH };
-            RECT left{ 0, (std::max)(0, dstY), (std::max)(0, dstX), (std::min)(clientH, dstY + (int)f.rtHeight) };
-            RECT right{ (std::min)(clientW, dstX + (int)f.rtWidth), (std::max)(0, dstY), clientW,
-                        (std::min)(clientH, dstY + (int)f.rtHeight) };
-            if (top.bottom > top.top) FillRect(windowDC, &top, black);
-            if (bottom.bottom > bottom.top) FillRect(windowDC, &bottom, black);
-            if (left.right > left.left) FillRect(windowDC, &left, black);
-            if (right.right > right.left) FillRect(windowDC, &right, black);
-        }
-
-        paintedPreview = StretchDIBits(windowDC, dstX, dstY, (int)f.rtWidth, (int)f.rtHeight,
+        // The internal surface may be capped below the client size. Its aspect
+        // matches the client, so this is a pure final scale and the projection/
+        // quad composition remains pixel-coherent before GDI sees it.
+        paintedPreview = StretchDIBits(windowDC, 0, 0, clientW, clientH,
                                        0, 0, (int)f.rtWidth, (int)f.rtHeight,
                                        mapped, &bmi, DIB_RGB_COLORS, SRCCOPY) != GDI_ERROR;
         ReleaseDC(s.hwnd, windowDC);
@@ -5562,23 +5620,13 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
                           f.headYaw, f.headPitch, f.headRoll, f.headX, f.headY, f.headZ);
     }
 
-    // The detector consumes tightly packed BGRA. D3D12 readback rows are 256-byte
-    // aligned, so only repack when the client width does not already satisfy that.
+    // The detector samples the aligned readback rows in place; no repack. Before it
+    // took a row pitch, matching the 256-byte alignment on a window whose width was
+    // not a 64-pixel multiple cost a full-frame memcpy here on every painted frame.
     const uint8_t* detectorPixels = (const uint8_t*)mapped;
-    std::vector<uint8_t> packedPixels;
-    const size_t tightPitch = (size_t)f.rtWidth * 4;
-    if (s.previewReadbackPitch != tightPitch) {
-        packedPixels.resize(tightPitch * f.rtHeight);
-        for (UINT y = 0; y < f.rtHeight; ++y) {
-            memcpy(packedPixels.data() + (size_t)y * tightPitch,
-                   (const uint8_t*)mapped + (size_t)y * s.previewReadbackPitch,
-                   tightPitch);
-        }
-        detectorPixels = packedPixels.data();
-    }
-
     if (f.hasProjection) {
-        flicker::ObservePreview(detectorPixels, f.rtWidth, f.rtHeight, f.fenceValue, f.frame);
+        flicker::ObservePreview(detectorPixels, f.rtWidth, f.rtHeight,
+                                s.previewReadbackPitch, f.fenceValue, f.frame);
     }
     flicker::UiFrameInfo uiInfo;
     uiInfo.quadLayers = f.quadLayers;
@@ -5588,7 +5636,8 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
     uiInfo.composed = f.quadComposed;
     memcpy(uiInfo.rects, f.quadRects, sizeof(uiInfo.rects));
     uiInfo.sourceAlphaCoverage = f.quadSourceAlphaCoverage;
-    flicker::ObserveUi(detectorPixels, f.rtWidth, f.rtHeight, f.fenceValue, f.frame, uiInfo);
+    flicker::ObserveUi(detectorPixels, f.rtWidth, f.rtHeight, s.previewReadbackPitch,
+                       f.fenceValue, f.frame, uiInfo);
     flicker::ObservePaint(f.fenceValue, paintedPreview);
 
     D3D12_RANGE writeRange = { 0, 0 };
@@ -5924,8 +5973,10 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             }
 
             // Read pixel data from GL textures into CPU buffers
-            std::vector<uint8_t> leftPixels(width * height * 4);
-            std::vector<uint8_t> rightPixels(width * height * 4);
+            std::vector<uint8_t>& leftPixels = s.glEyePixels[0];    // reused across frames
+            std::vector<uint8_t>& rightPixels = s.glEyePixels[1];
+            leftPixels.resize((size_t)width * height * 4);
+            rightPixels.resize((size_t)width * height * 4);
 
             // Get left eye texture
             GLuint leftTex = 0;
@@ -6077,6 +6128,14 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 s.anaglyphRedBS.Reset();
                 s.anaglyphCyanBS.Reset();
                 s.layerBlendStates.clear();
+                // Cached staging textures belong to the old device too.
+                for (auto& entry : s.blitTempCache) entry = rt::Session::TempTexEntry{};
+                for (auto& entry : s.quadTempCache) entry = rt::Session::TempTexEntry{};
+                for (int eye = 0; eye < 2; ++eye) {
+                    s.glEyeTex[eye].Reset();
+                    s.glEyeSrv[eye].Reset();
+                }
+                s.glEyeTexW = s.glEyeTexH = 0;
                 Log("[SimXR] Reset blit resources for fresh shader compilation");
             }
 
@@ -6109,27 +6168,38 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 return;
             }
 
-            // Create staging textures to upload GL pixel data
-            D3D11_TEXTURE2D_DESC texDesc = {};
-            texDesc.Width = width;
-            texDesc.Height = height;
-            texDesc.MipLevels = 1;
-            texDesc.ArraySize = 1;
-            texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            texDesc.SampleDesc.Count = 1;
-            texDesc.Usage = D3D11_USAGE_DEFAULT;
-            texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-            D3D11_SUBRESOURCE_DATA initData = {};
-            initData.pSysMem = leftPixels.data();
-            initData.SysMemPitch = width * 4;
-
-            ComPtr<ID3D11Texture2D> leftTex2D;
-            s.d3d11Device->CreateTexture2D(&texDesc, &initData, &leftTex2D);
-
-            initData.pSysMem = rightPixels.data();
-            ComPtr<ID3D11Texture2D> rightTex2D;
-            s.d3d11Device->CreateTexture2D(&texDesc, &initData, &rightTex2D);
+            // Upload GL pixel data into cached textures; the pair is recreated only
+            // when the eye size changes rather than on every mirrored frame.
+            if (s.glEyeTexW != width || s.glEyeTexH != height || !s.glEyeTex[0]) {
+                D3D11_TEXTURE2D_DESC texDesc = {};
+                texDesc.Width = width;
+                texDesc.Height = height;
+                texDesc.MipLevels = 1;
+                texDesc.ArraySize = 1;
+                texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                texDesc.SampleDesc.Count = 1;
+                texDesc.Usage = D3D11_USAGE_DEFAULT;
+                texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                for (int eye = 0; eye < 2; ++eye) {
+                    s.glEyeTex[eye].Reset();
+                    s.glEyeSrv[eye].Reset();
+                    if (SUCCEEDED(s.d3d11Device->CreateTexture2D(&texDesc, nullptr,
+                                                                 s.glEyeTex[eye].GetAddressOf()))) {
+                        s.d3d11Device->CreateShaderResourceView(s.glEyeTex[eye].Get(), nullptr,
+                                                                s.glEyeSrv[eye].GetAddressOf());
+                    }
+                }
+                s.glEyeTexW = width;
+                s.glEyeTexH = height;
+            }
+            if (leftTex != 0 && s.glEyeTex[0]) {
+                s.d3d11Context->UpdateSubresource(s.glEyeTex[0].Get(), 0, nullptr,
+                                                  leftPixels.data(), width * 4, 0);
+            }
+            if (rightTex != 0 && s.glEyeTex[1]) {
+                s.d3d11Context->UpdateSubresource(s.glEyeTex[1].Get(), 0, nullptr,
+                                                  rightPixels.data(), width * 4, 0);
+            }
 
             // Use shader-based rendering for proper side-by-side display
             const bool singleEye = (viewMode != ui::ViewMode::BothEyes);
@@ -6149,24 +6219,13 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 return;
             }
 
-            // Create SRVs for the uploaded textures
-            ComPtr<ID3D11ShaderResourceView> leftSRV, rightSRV;
-            if (leftTex2D) {
-                HRESULT hr = s.d3d11Device->CreateShaderResourceView(leftTex2D.Get(), nullptr, leftSRV.GetAddressOf());
-                if (FAILED(hr) && glFrameCount % 60 == 1) {
-                    Logf("[SimXR] GL PREVIEW: CreateSRV for left failed: 0x%08X", hr);
-                }
-            }
-            if (rightTex2D) {
-                HRESULT hr = s.d3d11Device->CreateShaderResourceView(rightTex2D.Get(), nullptr, rightSRV.GetAddressOf());
-                if (FAILED(hr) && glFrameCount % 60 == 1) {
-                    Logf("[SimXR] GL PREVIEW: CreateSRV for right failed: 0x%08X", hr);
-                }
-            }
+            // SRVs are cached alongside the upload textures.
+            ID3D11ShaderResourceView* leftSRV = s.glEyeSrv[0].Get();
+            ID3D11ShaderResourceView* rightSRV = s.glEyeSrv[1].Get();
 
             if (glFrameCount % 60 == 1) {
                 Logf("[SimXR] GL PREVIEW: leftTex2D=%p rightTex2D=%p leftSRV=%p rightSRV=%p",
-                     leftTex2D.Get(), rightTex2D.Get(), leftSRV.Get(), rightSRV.Get());
+                     s.glEyeTex[0].Get(), s.glEyeTex[1].Get(), leftSRV, rightSRV);
             }
 
             // Clear the render target (full backbuffer → black borders for letterbox)
@@ -6236,20 +6295,20 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // Render the eyes
             if (singleEye) {
                 if (showLeft && leftSRV) {
-                    blitTexture(leftSRV.Get(), fullVp);
+                    blitTexture(leftSRV, fullVp);
                 } else if (showRight && rightSRV) {
-                    blitTexture(rightSRV.Get(), fullVp);
+                    blitTexture(rightSRV, fullVp);
                 }
             } else {
                 // Side by side (or over/under)
                 if (showLeft && leftSRV) {
-                    blitTexture(leftSRV.Get(), leftVp);
+                    blitTexture(leftSRV, leftVp);
                 }
                 if (showRight && rightSRV) {
-                    blitTexture(rightSRV.Get(), rightVp);
+                    blitTexture(rightSRV, rightVp);
                 } else if (showRight && leftSRV) {
                     // Mirror left eye if no right eye available
-                    blitTexture(leftSRV.Get(), rightVp);
+                    blitTexture(leftSRV, rightVp);
                 }
             }
 
@@ -6678,7 +6737,9 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
              texIdx, chain.imageCount);
     }
 
-    ComPtr<ID3D11Texture2D> quadTex;
+    // Filled by whichever backend branch runs; lifetime is owned by the session's
+    // temp-texture cache, so nothing here is created per frame in the steady state.
+    ID3D11ShaderResourceView* quadSrv = nullptr;
 
     // Check if using OpenGL
     if (chain.backend == rt::Swapchain::Backend::OpenGL && !chain.imagesGL.empty()) {
@@ -6715,7 +6776,8 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         }
 
         // Read pixels from GL texture using FBO (more reliable than glGetTexImage)
-        std::vector<uint8_t> pixels(texWidth * texHeight * 4);
+        std::vector<uint8_t>& pixels = s.glQuadPixels;   // reused across frames
+        pixels.resize((size_t)texWidth * texHeight * 4);
 
         // Try FBO method first if available
         bool usedFBO = false;
@@ -6775,34 +6837,28 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
             memcpy(bottomRow, tempRow.data(), rowSize);
         }
 
-        // Store quad layer pixels for MCP screenshot capture
-        mcp::StoreQuadLayerPixels(pixels.data(), texWidth, texHeight);
+        // Store quad layer pixels only when a screenshot actually asked for them;
+        // continuously copying the whole quad every frame served nothing else.
+        if (mcp::g_screenshotRequested) {
+            mcp::StoreQuadLayerPixels(pixels.data(), texWidth, texHeight);
+        }
 
         // Restore GL context
         if (savedRC) wglMakeCurrent(savedDC, savedRC);
 
-        // Create D3D11 texture from pixel data. A GL_SRGB8_ALPHA8 quad holds sRGB-encoded
+        // Upload into a cached D3D11 texture. A GL_SRGB8_ALPHA8 quad holds sRGB-encoded
         // bytes, so it needs the _SRGB view to decode to linear before the blend - otherwise
         // it is blended as if it were linear and comes out wrong against the eyes.
-        D3D11_TEXTURE2D_DESC texDesc = {};
-        texDesc.Width = texWidth;
-        texDesc.Height = texHeight;
-        texDesc.MipLevels = 1;
-        texDesc.ArraySize = 1;
-        texDesc.Format = (chain.glInternalFormat == GL_SRGB8_ALPHA8) ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
-                                                                     : DXGI_FORMAT_R8G8B8A8_UNORM;
-        texDesc.SampleDesc.Count = 1;
-        texDesc.Usage = D3D11_USAGE_DEFAULT;
-        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-        D3D11_SUBRESOURCE_DATA initData = {};
-        initData.pSysMem = pixels.data();
-        initData.SysMemPitch = texWidth * 4;
-
-        if (FAILED(s.d3d11Device->CreateTexture2D(&texDesc, &initData, quadTex.GetAddressOf()))) {
+        const DXGI_FORMAT glQuadFormat =
+            (chain.glInternalFormat == GL_SRGB8_ALPHA8) ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                                                        : DXGI_FORMAT_R8G8B8A8_UNORM;
+        ID3D11Texture2D* uploadTex = acquireTempTexture(s, s.quadTempCache, s.quadTempNext,
+                                                        texWidth, texHeight, glQuadFormat, &quadSrv);
+        if (!uploadTex) {
             if (shouldLog) Log("[SimXR] renderQuadLayer: Failed to create D3D11 texture from GL pixels");
             return;
         }
+        s.d3d11Context->UpdateSubresource(uploadTex, 0, nullptr, pixels.data(), texWidth * 4, 0);
 
         if (shouldLog) {
             Logf("[SimXR] Rendering quad layer (OpenGL): size=%.2fx%.2f, texSize=%ux%u, glTex=%u",
@@ -6869,18 +6925,11 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         const rt::SubImageRect rect = rt::ResolveSubImageRect(quad->subImage.imageRect,
                                                               srcDesc.Width, srcDesc.Height, "quad");
 
-        D3D11_TEXTURE2D_DESC tempDesc = srcDesc;
-        tempDesc.Width = rect.w;
-        tempDesc.Height = rect.h;
-        tempDesc.Format = typedFormat;  // Use typed format for the temp texture
-        tempDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        tempDesc.MiscFlags = 0;
-        tempDesc.SampleDesc.Count = 1;
-        tempDesc.SampleDesc.Quality = 0;
-        tempDesc.ArraySize = 1;   // one slice; a null-desc SRV over an array binds as Texture2DArray
-        tempDesc.MipLevels = 1;
-
-        if (FAILED(s.d3d11Device->CreateTexture2D(&tempDesc, nullptr, quadTex.GetAddressOf()))) return;
+        // One slice at the rect's size, from the cache: a full-size temp would leave
+        // the sub-rect shrunk into the corner of the sampled UV range.
+        ID3D11Texture2D* quadTex = acquireTempTexture(s, s.quadTempCache, s.quadTempNext,
+                                                      rect.w, rect.h, typedFormat, &quadSrv);
+        if (!quadTex) return;
 
         const uint32_t srcSubresource = D3D11CalcSubresource(0, arraySlice, chain.mipCount ? chain.mipCount : 1);
         ID3D11Texture2D* copySrc = chain.images[texIdx].Get();
@@ -6890,9 +6939,15 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         // multisampled quad needs a full-size resolve target in between.
         ComPtr<ID3D11Texture2D> resolved;
         if (srcDesc.SampleDesc.Count > 1) {
-            D3D11_TEXTURE2D_DESC resolveDesc = tempDesc;
+            D3D11_TEXTURE2D_DESC resolveDesc = {};
             resolveDesc.Width = srcDesc.Width;
             resolveDesc.Height = srcDesc.Height;
+            resolveDesc.MipLevels = 1;
+            resolveDesc.ArraySize = 1;
+            resolveDesc.Format = typedFormat;
+            resolveDesc.SampleDesc.Count = 1;
+            resolveDesc.Usage = D3D11_USAGE_DEFAULT;
+            resolveDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             if (FAILED(s.d3d11Device->CreateTexture2D(&resolveDesc, nullptr, resolved.GetAddressOf()))) return;
             s.d3d11Context->ResolveSubresource(resolved.Get(), 0, copySrc, srcSubresource, typedFormat);
             copySrc = resolved.Get();
@@ -6900,7 +6955,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         }
 
         D3D11_BOX box = { rect.x, rect.y, 0, rect.x + rect.w, rect.y + rect.h, 1 };
-        s.d3d11Context->CopySubresourceRegion(quadTex.Get(), 0, 0, 0, 0, copySrc, copySubresource, &box);
+        s.d3d11Context->CopySubresourceRegion(quadTex, 0, 0, 0, 0, copySrc, copySubresource, &box);
 
         if (shouldLog) {
             Logf("[SimXR] Rendering quad layer (D3D11): size=%.2fx%.2f, rect=%u,%u %ux%u, typedFmt=%d, srcFmt=%d, arraySlice=%u",
@@ -6927,9 +6982,8 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     ComPtr<ID3D11RenderTargetView> rtv;
     if (!rt::CreatePreviewRtv(s, bb.Get(), rtv)) return;
 
-    // Create SRV
-    ComPtr<ID3D11ShaderResourceView> srv;
-    if (FAILED(s.d3d11Device->CreateShaderResourceView(quadTex.Get(), nullptr, srv.GetAddressOf()))) return;
+    // The SRV came out of the temp-texture cache with the staging copy above.
+    if (!quadSrv) return;
 
     // Calculate viewports matching the projection layer layout (letterboxed)
     const auto layout = ui::g_uiState.displayLayout;
@@ -6985,7 +7039,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     ID3D11Buffer* cbs[] = { s.quadCB.Get() };
     s.d3d11Context->VSSetConstantBuffers(0, 1, cbs);
 
-    ID3D11ShaderResourceView* srvs[] = { srv.Get() };
+    ID3D11ShaderResourceView* srvs[] = { quadSrv };
     s.d3d11Context->PSSetShaderResources(0, 1, srvs);
     ID3D11SamplerState* samplers[] = { s.samplerState.Get() };
     s.d3d11Context->PSSetSamplers(0, 1, samplers);

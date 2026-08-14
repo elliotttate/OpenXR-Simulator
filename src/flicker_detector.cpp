@@ -3,8 +3,10 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -15,6 +17,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace flicker {
@@ -23,6 +27,13 @@ namespace {
 constexpr uint32_t kHistoryFrames = 10;
 constexpr uint32_t kPostIncidentFrames = 12;
 constexpr uint64_t kIncidentCooldownFrames = 300;
+
+// Disk-lifecycle guards. A chronically-firing heuristic must not be able to
+// fill the drive: each session stops writing new incident packets after this
+// many, and the worker prunes older sessions' packets at startup.
+constexpr uint64_t kMaxIncidentsPerSession = 40;
+constexpr size_t kKeepRecentSessions = 5;
+constexpr size_t kKeepRecentLogs = 10;
 
 struct Sample {
     uint64_t frame = 0;
@@ -38,6 +49,24 @@ struct Sample {
     float brightFractionLeft = 0.0f;
     float brightFractionRight = 0.0f;
 };
+
+// The classifier metrics without the pixels: what the status JSON needs, small
+// enough to copy on every sample without touching the allocator.
+Sample MetricsOnly(const Sample& sample) {
+    Sample metrics;
+    metrics.frame = sample.frame;
+    metrics.width = sample.width;
+    metrics.height = sample.height;
+    metrics.mean = sample.mean;
+    metrics.meanLeft = sample.meanLeft;
+    metrics.meanRight = sample.meanRight;
+    metrics.temporal = sample.temporal;
+    metrics.temporalLeft = sample.temporalLeft;
+    metrics.temporalRight = sample.temporalRight;
+    metrics.brightFractionLeft = sample.brightFractionLeft;
+    metrics.brightFractionRight = sample.brightFractionRight;
+    return metrics;
+}
 
 // RenderDoc's application API is append-only. Requesting 1.1.0 and declaring
 // the stable pointer layout through TriggerMultiFrameCapture avoids a build-time
@@ -74,6 +103,7 @@ using RenderDocGetApi = int(__cdecl*)(int, void**);
 struct State {
     std::mutex mutex;
     uint64_t lastGeneration = 0;
+    uint64_t lastFrame = 0;
     uint64_t totalSubmissions = 0;
     uint64_t projectionSubmissions = 0;
     uint64_t missingProjectionSubmissions = 0;
@@ -99,6 +129,9 @@ struct State {
     uint32_t lastLayerCount = 0;
     bool projectionStateInitialized = false;
     bool lastHadProjection = false;
+    bool statusDirty = false;
+    bool hasMetrics = false;
+    Sample lastMetrics;
     std::string lastReason = "NONE";
     std::filesystem::path lastIncidentDirectory;
     std::filesystem::path activeIncidentDirectory;
@@ -110,6 +143,7 @@ struct State {
 struct UiState {
     std::mutex mutex;
     uint64_t lastGeneration = 0;
+    uint64_t lastFrame = 0;
     uint64_t observedFrames = 0;
     uint64_t quadSubmittedFrames = 0;
     uint64_t projectionRefreshFrames = 0;
@@ -127,6 +161,9 @@ struct UiState {
     uint32_t lastQuadLayers = 0;
     bool lastCacheValid = false;
     bool lastComposed = false;
+    bool statusDirty = false;
+    bool hasMetrics = false;
+    Sample lastMetrics;
     float lastSourceAlphaCoverage = 0.0f;
     std::string lastReason = "NONE";
     std::filesystem::path lastIncidentDirectory;
@@ -136,21 +173,26 @@ struct UiState {
     std::deque<Sample> history;
 };
 
+// Leaked on purpose: the I/O worker is a detached thread that can outlive
+// static destruction, so nothing it touches may ever be destructed.
 State& GetState() {
-    static State state;
-    return state;
+    static State* state = new State;
+    return *state;
 }
 
 UiState& GetUiState() {
-    static UiState state;
-    return state;
+    static UiState* state = new UiState;
+    return *state;
 }
 
-std::filesystem::path DataRoot() {
-    wchar_t buffer[MAX_PATH] = {};
-    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, MAX_PATH);
-    std::filesystem::path root = length > 0 && length < MAX_PATH ? buffer : L".";
-    return root / L"OpenXR-Simulator";
+const std::filesystem::path& DataRoot() {
+    static const std::filesystem::path* root = []() {
+        wchar_t buffer[MAX_PATH] = {};
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, MAX_PATH);
+        std::filesystem::path base = length > 0 && length < MAX_PATH ? buffer : L".";
+        return new std::filesystem::path(base / L"OpenXR-Simulator");
+    }();
+    return *root;
 }
 
 bool TryTriggerRenderDocCapture(State& state, uint64_t frame) {
@@ -219,10 +261,8 @@ void AtomicWrite(const std::filesystem::path& path, const std::string& contents)
         file.write(contents.data(), (std::streamsize)contents.size());
         file.flush();
     }
-    // Rename atomically without forcing a physical disk flush on the OpenXR
-    // render thread. Readers still never observe a partial JSON file, while the
-    // simulator avoids paying storage latency for status published several
-    // times per second.
+    // Rename atomically without forcing a physical disk flush. Readers never
+    // observe a partial JSON file.
     MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
@@ -230,37 +270,49 @@ uint8_t Luma(const uint8_t* bgra) {
     return (uint8_t)((19u * bgra[0] + 183u * bgra[1] + 54u * bgra[2]) >> 8);
 }
 
-Sample Downsample(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t frame) {
+// `pitchBytes` is the distance between source rows: the D3D12 readback the
+// caller maps is 256-byte aligned, and sampling it in place is what removed the
+// full-frame repack the detector used to force on the render thread.
+Sample Downsample(const uint8_t* bgra, uint32_t width, uint32_t height,
+                  uint32_t pitchBytes, uint64_t frame) {
     Sample sample;
     sample.frame = frame;
     // Detection runs on the application's xrEndFrame thread. A 320-wide signal
     // retains far more spatial detail than the temporal/luma classifier needs
-    // while cutting sampling and history comparisons to one quarter of their
-    // previous cost.
+    // while keeping sampling and history comparisons cheap.
     sample.width = std::min(width, 320u);
     sample.height = std::max(1u, (uint32_t)std::llround((double)height * sample.width / std::max(1u, width)));
     sample.height = std::min(sample.height, 180u);
     sample.bgra.resize((size_t)sample.width * sample.height * 4);
 
+    // The horizontal sampling pattern is identical for every row.
+    uint32_t sourceOffsets[320];
+    for (uint32_t x = 0; x < sample.width; ++x) {
+        sourceOffsets[x] =
+            std::min(width - 1, (uint32_t)((uint64_t)x * width / sample.width)) * 4;
+    }
+
     double sum = 0.0, sumLeft = 0.0, sumRight = 0.0;
     uint64_t countLeft = 0, countRight = 0, brightLeft = 0, brightRight = 0;
+    const uint32_t halfWidth = sample.width / 2;
     for (uint32_t y = 0; y < sample.height; ++y) {
         const uint32_t sourceY = std::min(height - 1, (uint32_t)((uint64_t)y * height / sample.height));
+        const uint8_t* sourceRow = bgra + (size_t)sourceY * pitchBytes;
+        uint8_t* destinationRow = sample.bgra.data() + (size_t)y * sample.width * 4;
         for (uint32_t x = 0; x < sample.width; ++x) {
-            const uint32_t sourceX = std::min(width - 1, (uint32_t)((uint64_t)x * width / sample.width));
-            const uint8_t* source = bgra + ((size_t)sourceY * width + sourceX) * 4;
-            uint8_t* destination = sample.bgra.data() + ((size_t)y * sample.width + x) * 4;
-            memcpy(destination, source, 4);
-            const double value = Luma(source) / 255.0;
+            const uint8_t* source = sourceRow + sourceOffsets[x];
+            memcpy(destinationRow + (size_t)x * 4, source, 4);
+            const uint8_t luma = Luma(source);
+            const double value = luma / 255.0;
             sum += value;
-            if (x < sample.width / 2) {
+            if (x < halfWidth) {
                 sumLeft += value;
                 ++countLeft;
-                if (Luma(source) >= 245) ++brightLeft;
+                if (luma >= 245) ++brightLeft;
             } else {
                 sumRight += value;
                 ++countRight;
-                if (Luma(source) >= 245) ++brightRight;
+                if (luma >= 245) ++brightRight;
             }
         }
     }
@@ -273,13 +325,13 @@ Sample Downsample(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t
     return sample;
 }
 
-Sample CropUi(const uint8_t* bgra, uint32_t width, uint32_t height,
+Sample CropUi(const uint8_t* bgra, uint32_t width, uint32_t height, uint32_t pitchBytes,
               const int32_t rects[2][4], uint64_t frame) {
     Sample sample;
     sample.frame = frame;
     // The UI detector only needs presence/absence and coarse temporal shape.
-    // Keep paired eye crops, but avoid scanning 74k pixels on every composed
-    // diagnostic preview update.
+    // Keep paired eye crops, but avoid scanning the full quad rectangle on
+    // every composed diagnostic preview update.
     sample.width = 256;
     sample.height = 72;
     sample.bgra.assign((size_t)sample.width * sample.height * 4, 0);
@@ -292,16 +344,20 @@ Sample CropUi(const uint8_t* bgra, uint32_t width, uint32_t height,
         const int64_t rx1 = std::clamp<int64_t>((int64_t)rects[eye][0] + rects[eye][2], 0, width);
         const int64_t ry1 = std::clamp<int64_t>((int64_t)rects[eye][1] + rects[eye][3], 0, height);
         if (rx1 <= rx0 || ry1 <= ry0) continue;
+        uint32_t sourceOffsets[128];
+        for (uint32_t x = 0; x < 128; ++x) {
+            sourceOffsets[x] = (uint32_t)std::min<int64_t>(
+                rx1 - 1, rx0 + (int64_t)x * (rx1 - rx0) / 128) * 4;
+        }
         for (uint32_t y = 0; y < sample.height; ++y) {
             const uint32_t sourceY = (uint32_t)std::min<int64_t>(
                 ry1 - 1, ry0 + (int64_t)y * (ry1 - ry0) / sample.height);
+            const uint8_t* sourceRow = bgra + (size_t)sourceY * pitchBytes;
+            uint8_t* destinationRow = sample.bgra.data() +
+                ((size_t)y * sample.width + (size_t)eye * 128) * 4;
             for (uint32_t x = 0; x < 128; ++x) {
-                const uint32_t sourceX = (uint32_t)std::min<int64_t>(
-                    rx1 - 1, rx0 + (int64_t)x * (rx1 - rx0) / 128);
-                const uint8_t* source = bgra + ((size_t)sourceY * width + sourceX) * 4;
-                uint8_t* destination = sample.bgra.data() +
-                    ((size_t)y * sample.width + eye * 128 + x) * 4;
-                memcpy(destination, source, 4);
+                const uint8_t* source = sourceRow + sourceOffsets[x];
+                memcpy(destinationRow + (size_t)x * 4, source, 4);
                 sum[eye] += Luma(source) / 255.0;
                 ++count[eye];
             }
@@ -406,7 +462,59 @@ void SaveSample(const std::filesystem::path& directory, const Sample& sample) {
     WriteBmpRegion(directory / ("frame" + std::to_string(sample.frame) + "_preview.bmp"), sample, 0, sample.width);
 }
 
-void WriteStatus(const State& state, const Sample* sample, uint64_t frame) {
+// ---------------------------------------------------------------------------
+// I/O worker
+//
+// The detector observes on the application's render thread, but every file it
+// produces is written here: incident BMP packets, incident/status JSON, and
+// the manual capture-request polls. Lock order is always a state mutex first,
+// then the worker mutex — never the reverse.
+// ---------------------------------------------------------------------------
+
+struct PendingFile {
+    std::filesystem::path path;
+    std::string contents;
+};
+
+struct PendingSample {
+    std::filesystem::path directory;
+    Sample sample;
+};
+
+struct IoWorker {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<PendingFile> files;
+    std::deque<PendingSample> samples;
+};
+
+IoWorker& GetWorker() {
+    static IoWorker* worker = new IoWorker;
+    return *worker;
+}
+
+void QueueFile(std::filesystem::path path, std::string contents) {
+    IoWorker& worker = GetWorker();
+    {
+        std::lock_guard<std::mutex> guard(worker.mutex);
+        worker.files.push_back(PendingFile{ std::move(path), std::move(contents) });
+    }
+    worker.wake.notify_one();
+}
+
+void QueueSample(const std::filesystem::path& directory, const Sample& sample) {
+    IoWorker& worker = GetWorker();
+    {
+        std::lock_guard<std::mutex> guard(worker.mutex);
+        // Bound the backlog if storage cannot keep up; dropping a post-incident
+        // frame beats growing without limit on the app's memory.
+        if (worker.samples.size() >= 64) return;
+        worker.samples.push_back(PendingSample{ directory, sample });
+    }
+    worker.wake.notify_one();
+}
+
+std::string BuildStatusJson(const State& state, const Sample* sample, uint64_t frame) {
     std::ostringstream json;
     json << std::fixed << std::setprecision(6)
          << "{\n  \"schemaVersion\": 1,\n  \"timestampUnixMs\": " << UnixTimeMs()
@@ -446,56 +554,10 @@ void WriteStatus(const State& state, const Sample* sample, uint64_t frame) {
              << ", \"brightFractionRight\": " << sample->brightFractionRight << " }";
     }
     json << "\n}\n";
-    AtomicWrite(DataRoot() / L"flicker_status.json", json.str());
+    return json.str();
 }
 
-void BeginIncident(State& state, const std::string& reason, uint64_t frame, bool force = false) {
-    if (reason != "MANUAL_CAPTURE") ++state.anomalyCount;
-    state.lastReason = reason;
-    if (reason != "MANUAL_CAPTURE") TryTriggerRenderDocCapture(state, frame);
-    if (!state.activeIncidentDirectory.empty() ||
-        (!force && state.lastIncidentFrame != 0 && frame - state.lastIncidentFrame < kIncidentCooldownFrames)) return;
-
-    state.lastIncidentFrame = frame;
-    ++state.incidentCount;
-    state.activeIncidentDirectory = DataRoot() / L"flicker_incidents" /
-        (L"session_" + std::to_wstring(GetCurrentProcessId())) /
-        (L"incident_" + std::to_wstring(frame));
-    state.lastIncidentDirectory = state.activeIncidentDirectory;
-    state.postFramesRemaining = kPostIncidentFrames;
-    state.activeLastSavedFrame = 0;
-    std::error_code ec;
-    std::filesystem::create_directories(state.activeIncidentDirectory, ec);
-    for (const auto& historySample : state.history) {
-        SaveSample(state.activeIncidentDirectory, historySample);
-        state.activeLastSavedFrame = historySample.frame;
-    }
-
-    std::ostringstream incident;
-    incident << "{\n  \"schemaVersion\": 1,\n  \"pid\": " << GetCurrentProcessId()
-             << ",\n  \"triggerFrame\": " << frame
-             << ",\n  \"timestampUnixMs\": " << UnixTimeMs()
-             << ",\n  \"reason\": \"" << JsonEscape(reason) << "\""
-             << ",\n  \"totalSubmissions\": " << state.totalSubmissions
-             << ",\n  \"projectionSubmissions\": " << state.projectionSubmissions
-             << ",\n  \"missingProjectionSubmissions\": " << state.missingProjectionSubmissions
-             << ",\n  \"projectionPresenceTransitions\": " << state.projectionPresenceTransitions
-             << ",\n  \"consecutiveMissingProjection\": " << state.consecutiveMissingProjection
-             << ",\n  \"lastLayerCount\": " << state.lastLayerCount
-             << ",\n  \"previewSamples\": " << state.previewSamples
-             << ",\n  \"paintAttempts\": " << state.paintAttempts
-             << ",\n  \"successfulPaints\": " << state.successfulPaints
-             << ",\n  \"failedPaints\": " << state.failedPaints << "\n}\n";
-    AtomicWrite(state.activeIncidentDirectory / L"incident.json", incident.str());
-    AtomicWrite(state.activeIncidentDirectory / L"LLM_REVIEW.md",
-        "# OpenXR Simulator visible-preview flicker incident\n\n"
-        "This packet was captured from the simulator's fully composed CPU preview surface, after projection and quad layers. "
-        "It does not rely on the application's game window or pre-compositor textures.\n\n"
-        "Run `analyze_openxr_flicker.py` on this directory. Review the paired `color_L`/`color_R` frames for flashes, missing-eye frames, alternation, and frozen output. "
-        "The trigger and submission context are in `incident.json` and `%LOCALAPPDATA%\\OpenXR-Simulator\\flicker_status.json`.\n");
-}
-
-void WriteUiStatus(const UiState& state, const Sample* sample, uint64_t frame) {
+std::string BuildUiStatusJson(const UiState& state, const Sample* sample, uint64_t frame) {
     std::ostringstream json;
     json << std::fixed << std::setprecision(6)
          << "{\n  \"schemaVersion\": 1,\n  \"captureSource\": \"openxr-simulator-ui-quad\""
@@ -530,14 +592,66 @@ void WriteUiStatus(const UiState& state, const Sample* sample, uint64_t frame) {
              << ", \"temporalRight\": " << sample->temporalRight << " }";
     }
     json << "\n}\n";
-    AtomicWrite(DataRoot() / L"ui_flicker_status.json", json.str());
+    return json.str();
 }
 
+// Caller holds state.mutex. Everything this produces goes through the worker
+// queue: an incident's history packet is ~30 small BMPs and the render thread
+// must not pay for them.
+void BeginIncident(State& state, const std::string& reason, uint64_t frame, bool force = false) {
+    if (reason != "MANUAL_CAPTURE") ++state.anomalyCount;
+    state.lastReason = reason;
+    state.statusDirty = true;
+    if (reason != "MANUAL_CAPTURE") TryTriggerRenderDocCapture(state, frame);
+    if (!state.activeIncidentDirectory.empty() ||
+        (!force && state.lastIncidentFrame != 0 && frame - state.lastIncidentFrame < kIncidentCooldownFrames)) return;
+    if (state.incidentCount >= kMaxIncidentsPerSession) return;
+
+    state.lastIncidentFrame = frame;
+    ++state.incidentCount;
+    state.activeIncidentDirectory = DataRoot() / L"flicker_incidents" /
+        (L"session_" + std::to_wstring(GetCurrentProcessId())) /
+        (L"incident_" + std::to_wstring(frame));
+    state.lastIncidentDirectory = state.activeIncidentDirectory;
+    state.postFramesRemaining = kPostIncidentFrames;
+    state.activeLastSavedFrame = 0;
+    for (const auto& historySample : state.history) {
+        QueueSample(state.activeIncidentDirectory, historySample);
+        state.activeLastSavedFrame = historySample.frame;
+    }
+
+    std::ostringstream incident;
+    incident << "{\n  \"schemaVersion\": 1,\n  \"pid\": " << GetCurrentProcessId()
+             << ",\n  \"triggerFrame\": " << frame
+             << ",\n  \"timestampUnixMs\": " << UnixTimeMs()
+             << ",\n  \"reason\": \"" << JsonEscape(reason) << "\""
+             << ",\n  \"totalSubmissions\": " << state.totalSubmissions
+             << ",\n  \"projectionSubmissions\": " << state.projectionSubmissions
+             << ",\n  \"missingProjectionSubmissions\": " << state.missingProjectionSubmissions
+             << ",\n  \"projectionPresenceTransitions\": " << state.projectionPresenceTransitions
+             << ",\n  \"consecutiveMissingProjection\": " << state.consecutiveMissingProjection
+             << ",\n  \"lastLayerCount\": " << state.lastLayerCount
+             << ",\n  \"previewSamples\": " << state.previewSamples
+             << ",\n  \"paintAttempts\": " << state.paintAttempts
+             << ",\n  \"successfulPaints\": " << state.successfulPaints
+             << ",\n  \"failedPaints\": " << state.failedPaints << "\n}\n";
+    QueueFile(state.activeIncidentDirectory / L"incident.json", incident.str());
+    QueueFile(state.activeIncidentDirectory / L"LLM_REVIEW.md",
+        "# OpenXR Simulator visible-preview flicker incident\n\n"
+        "This packet was captured from the simulator's fully composed CPU preview surface, after projection and quad layers. "
+        "It does not rely on the application's game window or pre-compositor textures.\n\n"
+        "Run `analyze_openxr_flicker.py` on this directory. Review the paired `color_L`/`color_R` frames for flashes, missing-eye frames, alternation, and frozen output. "
+        "The trigger and submission context are in `incident.json` and `%LOCALAPPDATA%\\OpenXR-Simulator\\flicker_status.json`.\n");
+}
+
+// Caller holds state.mutex.
 void BeginUiIncident(UiState& state, const std::string& reason, uint64_t frame, bool force = false) {
     if (reason != "MANUAL_UI_CAPTURE") ++state.anomalyCount;
     state.lastReason = reason;
+    state.statusDirty = true;
     if (!state.activeIncidentDirectory.empty() ||
         (!force && state.lastIncidentFrame != 0 && frame - state.lastIncidentFrame < kIncidentCooldownFrames)) return;
+    if (state.incidentCount >= kMaxIncidentsPerSession) return;
 
     state.lastIncidentFrame = frame;
     ++state.incidentCount;
@@ -547,10 +661,8 @@ void BeginUiIncident(UiState& state, const std::string& reason, uint64_t frame, 
     state.lastIncidentDirectory = state.activeIncidentDirectory;
     state.postFramesRemaining = kPostIncidentFrames;
     state.activeLastSavedFrame = 0;
-    std::error_code ec;
-    std::filesystem::create_directories(state.activeIncidentDirectory, ec);
     for (const auto& historySample : state.history) {
-        SaveSample(state.activeIncidentDirectory, historySample);
+        QueueSample(state.activeIncidentDirectory, historySample);
         state.activeLastSavedFrame = historySample.frame;
     }
     std::ostringstream incident;
@@ -566,8 +678,8 @@ void BeginUiIncident(UiState& state, const std::string& reason, uint64_t frame, 
              << ",\n  \"cachedCompositions\": " << state.cachedCompositions
              << ",\n  \"missingAfterProjection\": " << state.missingAfterProjection
              << ",\n  \"compositionFailures\": " << state.compositionFailures << "\n}\n";
-    AtomicWrite(state.activeIncidentDirectory / L"incident.json", incident.str());
-    AtomicWrite(state.activeIncidentDirectory / L"LLM_REVIEW.md",
+    QueueFile(state.activeIncidentDirectory / L"incident.json", incident.str());
+    QueueFile(state.activeIncidentDirectory / L"LLM_REVIEW.md",
         "# OpenXR Simulator UI-only flicker incident\n\n"
         "Every paired image in this packet is cropped to the submitted quad-layer rectangle in each eye. "
         "World motion outside the UI is intentionally excluded.\n\n"
@@ -575,11 +687,157 @@ void BeginUiIncident(UiState& state, const std::string& reason, uint64_t frame, 
         "quad readback/composition counters are in `incident.json` and `ui_flicker_status.json`.\n");
 }
 
+// Old sessions' incident packets and log files, pruned once per process from
+// the worker. Without this the incident roots grow without bound (2.8 GB was
+// observed before the cap existed).
+void PruneStaleArtifacts() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::wstring ownSession = L"session_" + std::to_wstring(GetCurrentProcessId());
+    const wchar_t* const incidentRoots[] = { L"flicker_incidents", L"ui_flicker_incidents" };
+    for (const wchar_t* rootName : incidentRoots) {
+        std::vector<std::pair<fs::file_time_type, fs::path>> sessions;
+        fs::directory_iterator it(DataRoot() / rootName, ec);
+        for (; !ec && it != fs::directory_iterator(); it.increment(ec)) {
+            if (!it->is_directory(ec)) continue;
+            if (it->path().filename().wstring() == ownSession) continue;
+            sessions.emplace_back(fs::last_write_time(it->path(), ec), it->path());
+        }
+        std::sort(sessions.begin(), sessions.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+        for (size_t i = kKeepRecentSessions; i < sessions.size(); ++i) {
+            std::error_code removeError;
+            fs::remove_all(sessions[i].second, removeError);
+        }
+    }
+
+    const std::wstring ownLog =
+        L"openxr_simulator." + std::to_wstring(GetCurrentProcessId()) + L".log";
+    std::vector<std::pair<fs::file_time_type, fs::path>> logs;
+    ec.clear();
+    fs::directory_iterator logIt(DataRoot(), ec);
+    for (; !ec && logIt != fs::directory_iterator(); logIt.increment(ec)) {
+        const std::wstring name = logIt->path().filename().wstring();
+        if (name.rfind(L"openxr_simulator.", 0) != 0 ||
+            name.size() < 4 || name.compare(name.size() - 4, 4, L".log") != 0) continue;
+        if (name == ownLog) continue;
+        logs.emplace_back(fs::last_write_time(logIt->path(), ec), logIt->path());
+    }
+    std::sort(logs.begin(), logs.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (size_t i = kKeepRecentLogs; i < logs.size(); ++i) {
+        std::error_code removeError;
+        fs::remove(logs[i].second, removeError);
+    }
+}
+
+void FlushDirtyStatus() {
+    static ULONGLONG lastWriteMs = 0;
+    static ULONGLONG lastUiWriteMs = 0;
+    const ULONGLONG now = GetTickCount64();
+
+    std::string statusJson;
+    {
+        State& state = GetState();
+        std::lock_guard<std::mutex> guard(state.mutex);
+        if (state.statusDirty && now - lastWriteMs >= 250) {
+            statusJson = BuildStatusJson(state, state.hasMetrics ? &state.lastMetrics : nullptr,
+                                         state.lastFrame);
+            state.statusDirty = false;
+            lastWriteMs = now;
+        }
+    }
+    if (!statusJson.empty()) AtomicWrite(DataRoot() / L"flicker_status.json", statusJson);
+
+    std::string uiJson;
+    {
+        UiState& state = GetUiState();
+        std::lock_guard<std::mutex> guard(state.mutex);
+        if (state.statusDirty && now - lastUiWriteMs >= 250) {
+            uiJson = BuildUiStatusJson(state, state.hasMetrics ? &state.lastMetrics : nullptr,
+                                       state.lastFrame);
+            state.statusDirty = false;
+            lastUiWriteMs = now;
+        }
+    }
+    if (!uiJson.empty()) AtomicWrite(DataRoot() / L"ui_flicker_status.json", uiJson);
+}
+
+void PollManualRequests() {
+    static ULONGLONG lastPollMs = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastPollMs < 500) return;
+    lastPollMs = now;
+
+    const std::filesystem::path request = DataRoot() / L"flicker_capture_request.json";
+    if (GetFileAttributesW(request.c_str()) != INVALID_FILE_ATTRIBUTES && DeleteFileW(request.c_str())) {
+        State& state = GetState();
+        std::lock_guard<std::mutex> guard(state.mutex);
+        BeginIncident(state, "MANUAL_CAPTURE", state.lastFrame, true);
+    }
+    const std::filesystem::path renderDocRequest = DataRoot() / L"renderdoc_capture_request.json";
+    if (GetFileAttributesW(renderDocRequest.c_str()) != INVALID_FILE_ATTRIBUTES &&
+        DeleteFileW(renderDocRequest.c_str())) {
+        State& state = GetState();
+        std::lock_guard<std::mutex> guard(state.mutex);
+        TryTriggerRenderDocCapture(state, state.lastFrame);
+    }
+    const std::filesystem::path uiRequest = DataRoot() / L"ui_flicker_capture_request.json";
+    if (GetFileAttributesW(uiRequest.c_str()) != INVALID_FILE_ATTRIBUTES && DeleteFileW(uiRequest.c_str())) {
+        UiState& state = GetUiState();
+        std::lock_guard<std::mutex> guard(state.mutex);
+        BeginUiIncident(state, "MANUAL_UI_CAPTURE", state.lastFrame, true);
+    }
+}
+
+void WorkerMain() {
+    IoWorker& worker = GetWorker();
+    bool pruned = false;
+    for (;;) {
+        std::vector<PendingFile> files;
+        std::deque<PendingSample> samples;
+        {
+            std::unique_lock<std::mutex> lock(worker.mutex);
+            worker.wake.wait_for(lock, std::chrono::milliseconds(250));
+            files.swap(worker.files);
+            samples.swap(worker.samples);
+        }
+        for (PendingFile& file : files) AtomicWrite(file.path, file.contents);
+        for (PendingSample& pending : samples) SaveSample(pending.directory, pending.sample);
+        FlushDirtyStatus();
+        PollManualRequests();
+        // Prune after the first service cycle, not before it: clearing a large
+        // backlog can take minutes, and fresh status output must not wait on it.
+        if (!pruned) {
+            pruned = true;
+            PruneStaleArtifacts();
+        }
+    }
+}
+
+void EnsureWorker() {
+    static std::atomic<bool> started{false};
+    if (started.load(std::memory_order_acquire)) return;
+    IoWorker& worker = GetWorker();
+    std::lock_guard<std::mutex> guard(worker.mutex);
+    if (started.load(std::memory_order_relaxed)) return;
+    // The worker is detached and every singleton it touches is leaked, so the
+    // one remaining hazard is the module's code disappearing underneath it.
+    // Pin the DLL: a runtime that has started diagnostics stays resident.
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                       reinterpret_cast<LPCWSTR>(&WorkerMain), &self);
+    std::thread(&WorkerMain).detach();
+    started.store(true, std::memory_order_release);
+}
+
 } // namespace
 
 void ObserveSubmission(uint64_t frame, uint32_t projectionLayers, uint32_t totalLayers) {
+    EnsureWorker();
     State& state = GetState();
     std::lock_guard<std::mutex> guard(state.mutex);
+    state.lastFrame = frame;
     ++state.totalSubmissions;
     state.lastLayerCount = totalLayers;
     const bool hasProjection = projectionLayers > 0;
@@ -603,31 +861,25 @@ void ObserveSubmission(uint64_t frame, uint32_t projectionLayers, uint32_t total
     }
     state.projectionStateInitialized = true;
     state.lastHadProjection = hasProjection;
-    if (state.totalSubmissions % 15 == 0) {
-        const std::filesystem::path request = DataRoot() / L"flicker_capture_request.json";
-        if (GetFileAttributesW(request.c_str()) != INVALID_FILE_ATTRIBUTES && DeleteFileW(request.c_str())) {
-            BeginIncident(state, "MANUAL_CAPTURE", frame, true);
-        }
-        const std::filesystem::path renderDocRequest = DataRoot() / L"renderdoc_capture_request.json";
-        if (GetFileAttributesW(renderDocRequest.c_str()) != INVALID_FILE_ATTRIBUTES &&
-            DeleteFileW(renderDocRequest.c_str())) {
-            TryTriggerRenderDocCapture(state, frame);
-        }
-    }
+    // Marking dirty is all that happens on the frame path; the worker rate-limits
+    // the actual writes, so a long 2D-only stretch (menus, loading) no longer
+    // turns into one file write per frame.
     if (state.totalSubmissions % 15 == 0 || !hasProjection) {
-        WriteStatus(state, state.history.empty() ? nullptr : &state.history.back(), frame);
+        state.statusDirty = true;
     }
 }
 
 void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
-                    uint64_t generation, uint64_t frame) {
+                    uint32_t pitchBytes, uint64_t generation, uint64_t frame) {
     if (!bgra || width < 4 || height < 2) return;
+    if (pitchBytes == 0) pitchBytes = width * 4;
+    EnsureWorker();
     State& state = GetState();
     std::lock_guard<std::mutex> guard(state.mutex);
     if (generation == 0 || generation == state.lastGeneration) return;
     state.lastGeneration = generation;
 
-    Sample current = Downsample(bgra, width, height, frame);
+    Sample current = Downsample(bgra, width, height, pitchBytes, frame);
     if (!state.history.empty()) CalculateTemporal(current, state.history.back());
     ++state.previewSamples;
 
@@ -669,21 +921,24 @@ void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
     }
     if (!reason.empty()) BeginIncident(state, reason, frame);
 
-    state.history.push_back(current);
-    while (state.history.size() > kHistoryFrames) state.history.pop_front();
-
     if (!state.activeIncidentDirectory.empty() && state.activeLastSavedFrame != current.frame) {
-        SaveSample(state.activeIncidentDirectory, current);
+        QueueSample(state.activeIncidentDirectory, current);
         state.activeLastSavedFrame = current.frame;
         if (state.postFramesRemaining > 0) --state.postFramesRemaining;
         if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
     }
     if (state.previewSamples % 15 == 0 || !reason.empty()) {
-        WriteStatus(state, &current, frame);
+        state.statusDirty = true;
     }
+    state.lastMetrics = MetricsOnly(current);
+    state.hasMetrics = true;
+
+    state.history.push_back(std::move(current));
+    while (state.history.size() > kHistoryFrames) state.history.pop_front();
 }
 
 void ObservePaint(uint64_t generation, bool paintedPreview) {
+    EnsureWorker();
     State& state = GetState();
     std::lock_guard<std::mutex> guard(state.mutex);
     ++state.paintAttempts;
@@ -696,18 +951,22 @@ void ObservePaint(uint64_t generation, bool paintedPreview) {
     } else {
         ++state.failedPaints;
         if (state.successfulPaints >= 5) {
-            BeginIncident(state, "PREVIEW_PAINT_FAILURE", generation);
+            BeginIncident(state, "PREVIEW_PAINT_FAILURE", state.lastFrame);
         }
     }
     if (!paintedPreview || state.paintAttempts % 15 == 0) {
-        WriteStatus(state, state.history.empty() ? nullptr : &state.history.back(), generation);
+        state.statusDirty = true;
     }
 }
 
 void ObserveUi(const uint8_t* bgra, uint32_t width, uint32_t height,
-               uint64_t generation, uint64_t frame, const UiFrameInfo& info) {
+               uint32_t pitchBytes, uint64_t generation, uint64_t frame,
+               const UiFrameInfo& info) {
+    if (pitchBytes == 0) pitchBytes = width * 4;
+    EnsureWorker();
     UiState& state = GetUiState();
     std::lock_guard<std::mutex> guard(state.mutex);
+    state.lastFrame = frame;
     ++state.observedFrames;
     state.lastQuadLayers = info.quadLayers;
     state.lastCacheValid = info.cacheValid;
@@ -744,7 +1003,7 @@ void ObserveUi(const uint8_t* bgra, uint32_t width, uint32_t height,
     if (bgra && width >= 4 && height >= 2 && validRects && generation != 0 &&
         generation != state.lastGeneration) {
         state.lastGeneration = generation;
-        current = CropUi(bgra, width, height, info.rects, frame);
+        current = CropUi(bgra, width, height, pitchBytes, info.rects, frame);
         if (!state.history.empty()) CalculateTemporal(current, state.history.back());
         ++state.uiSamples;
         if (reason.empty() && !state.history.empty()) {
@@ -760,26 +1019,20 @@ void ObserveUi(const uint8_t* bgra, uint32_t width, uint32_t height,
 
     if (!reason.empty()) BeginUiIncident(state, reason, frame);
     if (!current.bgra.empty()) {
-        state.history.push_back(current);
-        while (state.history.size() > kHistoryFrames) state.history.pop_front();
         if (!state.activeIncidentDirectory.empty() && state.activeLastSavedFrame != current.frame) {
-            SaveSample(state.activeIncidentDirectory, current);
+            QueueSample(state.activeIncidentDirectory, current);
             state.activeLastSavedFrame = current.frame;
             if (state.postFramesRemaining > 0) --state.postFramesRemaining;
             if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
         }
+        state.lastMetrics = MetricsOnly(current);
+        state.hasMetrics = true;
+        state.history.push_back(std::move(current));
+        while (state.history.size() > kHistoryFrames) state.history.pop_front();
     }
 
-    if (state.observedFrames % 15 == 0) {
-        const std::filesystem::path request = DataRoot() / L"ui_flicker_capture_request.json";
-        if (GetFileAttributesW(request.c_str()) != INVALID_FILE_ATTRIBUTES && DeleteFileW(request.c_str())) {
-            BeginUiIncident(state, "MANUAL_UI_CAPTURE", frame, true);
-        }
-    }
     if (state.observedFrames % 15 == 0 || !reason.empty()) {
-        const Sample* sample = !current.bgra.empty() ? &current :
-            (state.history.empty() ? nullptr : &state.history.back());
-        WriteUiStatus(state, sample, frame);
+        state.statusDirty = true;
     }
 }
 

@@ -120,9 +120,11 @@ either one with `XR_PROBE_PROJECTION_ONLY=1` and compare screenshots.
   `src\hooking\framebuffer.cpp` does not kick in. That is deliberate: this runtime
   accepts swapchains at the game's own render resolution, so BetterVR takes the
   same code path a real headset takes.
-- Recommended per-eye resolution is the active headset profile's panel (2064x2208 for
-  the default Quest 3; Meta's is 1440x1584). BetterVR ignores it and asks for the
-  game's own render resolution either way.
+- Recommended per-eye resolution is independent of headset FOV/IPD and is selected under
+  **Tools > Render Resolution**. The 1280x1400 performance default restores the render size
+  used before native-panel recommendations; **Headset Native** reports 2064x2208 for Quest 3.
+  BetterVR follows the recommendation (with alignment rounding), so this setting changes
+  its color/depth swapchain cost after the application is restarted.
 - `xrEndSession` immediately after `xrRequestExitSession` succeeds here. The Meta
   simulator returns `XR_ERROR_SESSION_NOT_STOPPING`, which older BetterVR builds
   turn into a throw from `RND_Renderer::~RND_Renderer`.
@@ -167,10 +169,11 @@ the panel.
 The preview did not. It blitted the app's pixels 1:1, so the squeeze survived to the
 screen and everything came out about 1.89x too wide.
 
-Each headset profile now carries its native per-eye panel resolution, and the preview
-maps the eyes onto *that* shape rather than the app's buffer — one stretch in the final
-GDI blit, which is what turns the non-square pixels back into square ones. The app's
-pixels still land in the offscreen RT 1:1, so nothing is resampled twice.
+Each headset profile carries its native per-eye panel resolution, and the preview maps
+the eyes onto *that* shape rather than tying desktop size to the application's render
+resolution. In **Fill Window** mode the final compositor pass scales that shape to the
+entire client area, so a lower render resolution is upscaled and a supersampled one is
+downscaled without changing how much of the desktop the preview occupies.
 
 Panel aspect and FOV aspect are not identical on real hardware (Quest 3: 0.935 vs
 0.941), so a world-space square still renders slightly off — well under 1% on Quest 3,
