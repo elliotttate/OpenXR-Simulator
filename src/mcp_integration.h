@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+#include <atomic>
 
 namespace mcp {
 
@@ -42,6 +43,30 @@ inline std::string GetSimulatorDataPath() {
 inline bool g_screenshotRequested = false;
 inline std::string g_screenshotEye = "both";
 inline std::string g_screenshotLayer = "projection";  // "projection", "quad", or "all"
+inline std::atomic_uint64_t g_runtimeFrameCount{};
+inline uint64_t g_screenshotRequestFrame = 0;
+
+inline void WriteScreenshotStatus(const char* layer, uint32_t width, uint32_t height) {
+    std::string path = GetSimulatorDataPath() + "\\screenshot_status.json";
+    std::string temporary = path + ".tmp";
+    FILE* file = nullptr;
+    if (fopen_s(&file, temporary.c_str(), "w") != 0 || !file) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(file, "{\n");
+    fprintf(file, "  \"timestamp\": \"%04d-%02d-%02dT%02d:%02d:%02d.%03d\",\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    fprintf(file, "  \"requestFrame\": %llu,\n", (unsigned long long)g_screenshotRequestFrame);
+    fprintf(file, "  \"capturedFrame\": %llu,\n",
+            (unsigned long long)g_runtimeFrameCount.load(std::memory_order_acquire));
+    fprintf(file, "  \"layer\": \"%s\",\n", layer ? layer : "unknown");
+    fprintf(file, "  \"eye\": \"%s\",\n", g_screenshotEye.c_str());
+    fprintf(file, "  \"width\": %u,\n", width);
+    fprintf(file, "  \"height\": %u\n", height);
+    fprintf(file, "}\n");
+    fclose(file);
+    MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
 
 // Storage for quad layer pixels (set by renderQuadLayer)
 inline std::vector<uint8_t> g_quadLayerPixels;
@@ -60,6 +85,7 @@ inline void CheckScreenshotRequest() {
         fclose(f);
 
         g_screenshotRequested = true;
+        g_screenshotRequestFrame = g_runtimeFrameCount.load(std::memory_order_acquire);
         g_screenshotEye = "both";
         g_screenshotLayer = "projection";  // default
 
@@ -215,7 +241,11 @@ inline void CaptureScreenshot(ID3D11Device* device, ID3D11DeviceContext* ctx,
     }
 
     std::string outPath = GetSimulatorDataPath() + "\\screenshot.bmp";
-    SaveTextureToBMP(device, ctx, backbuffer.Get(), outPath.c_str());
+    if (SaveTextureToBMP(device, ctx, backbuffer.Get(), outPath.c_str())) {
+        D3D11_TEXTURE2D_DESC desc{};
+        backbuffer->GetDesc(&desc);
+        WriteScreenshotStatus(g_screenshotLayer.c_str(), desc.Width, desc.Height);
+    }
 
     g_screenshotRequested = false;
 }
@@ -300,6 +330,7 @@ inline void CaptureQuadScreenshot() {
 
     std::string outPath = GetSimulatorDataPath() + "\\screenshot_quad.bmp";
     SavePixelsToBMP(g_quadLayerPixels.data(), g_quadLayerWidth, g_quadLayerHeight, outPath.c_str());
+    WriteScreenshotStatus("quad", g_quadLayerWidth, g_quadLayerHeight);
     McpLogf("Quad layer screenshot saved: %s (%ux%u)", outPath.c_str(), g_quadLayerWidth, g_quadLayerHeight);
     g_screenshotRequested = false;
 }
@@ -435,6 +466,7 @@ inline void CaptureScreenshotD3D12(ID3D12Device* device, ID3D12CommandQueue* que
 
     std::string outPath = GetSimulatorDataPath() + "\\screenshot.bmp";
     SavePixelsToBMP(pixels.data(), w, h, outPath.c_str());
+    WriteScreenshotStatus(g_screenshotLayer.c_str(), w, h);
     McpLogf("D3D12 screenshot captured: %ux%u format=%d", w, h, (int)desc.Format);
 
     g_screenshotRequested = false;
@@ -473,6 +505,7 @@ inline void CaptureScreenshotGL(const uint8_t* leftPixels, const uint8_t* rightP
 
     std::string outPath = GetSimulatorDataPath() + "\\screenshot.bmp";
     SavePixelsToBMP(combined.data(), totalWidth, height, outPath.c_str());
+    WriteScreenshotStatus(g_screenshotLayer.c_str(), totalWidth, height);
 
     g_screenshotRequested = false;
 }

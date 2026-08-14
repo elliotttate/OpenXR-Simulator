@@ -5329,6 +5329,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
 
     static int frameCount = 0;
     frameCount++;
+    mcp::g_runtimeFrameCount.store((uint64_t)frameCount, std::memory_order_release);
 
     // Log every frame for first 10 frames, then every 60 frames
     bool shouldLog = (frameCount <= 10) || (frameCount % 60 == 1);
