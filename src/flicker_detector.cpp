@@ -34,6 +34,8 @@ struct Sample {
     float temporal = 0.0f;
     float temporalLeft = 0.0f;
     float temporalRight = 0.0f;
+    float brightFractionLeft = 0.0f;
+    float brightFractionRight = 0.0f;
 };
 
 struct State {
@@ -49,12 +51,15 @@ struct State {
     uint64_t successfulPaints = 0;
     uint64_t failedPaints = 0;
     uint64_t duplicateGenerationPaints = 0;
+    uint64_t asymmetricBrightSamples = 0;
     uint64_t lastPaintGeneration = 0;
     uint64_t anomalyCount = 0;
     uint64_t incidentCount = 0;
     uint64_t lastIncidentFrame = 0;
     uint32_t consecutiveMissingProjection = 0;
     uint32_t maxConsecutiveMissingProjection = 0;
+    uint32_t consecutiveAsymmetricBright = 0;
+    uint32_t maxConsecutiveAsymmetricBright = 0;
     uint32_t lastLayerCount = 0;
     bool projectionStateInitialized = false;
     bool lastHadProjection = false;
@@ -168,7 +173,7 @@ Sample Downsample(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t
     sample.bgra.resize((size_t)sample.width * sample.height * 4);
 
     double sum = 0.0, sumLeft = 0.0, sumRight = 0.0;
-    uint64_t countLeft = 0, countRight = 0;
+    uint64_t countLeft = 0, countRight = 0, brightLeft = 0, brightRight = 0;
     for (uint32_t y = 0; y < sample.height; ++y) {
         const uint32_t sourceY = std::min(height - 1, (uint32_t)((uint64_t)y * height / sample.height));
         for (uint32_t x = 0; x < sample.width; ++x) {
@@ -181,9 +186,11 @@ Sample Downsample(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t
             if (x < sample.width / 2) {
                 sumLeft += value;
                 ++countLeft;
+                if (Luma(source) >= 245) ++brightLeft;
             } else {
                 sumRight += value;
                 ++countRight;
+                if (Luma(source) >= 245) ++brightRight;
             }
         }
     }
@@ -191,6 +198,8 @@ Sample Downsample(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t
     sample.mean = pixels ? (float)(sum / pixels) : 0.0f;
     sample.meanLeft = countLeft ? (float)(sumLeft / countLeft) : sample.mean;
     sample.meanRight = countRight ? (float)(sumRight / countRight) : sample.mean;
+    sample.brightFractionLeft = countLeft ? (float)brightLeft / countLeft : 0.0f;
+    sample.brightFractionRight = countRight ? (float)brightRight / countRight : 0.0f;
     return sample;
 }
 
@@ -346,6 +355,9 @@ void WriteStatus(const State& state, const Sample* sample, uint64_t frame) {
          << ",\n  \"successfulPaints\": " << state.successfulPaints
          << ",\n  \"failedPaints\": " << state.failedPaints
          << ",\n  \"duplicateGenerationPaints\": " << state.duplicateGenerationPaints
+         << ",\n  \"asymmetricBrightSamples\": " << state.asymmetricBrightSamples
+         << ",\n  \"consecutiveAsymmetricBright\": " << state.consecutiveAsymmetricBright
+         << ",\n  \"maxConsecutiveAsymmetricBright\": " << state.maxConsecutiveAsymmetricBright
          << ",\n  \"anomalyCount\": " << state.anomalyCount
          << ",\n  \"incidentCount\": " << state.incidentCount
          << ",\n  \"lastReason\": \"" << JsonEscape(state.lastReason) << "\""
@@ -356,7 +368,9 @@ void WriteStatus(const State& state, const Sample* sample, uint64_t frame) {
              << ", \"meanRight\": " << sample->meanRight
              << ", \"temporal\": " << sample->temporal
              << ", \"temporalLeft\": " << sample->temporalLeft
-             << ", \"temporalRight\": " << sample->temporalRight << " }";
+             << ", \"temporalRight\": " << sample->temporalRight
+             << ", \"brightFractionLeft\": " << sample->brightFractionLeft
+             << ", \"brightFractionRight\": " << sample->brightFractionRight << " }";
     }
     json << "\n}\n";
     AtomicWrite(DataRoot() / L"flicker_status.json", json.str());
@@ -539,6 +553,23 @@ void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
     ++state.previewSamples;
 
     std::string reason;
+    const float brightMaximum = std::max(
+        current.brightFractionLeft, current.brightFractionRight);
+    const float brightMinimum = std::min(
+        current.brightFractionLeft, current.brightFractionRight);
+    const bool asymmetricBright = brightMaximum >= 0.001f &&
+        brightMaximum - brightMinimum >= 0.0009f &&
+        brightMinimum <= brightMaximum * 0.35f;
+    if (asymmetricBright) {
+        ++state.asymmetricBrightSamples;
+        ++state.consecutiveAsymmetricBright;
+        state.maxConsecutiveAsymmetricBright = std::max(
+            state.maxConsecutiveAsymmetricBright, state.consecutiveAsymmetricBright);
+        if (state.consecutiveAsymmetricBright == 2)
+            reason = "ASYMMETRIC_BRIGHT_BREAKTHROUGH";
+    } else {
+        state.consecutiveAsymmetricBright = 0;
+    }
     if (!state.history.empty()) {
         const Sample& previous = state.history.back();
         const bool blankNow = current.mean < 0.015f || current.mean > 0.985f;
@@ -546,11 +577,11 @@ void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
         const float eyeAsymmetry = std::abs(current.temporalLeft - current.temporalRight);
         // Black-to-visible is the expected startup transition. A return to a
         // blank frame after several visible samples is the actionable case.
-        if (blankNow && !blankBefore && state.visiblePreviewSamples >= 5)
+        if (reason.empty() && blankNow && !blankBefore && state.visiblePreviewSamples >= 5)
             reason = "VISIBLE_TO_BLANK_FRAME";
-        else if (std::max(current.temporalLeft, current.temporalRight) > 0.12f && eyeAsymmetry > 0.08f)
+        else if (reason.empty() && std::max(current.temporalLeft, current.temporalRight) > 0.12f && eyeAsymmetry > 0.08f)
             reason = "ASYMMETRIC_EYE_FLASH";
-        else if (state.history.size() >= 2 && current.temporal > 0.08f &&
+        else if (reason.empty() && state.history.size() >= 2 && current.temporal > 0.08f &&
                  TemporalBetween(current, state.history[state.history.size() - 2]) < 0.03f)
             reason = "ALTERNATING_VISIBLE_FRAMES";
     }
