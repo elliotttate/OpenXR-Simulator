@@ -1367,7 +1367,14 @@ void ObserveUi(const uint8_t* bgra, uint32_t width, uint32_t height,
         current = CropUi(bgra, width, height, pitchBytes, info.rects, frame);
         if (!state.history.empty()) CalculateUiTemporal(current, state.history.back());
         ++state.uiSamples;
-        if (reason.empty() && !state.history.empty()) {
+        // A fully transparent quad contributes no UI pixels. Its composed crop
+        // contains only the projection behind it, so stereo head motion can
+        // legitimately produce a large one-eye temporal delta. Keep structural
+        // readback/composition checks active, but never classify projection-only
+        // motion as a UI flash.
+        constexpr float kMinimumUiAlphaCoverage = 1.0e-5f;
+        if (reason.empty() && !state.history.empty() &&
+            info.sourceAlphaCoverage >= kMinimumUiAlphaCoverage) {
             const float asymmetry = std::abs(current.temporalLeft - current.temporalRight);
             if (state.history.size() >= 2 && current.temporal > 0.055f &&
                 TemporalBetween(current, state.history[state.history.size() - 2]) < 0.025f) {
