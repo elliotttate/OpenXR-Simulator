@@ -197,6 +197,20 @@ if(WIN32)
     if(MSVC)
         # Without this MSVC decodes the UTF-8 sources as the system ANSI codepage.
         target_compile_options(openxr_simulator PRIVATE /utf-8)
+        # Statically link the C/C++ runtime (/MT) so the DLL does not depend on the
+        # process's MSVCP140.dll. Godot loads an older MSVCP140 (14.15) into the
+        # process; if our DLL binds to that older copy, std::string/locale layout
+        # mismatches crash during static init (access violation in MSVCP140 0x18e44)
+        # before any runtime entry point runs. /MT embeds the CRT we built with.
+        set_property(TARGET openxr_simulator PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(openxr_simulator PRIVATE
+            $<$<CONFIG:Debug>:/MTd>
+            $<$<CONFIG:Release>:/MT>
+            $<$<CONFIG:RelWithDebInfo>:/MT>)
+        target_link_options(openxr_simulator PRIVATE
+            $<$<CONFIG:Debug>:/NODEFAULTLIB:MSVCRTD.lib>
+            $<$<CONFIG:Release>:/NODEFAULTLIB:MSVCRT.lib>
+            $<$<CONFIG:RelWithDebInfo>:/NODEFAULTLIB:MSVCRT.lib>)
     endif()
 endif()
 
