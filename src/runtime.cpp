@@ -336,9 +336,12 @@ static bool g_adapterLuidSet = false;
 
 // Global persistent window that survives session creation/destruction
 // The preview window needs a thread we own. Only the creating thread can retrieve a
-// window's messages, and hosts differ over which thread calls which entry point; and
-// window work on the app's render thread deadlocks against DWM mid-frame (SetWindowText
-// alone repaints the caption). The frame path only ever posts to this thread.
+// window's messages, and hosts differ over which thread calls which entry point; putting
+// it on the app's render thread instead wedged Cemu inside SetWindowText on the first
+// composited frame.
+//
+// The frame path calls in synchronously (SetWindowText, SetWindowPos), so this thread must
+// stay in its message loop: whatever blocks here stalls the application's rendering.
 struct PreviewUi {
     std::thread       thread;
     std::atomic<HWND> hwnd{nullptr};
@@ -352,7 +355,7 @@ static std::mutex g_windowMutex;
 static ComPtr<IDXGISwapChain1> g_persistentSwapchain;
 static UINT g_persistentWidth = 1920;
 static UINT g_persistentHeight = 540;
-static bool g_windowClassRegistered = false;
+static std::atomic<bool> g_windowClassRegistered{false};
 
 // Latest XR swapchain (per-eye) source dimensions, populated by presentProjection.
 // Used by menu/keyboard resize callbacks to compute a target window size.
@@ -669,6 +672,12 @@ static float g_poseSweepRollAmp  = 0.3f;   // radians (~17 deg)
 static float g_poseSweepFreq     = 0.25f;  // Hz
 static bool g_mouseCapture = false;
 static POINT g_lastMousePos = {0, 0};
+
+// Mouse look and Home reach the head pose through these rather than writing it: the frame
+// loop integrates WASD into the same fields, and it is the only thread that should.
+static std::atomic<int>  g_lookDeltaX{0};
+static std::atomic<int>  g_lookDeltaY{0};
+static std::atomic<bool> g_resetPoseRequested{false};
 
 // ShowCursor keeps a counter, not a flag, so both ends of look mode have to go through one
 // place -- losing focus mid-drag used to clear g_mouseCapture without the matching show,
@@ -1283,7 +1292,7 @@ static ui::StatsInfo BuildStatsInfo(rt::Session& s) {
 // title says lands immediately instead of at the render loop's next 500ms tick
 // -- which never arrives at all if the app has stopped submitting frames.
 static void RefreshTitleNow(HWND hwnd) {
-    if (!hwnd || hwnd != rt::g_session.hwnd) return;
+    if (!hwnd || hwnd != rt::g_previewUi.hwnd.load()) return;
     ui::StatsInfo si = BuildStatsInfo(rt::g_session);
     ui::UpdateWindowTitle(hwnd, &si);
 }
@@ -1327,8 +1336,9 @@ static void RefreshPreviewGeometry(HWND hWnd) {
 // "Fill Window" gives the entire target; any other zoom is an absolute content scale
 // placed by the pan offset, which the target then clips.
 static FitRect ComputePresentRect(int dstW, int dstH) {
-    RefreshPreviewGeometry(dstW, dstH);
-    const ui::PreviewRect r = ui::ComputePreviewRect();
+    int contentW = 0, contentH = 0;
+    ComputeDisplayDims(contentW, contentH);
+    const ui::PreviewRect r = ui::ComputePreviewRect(ui::PreviewGeometry{ dstW, dstH, contentW, contentH });
     return FitRect{ r.x, r.y, r.w, r.h };
 }
 
@@ -1782,16 +1792,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 int deltaX = currentPos.x - rt::g_lastMousePos.x;
                 int deltaY = currentPos.y - rt::g_lastMousePos.y;
                 
-                // Update yaw and pitch (with sensitivity)
-                const float sensitivity = 0.002f;
-                rt::g_headYaw -= deltaX * sensitivity;
-                rt::g_headPitch -= deltaY * sensitivity;  // Inverted for natural feel
-                
-                // Clamp pitch to avoid gimbal lock
-                const float maxPitch = 1.5f;  // ~85 degrees
-                if (rt::g_headPitch > maxPitch) rt::g_headPitch = maxPitch;
-                if (rt::g_headPitch < -maxPitch) rt::g_headPitch = -maxPitch;
-                
+                rt::g_lookDeltaX.fetch_add(deltaX);
+                rt::g_lookDeltaY.fetch_add(deltaY);
+
                 // Reset cursor to center of window to avoid hitting screen edges
                 RECT rect;
                 GetWindowRect(hWnd, &rect);
@@ -1807,10 +1810,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // geometry to be current even if no frame has been presented since a resize.
             rt::RefreshPreviewGeometry(hWnd);
             if (ui::HandleMenuCommand(hWnd, wParam,
-                []() { rt::ResizeWindowForContent(rt::g_session.hwnd); },
+                [hWnd]() { rt::ResizeWindowForContent(hWnd); },
                 []() { mcp::g_screenshotRequested = true; },
                 []() {
-                    rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0;
+                    rt::g_resetPoseRequested.store(true);
                     ui::SetFitToWindow();
                     ui::SaveSettings();
                 },
@@ -1829,10 +1832,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (!rt::g_mouseCapture) {
                 rt::RefreshPreviewGeometry(hWnd);
                 if (ui::HandleKeyboardShortcut(hWnd, wParam,
-                    []() { rt::ResizeWindowForContent(rt::g_session.hwnd); },
+                    [hWnd]() { rt::ResizeWindowForContent(hWnd); },
                     []() { mcp::g_screenshotRequested = true; },
                     []() {
-                        rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0;
+                        rt::g_resetPoseRequested.store(true);
                         ui::SetFitToWindow();
                         ui::SaveSettings();
                     },
@@ -3003,10 +3006,14 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
         }
         // DestroyWindow only works from the owning thread. Join before returning: the loader
         // may unload us immediately, and a WndProc left in freed code takes the host down.
-        if (const DWORD uiTid = rt::g_previewUi.threadId.load()) {
-            PostThreadMessageW(uiTid, WM_QUIT, 0, 0);
-        }
         if (rt::g_previewUi.thread.joinable()) {
+            // A thread has no message queue until its first message call, and a WM_QUIT
+            // posted before then is discarded -- which would leave the join below waiting
+            // forever. finished means CreateWindowExW has run, one way or the other.
+            for (int i = 0; i < 2000 && !rt::g_previewUi.finished.load(); ++i) Sleep(1);
+            if (const DWORD uiTid = rt::g_previewUi.threadId.load()) {
+                PostThreadMessageW(uiTid, WM_QUIT, 0, 0);
+            }
             rt::g_previewUi.thread.join();
             Log("[SimXR] xrDestroyInstance: Preview UI thread joined");
         }
@@ -4149,7 +4156,8 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
         }
     }
 
-    // Message pump so the preview window stays responsive
+    // Not the preview window -- that has its own thread. This drains whatever host windows
+    // happen to live on the render thread, which the runtime has always done from here.
     PumpMessages(nullptr);
     static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
     static double periodSec = 1.0 / 90.0;
@@ -4162,6 +4170,15 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
     // the host, so the game's own window counts as ours. PreviewFocused was once the only
     // behaviour and left WASD dead in any game that takes the foreground on launch.
     // Note: a game binding W/S/A/D itself will also act on them while it is focused.
+    if (rt::g_resetPoseRequested.exchange(false)) {
+        rt::g_headPos = {0, 1.7f, 0};
+        rt::g_headYaw = rt::g_headPitch = rt::g_headRoll = 0.0f;
+    }
+    if (const int dx = rt::g_lookDeltaX.exchange(0)) rt::g_headYaw -= dx * 0.002f;
+    if (const int dy = rt::g_lookDeltaY.exchange(0)) rt::g_headPitch -= dy * 0.002f;
+    const float maxPitch = 1.5f;  // ~85 degrees, short of gimbal lock
+    rt::g_headPitch = (std::max)(-maxPitch, (std::min)(maxPitch, rt::g_headPitch));
+
     const ui::InputPolling inputPolling = ui::g_uiState.inputPolling;
     bool inputActive = (inputPolling == ui::InputPolling::Background);
     const HWND foregroundWindow = inputActive ? nullptr : GetForegroundWindow();

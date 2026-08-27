@@ -1254,26 +1254,34 @@ inline void ClampPan() {
     g_uiState.panY = (std::max)(-maxY, (std::min)(maxY, g_uiState.panY));
 }
 
-inline PreviewRect ComputePreviewRect() {
-    const PreviewGeometry& g = g_previewGeom;
+// Read-only, so the render path can lay out a frame off its own geometry rather than
+// through g_previewGeom, which the input handlers own.
+inline PreviewRect ComputePreviewRect(const PreviewGeometry& g) {
     if (g.contentW <= 0 || g.contentH <= 0 || g.clientW <= 0 || g.clientH <= 0) {
         return { 0.0f, 0.0f, (float)(std::max)(g.clientW, 1), (float)(std::max)(g.clientH, 1) };
     }
-
     if (g_uiState.fitToWindow) {
-        g_uiState.panX = g_uiState.panY = 0.0f;
         return { 0.0f, 0.0f, (float)g.clientW, (float)g.clientH };
-    } else {
-        ClampPan();
     }
 
     const float scale = EffectiveScale();
     PreviewRect r;
     r.w = (float)g.contentW * scale;
     r.h = (float)g.contentH * scale;
-    r.x = ((float)g.clientW - r.w) * 0.5f + g_uiState.panX;
-    r.y = ((float)g.clientH - r.h) * 0.5f + g_uiState.panY;
+    const float maxX = (std::max)(0.0f, (r.w - (float)g.clientW) * 0.5f);
+    const float maxY = (std::max)(0.0f, (r.h - (float)g.clientH) * 0.5f);
+    r.x = ((float)g.clientW - r.w) * 0.5f + (std::max)(-maxX, (std::min)(maxX, g_uiState.panX));
+    r.y = ((float)g.clientH - r.h) * 0.5f + (std::max)(-maxY, (std::min)(maxY, g_uiState.panY));
     return r;
+}
+
+inline PreviewRect ComputePreviewRect() {
+    const PreviewGeometry& g = g_previewGeom;
+    if (g.contentW > 0 && g.contentH > 0 && g.clientW > 0 && g.clientH > 0) {
+        if (g_uiState.fitToWindow) g_uiState.panX = g_uiState.panY = 0.0f;
+        else                       ClampPan();
+    }
+    return ComputePreviewRect(g);
 }
 
 // Move to an absolute scale, keeping whatever sits under (anchorX, anchorY) in the client
