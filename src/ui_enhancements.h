@@ -85,7 +85,11 @@ enum MenuCommand {
 
     // One id per kRenderResolutionPresets entry, in table order.
     ID_RENDER_RESOLUTION_FIRST = 1770,
-    ID_RENDER_RESOLUTION_LAST = 1799
+    ID_RENDER_RESOLUTION_LAST = 1799,
+
+    // One id per kInputPollingPresets entry, in table order.
+    ID_INPUT_POLLING_FIRST = 1800,
+    ID_INPUT_POLLING_LAST = 1809
 };
 
 // View mode enum
@@ -115,6 +119,13 @@ enum class HeadsetProfile {
     PSVR2,
     Pico4,
     BigscreenBeyond
+};
+
+// Values index kInputPollingPresets, so the two must stay in the same order.
+enum class InputPolling {
+    PreviewFocused,
+    AppForeground,
+    Background
 };
 
 // UI State
@@ -164,6 +175,9 @@ struct UIState {
     // buys anything above the rate a monitor shows. 0 freezes the mirror (the app still
     // runs normally); kPreviewRateEveryFrame follows the app.
     int previewFps = 90;
+
+    // What the polling gate in xrWaitFrame admits.
+    InputPolling inputPolling = InputPolling::AppForeground;
 };
 
 inline UIState g_uiState;
@@ -425,6 +439,33 @@ inline bool IsMoveBoostCommand(int cmd) {
 }
 
 // ---------------------------------------------------------------------------
+// Input polling
+// ---------------------------------------------------------------------------
+
+struct InputPollingPreset {
+    const char*    id;          // settings key
+    const wchar_t* menuLabel;
+};
+
+// Held keys come from GetAsyncKeyState, which ignores focus, so reach is entirely a matter
+// of which foreground window the gate accepts.
+inline constexpr InputPollingPreset kInputPollingPresets[] = {
+    { "preview",    L"&Preview Window Only" },
+    { "app",        L"Preview or &Application Window" },
+    { "background", L"&Background (poll while unfocused)" },
+};
+
+inline constexpr int kInputPollingPresetCount =
+    (int)(sizeof(kInputPollingPresets) / sizeof(kInputPollingPresets[0]));
+
+static_assert(kInputPollingPresetCount <= ID_INPUT_POLLING_LAST - ID_INPUT_POLLING_FIRST + 1,
+              "kInputPollingPresets outgrew the reserved menu id block");
+
+inline bool IsInputPollingCommand(int cmd) {
+    return cmd >= ID_INPUT_POLLING_FIRST && cmd < ID_INPUT_POLLING_FIRST + kInputPollingPresetCount;
+}
+
+// ---------------------------------------------------------------------------
 // Mirror rate
 // ---------------------------------------------------------------------------
 
@@ -547,6 +588,19 @@ inline HeadsetProfile HeadsetProfileFromName(const char* s, HeadsetProfile def) 
     return i < 0 ? def : (HeadsetProfile)i;
 }
 
+inline const char* InputPollingName(InputPolling p) {
+    int i = (int)p;
+    if (i < 0 || i >= kInputPollingPresetCount) i = (int)InputPolling::AppForeground;
+    return kInputPollingPresets[i].id;
+}
+
+inline InputPolling InputPollingFromName(const char* s, InputPolling def) {
+    for (int i = 0; i < kInputPollingPresetCount; ++i) {
+        if (strcmp(s, kInputPollingPresets[i].id) == 0) return (InputPolling)i;
+    }
+    return def;
+}
+
 // Empty until LoadSettings() runs, which makes every SaveSettings() before that
 // a no-op -- startup can't write defaults over a file it hasn't read yet.
 inline std::string g_settingsPath;
@@ -572,6 +626,7 @@ inline std::string SerializeSettings() {
         "  \"show_stats\": %s,\n"
         "  \"move_speed\": %.2f,\n"
         "  \"move_boost\": %.2f,\n"
+        "  \"input_polling\": \"%s\",\n"
         "  \"preview_fps\": %d\n"
         "}\n",
         ViewModeName(g_uiState.viewMode),
@@ -590,6 +645,7 @@ inline std::string SerializeSettings() {
         g_uiState.showStats ? "true" : "false",
         g_uiState.moveSpeed,
         g_uiState.moveBoost,
+        InputPollingName(g_uiState.inputPolling),
         g_uiState.previewFps);
     return buf;
 }
@@ -655,6 +711,9 @@ inline void ApplySettingsJson(const char* text) {
     SetMoveSpeed(o.number("move_speed", g_uiState.moveSpeed));
     g_uiState.moveBoost = (std::max)(1.0f, (std::min)(50.0f,
         o.number("move_boost", g_uiState.moveBoost)));
+
+    g_uiState.inputPolling = InputPollingFromName(
+        o.string("input_polling").c_str(), g_uiState.inputPolling);
 
     g_uiState.previewFps = (std::max)(0, (std::min)(kPreviewRateEveryFrame,
         (int)o.number("preview_fps", g_uiState.previewFps)));
@@ -956,6 +1015,13 @@ inline HMENU CreateAppMenu() {
 
     AppendMenuW(toolsMenu, MF_POPUP, (UINT_PTR)moveMenu, L"&Movement Speed");
 
+    HMENU inputMenu = CreatePopupMenu();
+    for (int i = 0; i < kInputPollingPresetCount; ++i) {
+        AppendMenuW(inputMenu, MF_STRING,
+                    ID_INPUT_POLLING_FIRST + i, kInputPollingPresets[i].menuLabel);
+    }
+    AppendMenuW(toolsMenu, MF_POPUP, (UINT_PTR)inputMenu, L"&Input Polling");
+
     HMENU rateMenu = CreatePopupMenu();
     for (int i = 0; i < kPreviewRatePresetCount; ++i) {
         AppendMenuW(rateMenu, MF_STRING, ID_PREVIEW_RATE_FIRST + i, kPreviewRatePresets[i].label);
@@ -1014,6 +1080,12 @@ inline void UpdateMenuState(HMENU menu) {
             (int)g_uiState.headsetProfile == i ? MF_CHECKED : MF_UNCHECKED);
     }
 
+    // Input polling checks
+    for (int i = 0; i < kInputPollingPresetCount; ++i) {
+        CheckMenuItem(menu, ID_INPUT_POLLING_FIRST + i,
+            (int)g_uiState.inputPolling == i ? MF_CHECKED : MF_UNCHECKED);
+    }
+
     // Mirror rate checks
     for (int i = 0; i < kPreviewRatePresetCount; ++i) {
         CheckMenuItem(menu, ID_PREVIEW_RATE_FIRST + i,
@@ -1068,7 +1140,8 @@ inline void ShowControlsDialog(HWND parent) {
         L"  Q/E - Up/Down\n"
         L"  Shift - Hold to move faster\n"
         L"  , / . - Slower/Faster\n"
-        L"  Tools \x2192 Movement Speed - Presets and Shift multiplier\n\n"
+        L"  Tools \x2192 Movement Speed - Presets and Shift multiplier\n"
+        L"  Tools \x2192 Input Polling - Whether keys work while unfocused\n\n"
         L"View Controls:\n"
         L"  B - Both eyes\n"
         L"  L - Left eye only\n"
@@ -1181,26 +1254,34 @@ inline void ClampPan() {
     g_uiState.panY = (std::max)(-maxY, (std::min)(maxY, g_uiState.panY));
 }
 
-inline PreviewRect ComputePreviewRect() {
-    const PreviewGeometry& g = g_previewGeom;
+// Read-only, so the render path can lay out a frame off its own geometry rather than
+// through g_previewGeom, which the input handlers own.
+inline PreviewRect ComputePreviewRect(const PreviewGeometry& g) {
     if (g.contentW <= 0 || g.contentH <= 0 || g.clientW <= 0 || g.clientH <= 0) {
         return { 0.0f, 0.0f, (float)(std::max)(g.clientW, 1), (float)(std::max)(g.clientH, 1) };
     }
-
     if (g_uiState.fitToWindow) {
-        g_uiState.panX = g_uiState.panY = 0.0f;
         return { 0.0f, 0.0f, (float)g.clientW, (float)g.clientH };
-    } else {
-        ClampPan();
     }
 
     const float scale = EffectiveScale();
     PreviewRect r;
     r.w = (float)g.contentW * scale;
     r.h = (float)g.contentH * scale;
-    r.x = ((float)g.clientW - r.w) * 0.5f + g_uiState.panX;
-    r.y = ((float)g.clientH - r.h) * 0.5f + g_uiState.panY;
+    const float maxX = (std::max)(0.0f, (r.w - (float)g.clientW) * 0.5f);
+    const float maxY = (std::max)(0.0f, (r.h - (float)g.clientH) * 0.5f);
+    r.x = ((float)g.clientW - r.w) * 0.5f + (std::max)(-maxX, (std::min)(maxX, g_uiState.panX));
+    r.y = ((float)g.clientH - r.h) * 0.5f + (std::max)(-maxY, (std::min)(maxY, g_uiState.panY));
     return r;
+}
+
+inline PreviewRect ComputePreviewRect() {
+    const PreviewGeometry& g = g_previewGeom;
+    if (g.contentW > 0 && g.contentH > 0 && g.clientW > 0 && g.clientH > 0) {
+        if (g_uiState.fitToWindow) g_uiState.panX = g_uiState.panY = 0.0f;
+        else                       ClampPan();
+    }
+    return ComputePreviewRect(g);
 }
 
 // Move to an absolute scale, keeping whatever sits under (anchorX, anchorY) in the client
@@ -1427,8 +1508,14 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
                 g_uiState.moveBoost = kMoveBoostPresets[cmd - ID_MOVE_BOOST_FIRST].factor;
                 break;
             }
+            if (IsInputPollingCommand(cmd)) {
+                g_uiState.inputPolling = (InputPolling)(cmd - ID_INPUT_POLLING_FIRST);
+                break;
+            }
             if (IsPreviewRateCommand(cmd)) {
                 g_uiState.previewFps = kPreviewRatePresets[cmd - ID_PREVIEW_RATE_FIRST].fps;
+                // The client area just changed hands between the frame path and WM_PAINT.
+                InvalidateRect(hwnd, nullptr, TRUE);
                 break;
             }
             if (IsRenderResolutionCommand(cmd)) {

@@ -186,6 +186,25 @@ WASD/QE move the head at 3 m/s by default, and holding **Shift** multiplies that
 by 4. Both numbers are set from **Tools → Movement Speed**: presets from 0.5 to
 10 m/s, `,` and `.` to step off them, and a submenu for the Shift multiplier.
 
+### Input Polling
+
+Head and controller keys are read with `GetAsyncKeyState`, which ignores window
+focus, so **Tools → Input Polling** sets how far they reach:
+
+- **Preview or Application Window** (default) — keys work while either the preview
+  or the OpenXR application's own window is in the foreground. The runtime is a DLL
+  inside that application, so both are recognised by process id, and alt-tabbing to
+  an unrelated program stops input.
+- **Preview Window Only** — only the simulator's own preview window. Useful when the
+  application binds the same keys, but note that games which take the foreground on
+  launch or run fullscreen will leave WASD doing nothing.
+- **Background (poll while unfocused)** — keys are read no matter which program is in
+  the foreground, so the head keeps moving while you work in another window. Anything
+  else you type is seen too, including WASD, arrows, Space and Tab.
+
+Mouse look is unaffected: it is driven by window messages and always needs a click on
+the preview window.
+
 ### Mirror Rate
 
 The preview window is a mirror of what the headset would show, and drawing it costs

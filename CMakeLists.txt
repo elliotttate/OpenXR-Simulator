@@ -56,6 +56,13 @@ if(BUILD_TESTING)
         target_compile_options(ui_resolution_tests PRIVATE /utf-8)
     endif()
     add_test(NAME ui_resolution COMMAND ui_resolution_tests)
+
+    add_executable(ui_input_polling_tests tests/ui_input_polling_tests.cpp)
+    target_include_directories(ui_input_polling_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    if(MSVC)
+        target_compile_options(ui_input_polling_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME ui_input_polling COMMAND ui_input_polling_tests)
 endif()
 
 # Link libraries
