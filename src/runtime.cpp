@@ -143,6 +143,16 @@ inline UINT D3D12CalcSubresource(UINT MipSlice, UINT ArraySlice, UINT PlaneSlice
     return MipSlice + ArraySlice * MipLevels + PlaneSlice * MipLevels * ArraySize;
 }
 
+// OPENXR_SIM_REFRESH_HZ=<30..500>: the refresh rate simulated (90 by default, also for
+// values outside that range).
+static double SimulatorRefreshHz() {
+    static const double hz = []() {
+        const char* value = getenv("OPENXR_SIM_REFRESH_HZ");
+        const double requested = value ? atof(value) : 90.0;
+        return requested >= 30.0 && requested <= 500.0 ? requested : 90.0;
+    }();
+    return hz;
+}
 
 // Debugger and file writes can block unpredictably even for one log per second.
 // Keep them on the bounded diagnostics worker; frame calls only publish memory.
@@ -4651,7 +4661,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     PumpMessages(nullptr);
     timing.Mark(2);
     static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
-    static double periodSec = 1.0 / 90.0;
+    static double periodSec = 1.0 / SimulatorRefreshHz();
     static long long periodNs = (long long)(periodSec * 1e9);
     static double nextTick = [](){ LARGE_INTEGER t; QueryPerformanceCounter(&t); return (double)t.QuadPart; }();
     
