@@ -16,6 +16,7 @@
 #include <atomic>
 
 #include "json.h"
+#include "ui_automation.h"
 
 namespace mcp {
 
@@ -38,6 +39,8 @@ inline void McpLogf(const char* fmt, ...) {
 inline const std::string& GetSimulatorDataPath() {
     static const std::string path = []() -> std::string {
         char base[MAX_PATH]{};
+        DWORD overrideLen = GetEnvironmentVariableA("SIMXR_DATA_DIR", base, (DWORD)sizeof(base));
+        if (overrideLen > 0 && overrideLen < sizeof(base)) return std::string(base);
         DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
         if (len > 0 && len < sizeof(base)) {
             return std::string(base) + "\\OpenXR-Simulator";
@@ -58,7 +61,7 @@ inline const std::string& GetSimulatorDataPath() {
 // defeating the point of watching. Only a name matching a command/request file counts.
 // The 500ms backstop covers what the watch cannot: an overflowed notification buffer,
 // and the handle going stale if the folder is deleted and recreated underneath us.
-inline bool g_commandsDue = true;   // poll once on the first frame to drain anything stale
+inline std::atomic_bool g_commandsDue{true};   // poll once on the first frame to drain anything stale
 
 inline bool IsCommandFileName(const wchar_t* name, size_t chars) {
     wchar_t lowered[96];
@@ -77,6 +80,7 @@ inline bool IsCommandFileName(const wchar_t* name, size_t chars) {
 }
 
 inline void RefreshCommandsDue() {
+    std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex);
     static HANDLE directory = INVALID_HANDLE_VALUE;
     static HANDLE event = nullptr;
     static OVERLAPPED overlapped = {};
@@ -139,9 +143,16 @@ inline std::string g_screenshotEye = "both";
 inline std::string g_screenshotLayer = "projection";  // "projection", "quad", or "all"
 inline std::atomic_uint64_t g_runtimeFrameCount{};
 inline uint64_t g_screenshotRequestFrame = 0;
+inline uint64_t g_screenshotAfterSync = 0;
+inline std::string g_captureId;
+
+inline std::string GetScreenshotPath() {
+    return GetSimulatorDataPath() + (g_captureId.empty() ? "\\screenshot.bmp" : "\\screenshot." + g_captureId + ".bmp");
+}
 
 inline void WriteScreenshotStatus(const char* layer, uint32_t width, uint32_t height,
-                                  uint64_t capturedFrame = 0) {
+                                  uint64_t capturedFrame = 0, const ui_auto::Frame* geometry = nullptr) {
+    std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex);
     std::string path = GetSimulatorDataPath() + "\\screenshot_status.json";
     std::string temporary = path + ".tmp";
     FILE* file = nullptr;
@@ -159,7 +170,18 @@ inline void WriteScreenshotStatus(const char* layer, uint32_t width, uint32_t he
     fprintf(file, "  \"layer\": \"%s\",\n", layer ? layer : "unknown");
     fprintf(file, "  \"eye\": \"%s\",\n", g_screenshotEye.c_str());
     fprintf(file, "  \"width\": %u,\n", width);
-    fprintf(file, "  \"height\": %u\n", height);
+    fprintf(file, "  \"height\": %u,\n", height);
+    fprintf(file, "  \"capture_id\": \"%s\"", g_captureId.c_str());
+    const auto& g = geometry ? *geometry : ui_auto::g_frame;
+    ui_auto::WriteGeometry(file, g);
+    if (!g_captureId.empty()) {
+        ui_auto::g_captures[g_captureId] = {g, GetTickCount64()};
+        for (auto it = ui_auto::g_captures.begin(); it != ui_auto::g_captures.end();) {
+            if (GetTickCount64()-it->second.savedAt > 30000) it=ui_auto::g_captures.erase(it);
+            else ++it;
+        }
+    }
+    fprintf(file, "\n");
     fprintf(file, "}\n");
     fclose(file);
     MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
@@ -186,6 +208,12 @@ inline void CheckScreenshotRequest() {
         g_screenshotRequestFrame = g_runtimeFrameCount.load(std::memory_order_acquire);
         g_screenshotEye = o.string("eye", "both");
         g_screenshotLayer = o.string("layer", "projection");
+        g_captureId = o.string("capture_id");
+        if (!g_captureId.empty() && !ui_auto::ValidId(g_captureId)) {
+            g_screenshotRequested = false;
+            g_captureId.clear();
+        }
+        g_screenshotAfterSync = (uint64_t)o.number("after_sync", 0.0);
 
         DeleteFileA(reqPath.c_str());
         McpLogf("Screenshot request detected: layer=%s, eye=%s", g_screenshotLayer.c_str(), g_screenshotEye.c_str());
@@ -325,7 +353,7 @@ inline void CaptureScreenshot(ID3D11Device* device, ID3D11DeviceContext* ctx,
         return;
     }
 
-    std::string outPath = GetSimulatorDataPath() + "\\screenshot.bmp";
+    std::string outPath = GetScreenshotPath();
     if (SaveTextureToBMP(device, ctx, backbuffer.Get(), outPath.c_str())) {
         D3D11_TEXTURE2D_DESC desc{};
         backbuffer->GetDesc(&desc);
@@ -446,7 +474,7 @@ inline void CaptureScreenshotGL(const uint8_t* leftPixels, const uint8_t* rightP
         memcpy(combined.data(), rightPixels, width * height * 4);
     }
 
-    std::string outPath = GetSimulatorDataPath() + "\\screenshot.bmp";
+    std::string outPath = GetScreenshotPath();
     SavePixelsToBMP(combined.data(), totalWidth, height, outPath.c_str());
     WriteScreenshotStatus(g_screenshotLayer.c_str(), totalWidth, height);
 

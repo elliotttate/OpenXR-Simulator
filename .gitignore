@@ -105,6 +105,7 @@ docs/_build/
 docs/.doctrees/
 
 # Python
+.venv/
 __pycache__/
 *.py[cod]
 *$py.class

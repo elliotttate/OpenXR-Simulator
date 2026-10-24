@@ -5,12 +5,17 @@ description = "MCP server for OpenXR Simulator - provides screenshot capture and
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
+    "Pillow>=10.0.0",
+    "numpy>=1.24.0",
 ]
 
 [project.scripts]
-openxr-simulator-mcp = "openxr_simulator_mcp:main"
+openxr-simulator-mcp = "openxr_simulator_mcp:run"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["openxr_simulator_mcp.py", "ui_targeting.py"]

@@ -80,7 +80,7 @@ if (-not (Test-Path $exe) -or (Get-Item $source).LastWriteTime -gt (Get-Item $ex
                 /link "/LIBPATH:$vcpkg\lib" "/LIBPATH:$vulkanSdk\Lib" openxr_loader.lib jsoncpp.lib vulkan-1.lib advapi32.lib ole32.lib pathcch.lib
         } else {
             & cl /nologo /std:c++17 /EHsc /MT "/I$vcpkg\include" "$probeName.cpp" /Fe:"$probeName.exe" `
-                /link "/LIBPATH:$vcpkg\lib" openxr_loader.lib jsoncpp.lib d3d12.lib dxgi.lib advapi32.lib ole32.lib pathcch.lib
+                /link "/LIBPATH:$vcpkg\lib" openxr_loader.lib jsoncpp.lib d3d12.lib d3dcompiler.lib dxgi.lib advapi32.lib ole32.lib pathcch.lib
         }
         if ($LASTEXITCODE -ne 0) { throw "cl failed ($LASTEXITCODE)" }
     } finally { Pop-Location }

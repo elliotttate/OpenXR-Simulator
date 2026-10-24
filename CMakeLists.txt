@@ -5,16 +5,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Output directories
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+set(SIMXR_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin" CACHE PATH "Runtime and test output directory")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${SIMXR_OUTPUT_DIRECTORY})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${SIMXR_OUTPUT_DIRECTORY})
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${SIMXR_OUTPUT_DIRECTORY})
 
 # For multi-config generators (Visual Studio)
 foreach(OUTPUTCONFIG ${CMAKE_CONFIGURATION_TYPES})
     string(TOUPPER ${OUTPUTCONFIG} OUTPUTCONFIG)
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_SOURCE_DIR}/bin)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_SOURCE_DIR}/bin)
-    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_SOURCE_DIR}/bin)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${SIMXR_OUTPUT_DIRECTORY})
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${SIMXR_OUTPUT_DIRECTORY})
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${SIMXR_OUTPUT_DIRECTORY})
 endforeach()
 
 # Include directories
@@ -46,6 +47,16 @@ add_library(openxr_simulator SHARED
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(xr_ui_probe probe/xr_probe.cpp)
+    target_compile_definitions(xr_ui_probe PRIVATE XR_PROBE_DIRECT_RUNTIME)
+    target_link_libraries(xr_ui_probe PRIVATE d3d12 dxgi d3dcompiler)
+    add_dependencies(xr_ui_probe openxr_simulator)
+    add_executable(xr_ui_desktop probe/xr_ui_desktop.cpp)
+    target_link_libraries(xr_ui_desktop PRIVATE d3d11 dxgi opengl32)
+    add_dependencies(xr_ui_desktop openxr_simulator)
+    add_executable(xr_ui_probe_vk probe/xr_probe_vk.cpp)
+    target_compile_definitions(xr_ui_probe_vk PRIVATE XR_PROBE_DIRECT_RUNTIME)
+    add_dependencies(xr_ui_probe_vk openxr_simulator)
     add_executable(projection_timing_tests tests/projection_timing_tests.cpp)
     target_include_directories(projection_timing_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME projection_timing COMMAND projection_timing_tests)
@@ -56,6 +67,34 @@ if(BUILD_TESTING)
         target_compile_options(ui_resolution_tests PRIVATE /utf-8)
     endif()
     add_test(NAME ui_resolution COMMAND ui_resolution_tests)
+
+    option(SIMXR_ENABLE_UI_AUTOMATION_TESTS "Run real MCP screenshot/hover/click tests (requires Python dependencies)" OFF)
+    if(SIMXR_ENABLE_UI_AUTOMATION_TESTS)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+        add_test(NAME ui_targeting COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${CMAKE_SOURCE_DIR}/tests -p test_ui_targeting.py)
+        function(simxr_ui_test name target backend eye hand layout)
+            set(extra_args)
+            if(name STREQUAL "ui_e2e_d3d12")
+                list(APPEND extra_args --negative-tests)
+            endif()
+            add_test(NAME ${name} COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ui_automation_e2e.py
+                --probe $<TARGET_FILE:${target}> --backend ${backend} --eye ${eye} --hand ${hand} --layout ${layout}
+                --evidence ${CMAKE_BINARY_DIR}/ui-evidence ${extra_args})
+            set_tests_properties(${name} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        endfunction()
+        simxr_ui_test(ui_e2e_d3d12 xr_ui_probe d3d12 left right side_by_side)
+        simxr_ui_test(ui_e2e_over_under xr_ui_probe d3d12 right left over_under)
+        simxr_ui_test(ui_e2e_stereo xr_ui_probe d3d12 both right side_by_side)
+        simxr_ui_test(ui_e2e_d3d11 xr_ui_desktop d3d11 right left side_by_side)
+        simxr_ui_test(ui_e2e_opengl xr_ui_desktop opengl left right side_by_side)
+        simxr_ui_test(ui_e2e_vulkan xr_ui_probe_vk vulkan left right side_by_side)
+        add_test(NAME ui_e2e_world_eye COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ui_automation_e2e.py
+            --probe $<TARGET_FILE:xr_ui_probe> --ui-mode world --origin-mode eye --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
+        add_test(NAME ui_e2e_world_surface COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ui_automation_e2e.py
+            --probe $<TARGET_FILE:xr_ui_probe> --ui-mode world --origin-mode hand --hand left --eye right --layout over_under
+            --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
+        set_tests_properties(ui_e2e_world_eye ui_e2e_world_surface PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    endif()
 endif()
 
 # Link libraries
@@ -88,12 +127,13 @@ endif()
 set(RUNTIME_MANIFEST_CONTENT "{
     \"file_format_version\": \"1.0.0\",
     \"runtime\": {
-        \"library_path\": \"${CMAKE_SOURCE_DIR}/bin/openxr_simulator.dll\"
+        \"library_path\": \"${SIMXR_OUTPUT_DIRECTORY}/openxr_simulator.dll\"
     }
 }")
 
-file(WRITE ${CMAKE_SOURCE_DIR}/bin/openxr_simulator.json ${RUNTIME_MANIFEST_CONTENT})
+file(MAKE_DIRECTORY "${SIMXR_OUTPUT_DIRECTORY}")
+file(WRITE ${SIMXR_OUTPUT_DIRECTORY}/openxr_simulator.json ${RUNTIME_MANIFEST_CONTENT})
 
 # Installation
 install(TARGETS openxr_simulator DESTINATION bin)
-install(FILES ${CMAKE_SOURCE_DIR}/bin/openxr_simulator.json DESTINATION bin)
+install(FILES ${SIMXR_OUTPUT_DIRECTORY}/openxr_simulator.json DESTINATION bin)

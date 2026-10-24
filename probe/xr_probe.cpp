@@ -16,8 +16,19 @@
 
 #define XR_USE_GRAPHICS_API_D3D12
 #define XR_USE_PLATFORM_WIN32
+#ifdef XR_PROBE_DIRECT_RUNTIME
+#define XR_NO_PROTOTYPES
+#endif
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#ifndef XR_API_VERSION_1_0
+#define XR_API_VERSION_1_0 XR_MAKE_VERSION(1,0,0)
+#endif
+#ifdef XR_PROBE_DIRECT_RUNTIME
+#include "direct_runtime.h"
+#endif
+#include "ui_fixture.h"
+#include "world_ui_renderer.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -43,6 +54,13 @@ static XrInstance g_instance = XR_NULL_HANDLE;
 static XrPath P(const char* s) { XrPath p = XR_NULL_PATH; xrStringToPath(g_instance, s, &p); return p; }
 
 int main() {
+#ifdef XR_PROBE_DIRECT_RUNTIME
+    if (!InitDirectRuntime()) return 1;
+#endif
+    const bool uiTest=EnvOn("XR_PROBE_UI_TEST");
+    const bool worldUi=uiTest && EnvOn("XR_PROBE_UI_WORLD");
+    const int uiHand=EnvOn("XR_PROBE_UI_LEFT") ? 0:1;
+    UiFixture fixture;
     step("xrEnumerateInstanceExtensionProperties");
     uint32_t extCount = 0;
     XRC(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr), "enumerate extension count");
@@ -135,6 +153,8 @@ int main() {
     D3D_FEATURE_LEVEL fl = gfxReq.minFeatureLevel ? gfxReq.minFeatureLevel : D3D_FEATURE_LEVEL_11_0;
     if (FAILED(D3D12CreateDevice(adapter.Get(), fl, IID_PPV_ARGS(&device)))) { printf("  [FAIL] D3D12CreateDevice\n"); return 1; }
     ok("D3D12CreateDevice at the runtime's minFeatureLevel");
+    WorldUiRenderer worldRenderer;
+    if (worldUi && !worldRenderer.Init(device.Get())) { printf("World UI pipeline failed\n"); return 1; }
     ComPtr<ID3D12CommandQueue> queue;
     D3D12_COMMAND_QUEUE_DESC qd = {}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue)))) { printf("  [FAIL] CreateCommandQueue\n"); return 1; }
@@ -212,7 +232,7 @@ int main() {
     mkAction(gameplaySet, "jump", "Jump", XR_ACTION_TYPE_BOOLEAN_INPUT, jump);
     mkAction(gameplaySet, "grab_interact", "Interact", XR_ACTION_TYPE_FLOAT_INPUT, grab);
     mkAction(gameplaySet, "rumble", "Rumble", XR_ACTION_TYPE_VIBRATION_OUTPUT, rumble);
-    mkAction(menuSet, "select", "Select", XR_ACTION_TYPE_BOOLEAN_INPUT, menuSelect);
+    mkAction(menuSet, uiTest ? "activate_widget":"select", "Select", XR_ACTION_TYPE_BOOLEAN_INPUT, menuSelect);
     if (!g_fail) ok("all action types accepted (incl. VIBRATION_OUTPUT)");
 
     step("xrSuggestInteractionProfileBindings");
@@ -228,6 +248,7 @@ int main() {
             { grab,     P("/user/hand/left/input/squeeze/value") },
             { rumble,   P("/user/hand/left/output/haptic") },
             { menuSelect, P("/user/hand/right/input/a/click") },
+            { menuSelect, P("/user/hand/left/input/x/click") },
         };
         XrInteractionProfileSuggestedBinding sb = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
         sb.interactionProfile = P("/interaction_profiles/oculus/touch_controller");
@@ -254,10 +275,16 @@ int main() {
         XRC(xrAttachSessionActionSets(session, &ai), "xrAttachSessionActionSets");
     }
     XrSpace handSpaces[2] = {};
+    XrSpace uiAimSpace=XR_NULL_HANDLE;
     for (int side = 0; side < 2; ++side) {
         XrActionSpaceCreateInfo aspci = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
         aspci.action = gripPose; aspci.subactionPath = handPaths[side]; aspci.poseInActionSpace = identity;
         XRC_SOFT(xrCreateActionSpace(session, &aspci, &handSpaces[side]), side == 0 ? "xrCreateActionSpace(left grip)" : "xrCreateActionSpace(right grip)");
+    }
+    if (uiTest) {
+        XrActionSpaceCreateInfo aim{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        aim.action=aimPose; aim.subactionPath=handPaths[uiHand]; aim.poseInActionSpace=identity;
+        XRC(xrCreateActionSpace(session,&aim,&uiAimSpace),"UI aim action space");
     }
     {
         XrInteractionProfileState ips = { XR_TYPE_INTERACTION_PROFILE_STATE };
@@ -392,6 +419,7 @@ int main() {
     bool sawPosVar = false, sawSaneFov = true;
     float firstYaw = 0.0f;
     for (int f = 0; f < totalFrames; ++f) {
+        if (uiTest && fixture.data && GetFileAttributesA((std::string(fixture.data)+"\\ui_probe_stop").c_str())!=INVALID_FILE_ATTRIBUTES) break;
         XrEventDataBuffer ev = { XR_TYPE_EVENT_DATA_BUFFER };
         while (xrPollEvent(g_instance, &ev) == XR_SUCCESS) {
             if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) state = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev)->state;
@@ -411,11 +439,12 @@ int main() {
         if (XR_FAILED(r)) { fail("xrBeginFrame", r); break; }
 
         // BetterVR syncs actions every frame while the session is up.
-        XrActiveActionSet aas = { gameplaySet, XR_NULL_PATH };
+        XrActiveActionSet aas[2] = {{ gameplaySet, XR_NULL_PATH }, { menuSet, XR_NULL_PATH }};
         XrActionsSyncInfo asi = { XR_TYPE_ACTIONS_SYNC_INFO };
-        asi.countActiveActionSets = 1; asi.activeActionSets = &aas;
+        asi.countActiveActionSets = uiTest ? 2:1; asi.activeActionSets = aas;
         r = xrSyncActions(session, &asi);
         if (XR_FAILED(r) && r != XR_SESSION_NOT_FOCUSED) { fail("xrSyncActions", r); break; }
+        if (uiTest) fixture.Update(session,uiAimSpace,stageSpace,fs.predictedDisplayTime,menuSelect,handPaths[uiHand],aimPose);
 
         XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
         gi.action = gripPose; gi.subactionPath = handPaths[0];
@@ -502,10 +531,13 @@ int main() {
                 const D3D12_RECT rect = { viewRect.offset.x, viewRect.offset.y,
                                           viewRect.offset.x + viewRect.extent.width,
                                           viewRect.offset.y + viewRect.extent.height };
-                if (eye >= 0) {
+                if (uiTest && eye < 0) {
+                    fixture.Draw(cmdList.Get(),h,viewRect);
+                } else if (eye >= 0) {
                     const float clear[4] = { 0.1f, 0.2f, 0.4f, 1.0f };
                     cmdList->ClearRenderTargetView(h, clear, 1, &rect);
 
+                    if (worldUi) worldRenderer.Draw(cmdList.Get(),h,viewRect,views[eye],fixture);
                     // A flat clear is indistinguishable between the eyes, so a stereo
                     // checker can only ever report "no parallax" on it. Mark each eye
                     // with the same square at a 20px horizontal offset: real, known
@@ -514,7 +546,7 @@ int main() {
                     const LONG cx = rect.left + viewRect.extent.width / 2 + (eye == 0 ? 10 : -10);
                     const LONG cy = rect.top + viewRect.extent.height / 2;
                     D3D12_RECT square = { cx - 100, cy - 100, cx + 100, cy + 100 };
-                    cmdList->ClearRenderTargetView(h, mark, 1, &square);
+                    if (!worldUi) cmdList->ClearRenderTargetView(h, mark, 1, &square);
                 } else {
                     // The quad (2D) layer, in a colour nothing else uses: it is the only
                     // way to see, in the preview window, whether the overlay survives the
@@ -560,7 +592,7 @@ int main() {
         // Alternate in blocks rather than splitting the run in half, so a long run does not
         // make an observer wait out thousands of quad-only frames to see the mixed case.
         const int phaseLen = (totalFrames > 200) ? 100 : (totalFrames / 2);
-        const bool quadOnly = !projectionOnly && ((phaseLen <= 0) || ((f / phaseLen) % 2) == 0);
+        const bool quadOnly = !worldUi && (uiTest || (!projectionOnly && ((phaseLen <= 0) || ((f / phaseLen) % 2) == 0)));
         if (quadOnly) quadOnlyFrames++;
 
         bool cycled = cycle(quadChain, false);
@@ -609,6 +641,7 @@ int main() {
         quad.pose.position.y = eyeY;
         quad.pose.position.z = -2.0f;
         quad.size = { 1.6f, 0.9f };
+        if (uiTest) { quad.pose=fixture.pose; quad.size=fixture.size; }
 
         // A runtime that places quads by a screen-space bounding box draws this yawed quad as
         // an axis-aligned rectangle; one that projects the corners draws a trapezoid, and a
@@ -635,10 +668,12 @@ int main() {
         const XrCompositionLayerBaseHeader* layers[5];
         uint32_t layerCount = 0;
         if (!quadOnly) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj);
-        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
-        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&angled);
-        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&rightOnly);
-        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlap);
+        if (!worldUi) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
+        if (!uiTest) {
+            layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&angled);
+            layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&rightOnly);
+            layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlap);
+        }
 
         XrFrameEndInfo fei = { XR_TYPE_FRAME_END_INFO };
         fei.displayTime = fs.predictedDisplayTime;
@@ -647,6 +682,7 @@ int main() {
         fei.layers = const_cast<const XrCompositionLayerBaseHeader**>(layers);
         r = xrEndFrame(session, &fei);
         if (XR_FAILED(r)) { fail("xrEndFrame", r); break; }
+        if (uiTest) fixture.Write(f);
         framesRendered++;
         if (sleepMs > 0) Sleep((DWORD)sleepMs);
     }
@@ -660,6 +696,7 @@ int main() {
     }
     if (focusedFrames == 0) warn("session never reached FOCUSED - BetterVR gates its input handling on that");
     if (!sawSaneFov) { printf("  [FAIL] nonsensical FOV angles (left>=right or down>=up)\n"); g_fail++; }
+    if (uiTest && fixture.syncErrors) { printf("  [FAIL] %d UI action snapshot/edge errors\n",fixture.syncErrors); ++g_fail; }
 
     step("D3D12 validation messages");
     if (infoQueue) {

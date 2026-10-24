@@ -23,6 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from ui_targeting import UiAutomation, annotate_target
 
 # MCP SDK imports
 try:
@@ -35,30 +36,18 @@ try:
         EmbeddedResource,
     )
 except ImportError:
-    print("Error: MCP SDK not installed. Run: pip install mcp", file=sys.stderr)
+    print("Error: MCP SDK not installed. Run: pip install -r mcp-server/requirements.txt", file=sys.stderr)
     sys.exit(1)
 
 
 # Configuration
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
-SIMULATOR_DIR = Path(LOCALAPPDATA) / "OpenXR-Simulator"
+SIMULATOR_DIR = Path(os.environ.get("SIMXR_DATA_DIR") or Path(LOCALAPPDATA) / "OpenXR-Simulator")
+ui_automation = UiAutomation(SIMULATOR_DIR)
 # The runtime writes one log per process, openxr_simulator.<pid>.log, so there is no
 # single fixed log path -- resolve the newest match instead. Older builds wrote a
 # plain openxr_simulator.log; the glob covers both.
 LOG_GLOB = "openxr_simulator*.log"
-SCREENSHOT_REQUEST_FILE = SIMULATOR_DIR / "screenshot_request.json"
-# Runtime may write any of these formats — we'll pick whichever shows up most recently after the request.
-SCREENSHOT_OUTPUT_CANDIDATES = (
-    SIMULATOR_DIR / "screenshot.png",
-    SIMULATOR_DIR / "screenshot.bmp",
-    SIMULATOR_DIR / "screenshot.jpg",
-    SIMULATOR_DIR / "screenshot.jpeg",
-)
-# Max width in pixels for the returned JPEG. The runtime renders at full stereo resolution
-# (often 2560+ wide), which makes the base64 payload too big for the API. 1280 keeps the
-# image readable while staying small.
-SCREENSHOT_MAX_WIDTH = 1280
-SCREENSHOT_JPEG_QUALITY = 70
 # Width the stereo disparity search downscales to before matching. The search is
 # O(shifts x pixels), so running it at full preview resolution overruns the MCP timeout.
 STEREO_ANALYSIS_MAX_WIDTH = 1280
@@ -247,94 +236,6 @@ def parse_log_for_diagnostics() -> dict[str, Any]:
         diagnostics["parse_error"] = str(e)
 
     return diagnostics
-
-
-def request_screenshot(eye: str = "both", include_ui: bool = True) -> dict[str, Any]:
-    """
-    Request a screenshot from the runtime.
-
-    The runtime watches for the screenshot_request.json file and captures
-    the frame when it sees it.
-    """
-    ensure_simulator_dir()
-
-    request = {
-        "timestamp": time.time(),
-        "eye": eye,  # "left", "right", or "both"
-        "include_ui": include_ui,
-        "requested_by": "mcp"
-    }
-
-    try:
-        # Write the request
-        with open(SCREENSHOT_REQUEST_FILE, "w") as f:
-            json.dump(request, f)
-
-        return {"status": "requested", "request": request}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
-
-
-def wait_for_screenshot(timeout: float = 5.0, request_time: float = 0.0) -> Optional[bytes]:
-    """Wait for a screenshot file to be created and return its raw bytes.
-
-    Accepts any of the candidate formats. Skips files written before request_time
-    so we don't return a stale capture from a previous run.
-    """
-    start_time = time.time()
-
-    while time.time() - start_time < timeout:
-        for path in SCREENSHOT_OUTPUT_CANDIDATES:
-            if not path.exists():
-                continue
-            try:
-                # Skip stale files (written before this request)
-                if request_time and path.stat().st_mtime < request_time - 0.5:
-                    continue
-                with open(path, "rb") as f:
-                    data = f.read()
-                # Clean up — remove all candidate files plus the request marker
-                for p in SCREENSHOT_OUTPUT_CANDIDATES:
-                    p.unlink(missing_ok=True)
-                SCREENSHOT_REQUEST_FILE.unlink(missing_ok=True)
-                return data
-            except Exception:
-                pass
-        time.sleep(0.1)
-
-    return None
-
-
-def to_jpeg(image_bytes: bytes, max_width: int = SCREENSHOT_MAX_WIDTH,
-            quality: int = SCREENSHOT_JPEG_QUALITY, eye: str = "both") -> bytes:
-    """Decode an image (PNG/BMP/JPEG) and re-encode as a downscaled JPEG.
-
-    Forces JPEG output because the Anthropic API rejects some PNG/BMP payloads
-    from this MCP, and JPEG keeps the base64 payload small enough to ship reliably.
-    """
-    from io import BytesIO
-    from PIL import Image
-
-    img = Image.open(BytesIO(image_bytes))
-    # JPEG can't store alpha — convert RGBA/P/etc. to RGB
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    # The D3D12 simulator capture path currently returns the full preview render
-    # target regardless of the request's eye field. When the preview is SBS, crop
-    # here so MCP callers still get the requested eye directly.
-    eye = (eye or "both").lower()
-    if eye in ("left", "right") and img.width >= img.height * 2:
-        half = img.width // 2
-        if eye == "left":
-            img = img.crop((0, 0, half, img.height))
-        else:
-            img = img.crop((half, 0, img.width, img.height))
-    if img.width > max_width:
-        new_h = int(img.height * (max_width / img.width))
-        img = img.resize((max_width, new_h), Image.LANCZOS)
-    out = BytesIO()
-    img.save(out, format="JPEG", quality=quality, optimize=True)
-    return out.getvalue()
 
 
 def read_status_file() -> Optional[dict[str, Any]]:
@@ -605,29 +506,63 @@ def _validate_stereo_from_screenshot(image_bytes: bytes) -> dict[str, Any]:
     }
 
 
+def ui_interaction_tools() -> list[Tool]:
+    surface = {"type": "object", "properties": {
+        "pose": {"type": "object", "properties": {
+            "position": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+            "orientation": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}},
+            "required": ["position", "orientation"]},
+        "size": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}},
+        "required": ["pose", "size"]}
+    common = {
+        "capture_id": {"type": "string", "description": "ID from a screenshot in this MCP session, valid for 30 seconds"},
+        "x": {"type": "number", "description": "Pixel x in the returned image, top-left origin"},
+        "y": {"type": "number", "description": "Pixel y in the returned image, top-left origin"},
+        "hand": {"type": "string", "enum": ["left", "right"], "default": "right"},
+        "origin_mode": {"type": "string", "enum": ["hand", "eye"], "default": "hand",
+                        "description": "hand requires a quad or explicit surface; eye uses the captured view ray"},
+        "surface_id": {"type": "integer", "description": "Optional quad ID from screenshot geometry"},
+        "surface": surface,
+        "dwell_frames": {"type": "integer", "minimum": 1, "maximum": 90, "default": 2},
+        "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 30, "default": 5},
+        "command_id": {"type": "string", "description": "Optional alphanumeric idempotency key; reuse for retries"}}
+    return [
+        Tool(name="hover_ui_at", description="Aim an XR controller at an exact screenshot pixel and hold hover. Returns delivery evidence and a fresh screenshot. Hover expires after 10 seconds or on release/focus loss.",
+             inputSchema={"type": "object", "properties": common, "required": ["capture_id", "x", "y"], "additionalProperties": False}),
+        Tool(name="click_ui_at", description="Aim at a screenshot pixel, dwell, press once, release, and capture the result. Application feedback confirms activation; delivery alone does not.",
+             inputSchema={"type": "object", "properties": {**common,
+                 "button": {"type": "string", "enum": ["trigger", "select", "primary", "menu"], "default": "trigger"},
+                 "hold_frames": {"type": "integer", "minimum": 1, "maximum": 90, "default": 2}},
+                 "required": ["capture_id", "x", "y"], "additionalProperties": False}),
+        Tool(name="release_ui_pointer", description="Release all injected buttons and return this controller to normal input.",
+             inputSchema={"type": "object", "properties": {k: common[k] for k in ("capture_id", "hand", "timeout", "command_id")},
+                          "required": ["capture_id"], "additionalProperties": False})]
+
+
 # Define MCP tools
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available tools."""
-    return [
+    return ui_interaction_tools() + [
         Tool(
             name="capture_screenshot",
             description="Capture a screenshot of the current OpenXR frame being rendered. "
-                       "Returns the stereo view (left and right eye) as displayed in the preview window.",
+                       "Returns a composed eye image and capture_id for hover_ui_at/click_ui_at. Coordinates use the returned image, with a top-left origin.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "eye": {
                         "type": "string",
                         "enum": ["both", "left", "right"],
-                        "default": "both",
+                        "default": "left",
                         "description": "Which eye view to capture"
                     },
                     "timeout": {
                         "type": "number",
                         "default": 5.0,
                         "description": "Timeout in seconds to wait for screenshot"
-                    }
+                    },
+                    "max_width": {"type": "integer", "minimum": 128, "maximum": 4096, "default": 1280}
                 }
             }
         ),
@@ -923,58 +858,31 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
 
+    if name in ("hover_ui_at", "click_ui_at", "release_ui_pointer"):
+        action = {"hover_ui_at": "hover", "click_ui_at": "click", "release_ui_pointer": "release"}[name]
+        try:
+            async with ui_automation.lock:
+                result, pixels = await ui_automation.interact(action, **arguments)
+            content = [TextContent(type="text", text=json.dumps(result, indent=2)),
+                       ImageContent(type="image", data=base64.b64encode(pixels).decode(), mimeType="image/jpeg")]
+            reference = ui_automation.images.get(arguments["capture_id"])
+            if action != "release" and reference:
+                content += [TextContent(type="text", text="Requested target on the original capture (red marker; the preceding image is the fresh application result)."),
+                            ImageContent(type="image", data=base64.b64encode(annotate_target(reference, arguments["x"], arguments["y"])).decode(), mimeType="image/jpeg")]
+            return content
+        except (ValueError, TimeoutError, OSError) as error:
+            return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(error)}))]
+
     if name == "capture_screenshot":
-        eye = arguments.get("eye", "both")
-        timeout = arguments.get("timeout", 5.0)
+        try:
+            async with ui_automation.lock:
+                result, pixels = await ui_automation.capture(arguments.get("eye", "left"), arguments.get("timeout", 5.0), max_width=arguments.get("max_width", 1280))
+            return [TextContent(type="text", text=json.dumps(result, indent=2)),
+                    ImageContent(type="image", data=base64.b64encode(pixels).decode(), mimeType="image/jpeg")]
+        except (ValueError, TimeoutError, OSError) as error:
+            return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(error)}))]
 
-        # Pre-clean any stale captures so wait_for_screenshot doesn't latch onto an old file
-        for p in SCREENSHOT_OUTPUT_CANDIDATES:
-            p.unlink(missing_ok=True)
-
-        request_time = time.time()
-        result = request_screenshot(eye=eye)
-        if result["status"] == "error":
-            return [TextContent(
-                type="text",
-                text=f"Failed to request screenshot: {result['error']}"
-            )]
-
-        screenshot_data = wait_for_screenshot(timeout=timeout, request_time=request_time)
-
-        if screenshot_data:
-            try:
-                jpeg_data = to_jpeg(screenshot_data, eye=eye)
-            except Exception as e:
-                return [TextContent(
-                    type="text",
-                    text=(f"Captured {len(screenshot_data)} bytes but failed to convert to JPEG: {e}. "
-                          "Ensure Pillow is installed in the MCP environment.")
-                )]
-            b64_data = base64.standard_b64encode(jpeg_data).decode("utf-8")
-            return [
-                TextContent(
-                    type="text",
-                    text=(f"Screenshot captured ({len(screenshot_data)} bytes raw -> "
-                          f"{len(jpeg_data)} bytes JPEG @ q{SCREENSHOT_JPEG_QUALITY}, "
-                          f"max width {SCREENSHOT_MAX_WIDTH}px, eye={eye})")
-                ),
-                ImageContent(
-                    type="image",
-                    data=b64_data,
-                    mimeType="image/jpeg"
-                )
-            ]
-        else:
-            return [TextContent(
-                type="text",
-                text="Screenshot timeout. The OpenXR Simulator runtime may not be running, "
-                     "or no application is actively rendering frames. Make sure:\n"
-                     "1. An OpenXR application is running\n"
-                     "2. The OpenXR Simulator is set as the active runtime\n"
-                     "3. The application is submitting frames"
-            )]
-
-    elif name == "get_frame_info":
+    if name == "get_frame_info":
         info = get_frame_info()
         return [TextContent(
             type="text",
@@ -1411,15 +1319,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
     elif name == "validate_stereo":
         timeout = float(arguments.get("timeout", 5.0))
-        # Pre-clean stale screenshots so we don't validate an old frame.
-        for p in SCREENSHOT_OUTPUT_CANDIDATES:
-            p.unlink(missing_ok=True)
-        request_time = time.time()
-        request_screenshot(eye="both")
-        screenshot_data = wait_for_screenshot(timeout=timeout, request_time=request_time)
-        if not screenshot_data:
-            return [TextContent(type="text",
-                text="Screenshot timeout — can't validate stereo without a current frame.")]
+        try:
+            async with ui_automation.lock:
+                _, screenshot_data = await ui_automation.capture("both", timeout)
+        except (ValueError, TimeoutError, OSError) as error:
+            return [TextContent(type="text", text=f"Stereo capture failed: {error}")]
         result = _validate_stereo_from_screenshot(screenshot_data)
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
@@ -1440,5 +1344,9 @@ async def main():
         )
 
 
-if __name__ == "__main__":
+def run():
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()

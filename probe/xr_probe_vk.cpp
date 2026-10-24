@@ -20,12 +20,25 @@
 #include <array>
 
 #define VK_USE_PLATFORM_WIN32_KHR
+#ifdef XR_PROBE_DIRECT_RUNTIME
+#define VK_NO_PROTOTYPES
+#define XR_NO_PROTOTYPES
+#endif
 #include <vulkan/vulkan.h>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #define XR_USE_PLATFORM_WIN32
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#ifndef XR_API_VERSION_1_0
+#define XR_API_VERSION_1_0 XR_MAKE_VERSION(1,0,0)
+#endif
+#ifdef XR_PROBE_DIRECT_RUNTIME
+#include "direct_runtime.h"
+#include "direct_vulkan.h"
+#endif
+#include <d3d12.h>
+#include "ui_fixture.h"
 
 static int g_fail = 0;
 static int g_warn = 0;
@@ -112,6 +125,12 @@ struct Chain {
 };
 
 int main() {
+#ifdef XR_PROBE_DIRECT_RUNTIME
+    if (!InitDirectRuntime() || !InitDirectVulkan()) return 1;
+#endif
+    const bool uiTest=EnvOn("XR_PROBE_UI_TEST");
+    const int uiHand=EnvOn("XR_PROBE_UI_LEFT") ? 0:1;
+    UiFixture fixture;
     // Unbuffered: a probe that stalls has to have already told you how far it got.
     setvbuf(stdout, nullptr, _IONBF, 0);
     const bool enable1 = EnvOn("XR_PROBE_VK_ENABLE1");
@@ -246,7 +265,7 @@ int main() {
         if (!XrFn("xrCreateVulkanInstanceKHR", pfn)) return 1;
         XrVulkanInstanceCreateInfoKHR ci{ XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR };
         ci.systemId = systemId;
-        ci.pfnGetInstanceProcAddr = &vkGetInstanceProcAddr;
+        ci.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
         ci.vulkanCreateInfo = &vkici;
         VkResult vr = VK_SUCCESS;
         XRC(pfn(g_instance, &ci, &vkInstance, &vr), "xrCreateVulkanInstanceKHR");
@@ -347,7 +366,7 @@ int main() {
         if (!XrFn("xrCreateVulkanDeviceKHR", pfn)) return 1;
         XrVulkanDeviceCreateInfoKHR ci{ XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR };
         ci.systemId = systemId;
-        ci.pfnGetInstanceProcAddr = &vkGetInstanceProcAddr;
+        ci.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
         ci.vulkanPhysicalDevice = physicalDevice;
         ci.vulkanCreateInfo = &dci;
         VkResult vr = VK_SUCCESS;
@@ -418,7 +437,7 @@ int main() {
     XrActionSetCreateInfo asci = { XR_TYPE_ACTION_SET_CREATE_INFO };
     strcpy_s(asci.actionSetName, "gameplay_fps"); strcpy_s(asci.localizedActionSetName, "Gameplay");
     XRC(xrCreateActionSet(g_instance, &asci, &gameplaySet), "xrCreateActionSet(gameplay_fps)");
-    XrAction gripPose{};
+    XrAction gripPose{},aimPose{},menuSelect{};
     {
         XrActionCreateInfo aci = { XR_TYPE_ACTION_CREATE_INFO };
         aci.actionType = XR_ACTION_TYPE_POSE_INPUT;
@@ -426,12 +445,22 @@ int main() {
         aci.countSubactionPaths = (uint32_t)handPaths.size();
         aci.subactionPaths = handPaths.data();
         XRC(xrCreateAction(gameplaySet, &aci, &gripPose), "xrCreateAction(pose)");
+        if (uiTest) {
+            strcpy_s(aci.actionName,"ray"); strcpy_s(aci.localizedActionName,"Ray");
+            XRC(xrCreateAction(gameplaySet,&aci,&aimPose),"UI aim action");
+            strcpy_s(aci.actionName,"activate_widget"); strcpy_s(aci.localizedActionName,"Activate"); aci.actionType=XR_ACTION_TYPE_BOOLEAN_INPUT;
+            XRC(xrCreateAction(gameplaySet,&aci,&menuSelect),"UI activation action");
+        }
     }
     {
         std::vector<XrActionSuggestedBinding> b = {
             { gripPose, P("/user/hand/left/input/grip/pose") },
             { gripPose, P("/user/hand/right/input/grip/pose") },
         };
+        if (uiTest) {
+            b.push_back({aimPose,P("/user/hand/left/input/aim/pose")}); b.push_back({aimPose,P("/user/hand/right/input/aim/pose")});
+            b.push_back({menuSelect,P("/user/hand/left/input/x/click")}); b.push_back({menuSelect,P("/user/hand/right/input/a/click")});
+        }
         XrInteractionProfileSuggestedBinding sb = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
         sb.interactionProfile = P("/interaction_profiles/oculus/touch_controller");
         sb.countSuggestedBindings = (uint32_t)b.size();
@@ -440,6 +469,12 @@ int main() {
         XrSessionActionSetsAttachInfo ai = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
         ai.countActionSets = 1; ai.actionSets = &gameplaySet;
         XRC(xrAttachSessionActionSets(session, &ai), "xrAttachSessionActionSets");
+    }
+
+    XrSpace uiAimSpace=XR_NULL_HANDLE;
+    if (uiTest) {
+        XrActionSpaceCreateInfo aim{XR_TYPE_ACTION_SPACE_CREATE_INFO}; aim.action=aimPose; aim.subactionPath=handPaths[uiHand]; aim.poseInActionSpace=identity;
+        XRC(xrCreateActionSpace(session,&aim,&uiAimSpace),"UI aim space");
     }
 
     // ---- swapchains --------------------------------------------------------------------
@@ -609,6 +644,7 @@ int main() {
     int framesRendered = 0, focusedFrames = 0, quadOnlyFrames = 0;
     bool sawSaneFov = true;
     for (int f = 0; f < totalFrames; ++f) {
+        if (uiTest && fixture.data && GetFileAttributesA((std::string(fixture.data)+"\\ui_probe_stop").c_str())!=INVALID_FILE_ATTRIBUTES) break;
         XrEventDataBuffer ev = { XR_TYPE_EVENT_DATA_BUFFER };
         while (xrPollEvent(g_instance, &ev) == XR_SUCCESS) {
             if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) state = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev)->state;
@@ -629,6 +665,7 @@ int main() {
         asi.countActiveActionSets = 1; asi.activeActionSets = &aas;
         r = xrSyncActions(session, &asi);
         if (XR_FAILED(r) && r != XR_SESSION_NOT_FOCUSED) { fail("xrSyncActions", r); break; }
+        if (uiTest) fixture.Update(session,uiAimSpace,stageSpace,fs.predictedDisplayTime,menuSelect,handPaths[uiHand],aimPose);
 
         XrViewLocateInfo vli = { XR_TYPE_VIEW_LOCATE_INFO };
         vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -691,7 +728,14 @@ int main() {
                     cr.layerCount = 1;
                     vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
                 };
-                if (eye >= 0) {
+                if (uiTest && eye<0) {
+                    const float bg[4]{.025f,.03f,.04f,1},idle[4]{.05f,.25f,.9f,1},hover[4]{.95f,.65f,.02f,1},done[4]{.05f,.8f,.15f,1};
+                    clearRect(bg,declared);
+                    VkRect2D button{{declared.offset.x+(int32_t)(declared.extent.width*.60f),declared.offset.y+(int32_t)(declared.extent.height*.35f)},
+                                    {(uint32_t)(declared.extent.width*.25f),(uint32_t)(declared.extent.height*.30f)}};
+                    clearRect(fixture.clicks ? done:fixture.hovered ? hover:idle,button);
+                    if (fixture.hoverFrames>=8) { const float tip[4]{.8f,.8f,.8f,1}; button.offset.y-=50; button.extent.height=30; clearRect(tip,button); }
+                } else if (eye >= 0) {
                     const float base[4] = { 0.1f, 0.2f, 0.4f, 1.0f };
                     if (subRect) clearRect(base, declared);
                     // Same square in both eyes, offset 20px horizontally: real, known
@@ -734,7 +778,7 @@ int main() {
         };
 
         const int phaseLen = (totalFrames > 200) ? 100 : (totalFrames / 2);
-        const bool quadOnly = !projectionOnly && ((phaseLen <= 0) || ((f / phaseLen) % 2) == 0);
+        const bool quadOnly = uiTest || (!projectionOnly && ((phaseLen <= 0) || ((f / phaseLen) % 2) == 0));
         if (quadOnly) quadOnlyFrames++;
 
         bool cycled = cycle(quadChain);
@@ -775,6 +819,7 @@ int main() {
         quad.pose.position.y = eyeY;
         quad.pose.position.z = -2.0f;
         quad.size = { 1.6f, 0.9f };
+        if (uiTest) { quad.pose=fixture.pose; quad.size=fixture.size; }
 
         // The same three extra quads xr_probe.cpp submits, so the two probes composite the
         // same scene and their preview output can be diffed pixel for pixel.
@@ -795,9 +840,11 @@ int main() {
         uint32_t layerCount = 0;
         if (!quadOnly) layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&proj);
         layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad);
-        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&angled);
-        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&rightOnly);
-        layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlap);
+        if (!uiTest) {
+            layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&angled);
+            layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&rightOnly);
+            layers[layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&overlap);
+        }
 
         XrFrameEndInfo fei = { XR_TYPE_FRAME_END_INFO };
         fei.displayTime = fs.predictedDisplayTime;
@@ -806,6 +853,7 @@ int main() {
         fei.layers = const_cast<const XrCompositionLayerBaseHeader**>(layers);
         r = xrEndFrame(session, &fei);
         if (XR_FAILED(r)) { fail("xrEndFrame", r); break; }
+        if (uiTest) fixture.Write(f);
         framesRendered++;
         if (sleepMs > 0) Sleep((DWORD)sleepMs);
     }

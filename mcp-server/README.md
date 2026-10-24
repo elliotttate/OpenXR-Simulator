@@ -10,6 +10,7 @@ A Model Context Protocol (MCP) server that provides tools for diagnosing OpenXR 
 - **Issue Diagnosis**: Automated analysis of common OpenXR problems
 - **Session Monitoring**: Track session state and head tracking
 - **UI Flicker Detection**: Inspect quad-layer continuity independently from world/projection motion
+- **Screenshot UI Targeting**: Hover and click with a simulated XR controller using coordinates in a captured image
 
 ## Installation
 
@@ -25,7 +26,7 @@ pip install -e .
 
 Or install dependencies directly:
 ```bash
-pip install mcp
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -57,8 +58,115 @@ Add to your Claude Code MCP settings (`~/.claude/claude_desktop_config.json`):
 Capture a screenshot of the current OpenXR frame.
 
 Parameters:
-- `eye`: Which eye view to capture ("both", "left", "right") - default: "both"
+- `eye`: Which eye view to capture ("both", "left", "right") - default: "left"
 - `timeout`: Timeout in seconds - default: 5.0
+- `max_width`: Maximum returned image width, 128–4096 - default: 1280
+
+Returns the composed image (including quad menus), `capture_id`, actual image
+dimensions, and frame-matched camera, viewport, crop, scale, and surface metadata.
+Coordinates refer to **the returned image**, with a top-left origin and pixel centres.
+Stereo layouts and eye crops are taken from compositor metadata, not image aspect guesses.
+
+### `hover_ui_at` / `click_ui_at` / `release_ui_pointer`
+
+Example tool calls, using the ID returned by the first call:
+
+```text
+capture_screenshot(eye="left")
+hover_ui_at(capture_id="...", x=475, y=313, hand="right", dwell_frames=10)
+click_ui_at(capture_id="...", x=475, y=313, hand="right", button="primary",
+            command_id="aUniqueAlphanumericRetryKey")
+release_ui_pointer(capture_id="...", hand="right")
+```
+
+`hover_ui_at` aims without pressing. `click_ui_at` dwells, presses once, releases,
+and waits for release to reach action synchronization before returning. Both
+return a fresh application image plus a separately marked reference image, the
+resolved ray/aim pose, and frame/sync acknowledgments. These results mean
+`input_delivered`; inspect the application's highlight, tooltip, changed menu,
+or application telemetry to confirm an actual UI activation.
+
+Common parameters:
+
+- `capture_id`, `x`, `y`: Target a pixel in a capture from this MCP session.
+- `hand`: `left` or `right` (default).
+- `origin_mode`: `hand` (default) intersects a known quad or an explicit scene
+  surface, then aims from the normal hand position. `eye` explicitly places the
+  controller aim origin at the captured eye and reproduces that view ray.
+- `surface_id`: Optional quad ID from the capture metadata, useful for overlapping menus.
+- `surface`: Optional application-provided scene UI rectangle in simulator world
+  coordinates: `{"pose":{"position":[x,y,z],"orientation":[qx,qy,qz,qw]},"size":[width,height]}`.
+  Units are metres; orientation must be a unit quaternion. The rectangle lies in
+  its local XY plane. Projection UI currently needs this explicit surface or
+  `origin_mode="eye"`; the runtime does not infer scene depth from image colour.
+- `dwell_frames`: 1–90 action-sync cycles before completion/press (default 2).
+- `timeout`: 0–30 seconds (default 5).
+- `command_id`: Optional alphanumeric retry key. Reusing a completed key in the
+  same runtime session returns its delivery result without sending another click.
+  Reusing it for a different target, button, or operation returns an error.
+
+Click adds `button` (`trigger`, `select`, `primary`, `menu`) and `hold_frames`
+(1–90 action-sync cycles, default 2). `primary` is A/X; `select` uses the
+trigger/select source. Choose the component the application actually binds.
+The runtime uses suggested interaction-profile bindings, including arbitrary
+application action names, and honors active action sets and subaction paths.
+
+Captures expire after 30 seconds, with the last 32 held by the MCP. Session,
+camera, FOV, viewport, and selected quad changes reject stale targets. Anaglyph
+stereo and an active pose sweep cannot be targeted unambiguously. Hover/input
+ownership lasts up to 10 seconds; a release, timeout cleanup, focus loss, or session
+end clears injected buttons. The application must synchronize its relevant aim
+and button actions for an interaction to complete. Moving/animated scene UI still
+requires a fresh capture or application-provided feedback.
+
+### End-to-end UI tests
+
+Install the requirements in a Python environment, then enable the optional CTest
+suite. This builds probes directly against the runtime DLL; no sibling checkout,
+installed OpenXR loader library, or machine-wide runtime registration is required.
+
+```powershell
+python -m pip install -r mcp-server/requirements.txt
+cmake -S . -B build-ui-automation `
+  -DSIMXR_OUTPUT_DIRECTORY="$PWD/bin/ui-automation" `
+  -DSIMXR_ENABLE_UI_AUTOMATION_TESTS=ON `
+  -DPython3_EXECUTABLE="C:/path/to/python.exe"
+cmake --build build-ui-automation --config Release
+ctest --test-dir build-ui-automation -C Release --output-on-failure
+```
+
+The tests launch a real XR app and the MCP over stdio, locate a blue button in a
+resized screenshot, hover until it turns yellow and shows a tooltip, click once,
+and verify its green result and application-side activation/press/release counters.
+The app's independent raycast is reprojected to verify error below one source
+pixel. Coverage includes D3D11, D3D12, OpenGL, Vulkan, both hands/eyes, both-eye
+captures, over-under layout, asymmetric FOV, angled quads, sub-image rectangles,
+idempotent retry, invalid coordinates, timeout cleanup, and stale camera rejection.
+Vulkan layout validation additionally requires the optional Khronos validation layer.
+
+Two additional tests render the menu plane directly into the stereo projection
+images and submit **no quad composition layer**. These verify world-space menu
+interaction using both the eye-origin ray and a hand-origin ray aimed at an
+explicit scene surface. This covers the distinction between a game's quad-layer
+overlay menus and its main menu rendered in the scene, such as the FlatOut 4
+cases identified for game-level validation. A real FlatOut 4 run still requires
+an accessible installation and its VR/OpenXR launch configuration.
+
+Each run uses its own `SIMXR_DATA_DIR` for IPC and settings, and saves before,
+hover, click, retry, and release JPEGs plus JSON evidence under
+`build-ui-automation/ui-evidence/`. You can also run one case directly:
+
+```powershell
+python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_probe.exe --negative-tests
+python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_desktop.exe --backend opengl
+python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_probe_vk.exe --backend vulkan
+python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_probe.exe --ui-mode world --origin-mode eye
+python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_probe.exe --ui-mode world --origin-mode hand
+```
+
+Fixture runs set `SIMXR_AUTOMATION_ONLY=1`: the preview does not take desktop
+focus, desktop keyboard shortcuts/movement are ignored, and synthetic XR focus
+is maintained. Leave this unset for normal interactive simulator use.
 
 ### `get_frame_info`
 Get detailed information about the current frame including timing, resolution, format, and head tracking state.
@@ -105,9 +213,16 @@ The MCP server uses the following files in `%LOCALAPPDATA%\OpenXR-Simulator\`:
 - `openxr_simulator.log` - Runtime log file
 - `screenshot.bmp` - Captured screenshots
 - `screenshot_request.json` - Screenshot request trigger
+- `screenshot.<capture_id>.bmp` / `screenshot_status.json` - Correlated pixels and frame metadata
+- `ui_pointer_command.json` / `ui_pointer_result.<command_id>.json` - Atomic interaction requests and delivery acknowledgments
 - `runtime_status.json` - Current frame status
 - `ui_flicker_status.json` - UI-only continuity and temporal status
 - `ui_flicker_incidents\` - UI-rectangle pre/post evidence packets
+
+Set `SIMXR_DATA_DIR` to the same directory in the app and MCP environments to
+isolate a test or multiple app processes. Do not share an IPC directory between
+independent runtime processes. Restart the MCP and launch the target app with the
+updated runtime DLL to use the new tools.
 
 ## How It Works
 
