@@ -94,6 +94,18 @@ if(BUILD_TESTING)
             --probe $<TARGET_FILE:xr_ui_probe> --ui-mode world --origin-mode hand --hand left --eye right --layout over_under
             --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
         set_tests_properties(ui_e2e_world_eye ui_e2e_world_surface PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        foreach(mode quad world_eye world_surface)
+            set(offset_args --app-ray-offset)
+            if(mode MATCHES "^world")
+                list(APPEND offset_args --ui-mode world)
+                if(mode STREQUAL "world_surface")
+                    list(APPEND offset_args --origin-mode hand)
+                endif()
+            endif()
+            add_test(NAME ui_e2e_offset_${mode} COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ui_automation_e2e.py
+                --probe $<TARGET_FILE:xr_ui_probe> ${offset_args} --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
+            set_tests_properties(ui_e2e_offset_${mode} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        endforeach()
     endif()
 endif()
 

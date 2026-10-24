@@ -523,6 +523,8 @@ def ui_interaction_tools() -> list[Tool]:
                         "description": "hand requires a quad or explicit surface; eye uses the captured view ray"},
         "surface_id": {"type": "integer", "description": "Optional quad ID from screenshot geometry"},
         "surface": surface,
+        "ray_offset": {**surface["properties"]["pose"], "additionalProperties": False,
+            "description": "Optional application ray calibration in XR world axes: app origin = aim position + position; app direction = orientation applied to aim direction. Metres, unit quaternion [x,y,z,w]. Omit for unmodified XR aim."},
         "dwell_frames": {"type": "integer", "minimum": 1, "maximum": 90, "default": 2},
         "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 30, "default": 5},
         "command_id": {"type": "string", "description": "Optional alphanumeric idempotency key; reuse for retries"}}

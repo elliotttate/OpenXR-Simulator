@@ -103,6 +103,8 @@ async def run(args):
            "XR_PROBE_UI_TEST": "1", "XR_PROBE_UI_LEFT": "1" if args.hand == "left" else "0",
            "XR_PROBE_FRAMES": "12000", "XR_PROBE_SLEEP_MS": "3", "XR_PROBE_SUBRECT": "1", "XR_UI_BACKEND": args.backend,
            "XR_PROBE_UI_WORLD": "1" if args.ui_mode == "world" else "0", "SIMXR_AUTOMATION_ONLY": "1"}
+    if args.app_ray_offset:
+        env["XR_PROBE_APP_RAY_OFFSET"] = "1"
     log = (directory/"probe.log").open("w")
     proc = subprocess.Popen([str(args.probe)], env=env, stdout=log, stderr=subprocess.STDOUT,
                             creationflags=subprocess.CREATE_NO_WINDOW)
@@ -128,6 +130,9 @@ async def run(args):
                 ys, xs = button_pixels(blue)
                 x, y = float(np.median(xs)), float(np.median(ys))
                 target = {"capture_id": before["capture_id"], "x": x, "y": y, "hand": args.hand}
+                if args.app_ray_offset:
+                    target["ray_offset"] = {"position": [.03, 0, 0],
+                        "orientation": [0, math.sin(math.radians(-2.5)), 0, math.cos(math.radians(-2.5))]}
                 if args.ui_mode == "world":
                     target["origin_mode"] = args.origin_mode
                     if args.origin_mode == "hand":
@@ -177,6 +182,7 @@ async def run(args):
                 (directory/"result.json").write_text(json.dumps({"passed": True, "pixel": [x, y], "eye": args.eye,
                     "hand": args.hand, "layout": args.layout, "backend": args.backend, "source_pixel_error": error,
                     "ui_mode": args.ui_mode, "origin_mode": target.get("origin_mode", "hand"),
+                    "app_ray_offset": args.app_ray_offset,
                     "negative_tests": args.negative_tests, "state": state, "target": hovered["target"]}, indent=2))
                 print(f"PASS: screenshot -> hover -> one click -> visible result; {args.ui_mode}/{args.hand}/{args.eye}/{args.layout}\nEvidence: {directory}")
     finally:
@@ -201,6 +207,7 @@ if __name__ == "__main__":
     parser.add_argument("--negative-tests", action="store_true")
     parser.add_argument("--ui-mode", choices=["quad", "world"], default="quad")
     parser.add_argument("--origin-mode", choices=["hand", "eye"], default="eye")
+    parser.add_argument("--app-ray-offset", action="store_true")
     args = parser.parse_args()
     args.probe = args.probe.resolve()
     asyncio.run(run(args))

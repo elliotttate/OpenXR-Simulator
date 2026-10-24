@@ -99,6 +99,13 @@ Common parameters:
   Units are metres; orientation must be a unit quaternion. The rectangle lies in
   its local XY plane. Projection UI currently needs this explicit surface or
   `origin_mode="eye"`; the runtime does not infer scene depth from image colour.
+- `ray_offset`: Optional correction for an application that modifies its XR aim
+  ray before hit-testing. Supply `{"position":[x,y,z],"orientation":[qx,qy,qz,qw]}`.
+  These are independent offsets in simulator world axes: the app adds the
+  translation to the controller origin and rotates its direction by the unit
+  quaternion. The MCP inverts those operations when aiming. Omit this for apps
+  that use the XR aim pose directly. Eye mode keeps the resulting application
+  ray at the captured eye; hand mode keeps the controller at its natural origin.
 - `dwell_frames`: 1–90 action-sync cycles before completion/press (default 2).
 - `timeout`: 0–30 seconds (default 5).
 - `command_id`: Optional alphanumeric retry key. Reusing a completed key in the
@@ -149,8 +156,36 @@ images and submit **no quad composition layer**. These verify world-space menu
 interaction using both the eye-origin ray and a hand-origin ray aimed at an
 explicit scene surface. This covers the distinction between a game's quad-layer
 overlay menus and its main menu rendered in the scene, such as the FlatOut 4
-cases identified for game-level validation. A real FlatOut 4 run still requires
-an accessible installation and its VR/OpenXR launch configuration.
+cases identified for game-level validation. Three more cases apply FlatOut's
+application-side ray offsets before the independent fixture hit-test, verifying
+the correction with subpixel accuracy for all three targeting modes.
+
+#### FlatOut 4 validation
+
+The Fox Release DLL build was tested on 2026-10-24 with the D3D11 simulator,
+asymmetric Quest 3 FOV, and a 640x720 left-eye screenshot. Hovering the scene's
+Options button selected item 5; one trigger press opened Options. The native
+quad-layer Quit dialog was tested by hovering No and clicking once: the game
+reported `msgbox.cancel`, one activation, and a closed dialog. Retrying the same
+command ID kept the activation count at one. The Options submenu itself uses
+a scene-rendered RTT plane in this Fox build, so the modal supplied the actual
+OpenXR quad-layer coverage.
+
+FlatOut's `VRMenuPointer::UpdateRay` applies an extra +0.03 m X translation and
+-5 degree Y rotation to the aim ray. An uncorrected aim missed the small No
+button. Use the following `ray_offset` for this build, on both hover and click:
+
+```json
+{"position":[0.03,0,0],"orientation":[0,-0.043619387365336,0,0.999048221581858]}
+```
+
+This is an explicit application calibration, not a simulator-wide default.
+The game expects a seated LOCAL origin; `set_head_pose(x=0,y=0,z=0)` brings its
+default quad HUD into view. Launch through Fox's documented `/launch-game`
+Release recipe with `XR_RUNTIME_JSON` pointing to this build's manifest and a
+shared, isolated `SIMXR_DATA_DIR` for the game and MCP. Use `origin_mode="eye"`
+for the main menu and hand mode with the captured `surface_id` for the native
+quad dialog. Fresh screenshots and application telemetry are still required.
 
 Each run uses its own `SIMXR_DATA_DIR` for IPC and settings, and saves before,
 hover, click, retry, and release JPEGs plus JSON evidence under
@@ -162,6 +197,7 @@ python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_desktop.exe --
 python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_probe_vk.exe --backend vulkan
 python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_probe.exe --ui-mode world --origin-mode eye
 python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_probe.exe --ui-mode world --origin-mode hand
+python tests/ui_automation_e2e.py --probe bin/ui-automation/xr_ui_probe.exe --app-ray-offset
 ```
 
 Fixture runs set `SIMXR_AUTOMATION_ONLY=1`: the preview does not take desktop

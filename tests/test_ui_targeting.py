@@ -101,6 +101,37 @@ class TargetingTests(unittest.TestCase):
         for direction in ([0, 0, 1], [0, 0, -1], [0, 1, 0]):
             self.assertEqual([round(x, 6) for x in rotate(aim_orientation(direction), [0, 0, -1])], direction)
 
+    def test_application_ray_offset_hits_quad_from_hand(self):
+        offset = {"position": [.03, 0, 0], "orientation": [0, math.sin(-.07), 0, math.cos(-.07)]}
+        c = capture()
+        result = resolve_target(c, 300, 210, ray_offset=offset)
+        pose = result["aim_pose"]
+        direction = rotate(offset["orientation"], rotate(pose["orientation"], [0, 0, -1]))
+        origin = [a+b for a, b in zip(pose["position"], offset["position"])]
+        hit = intersect_surface(origin, direction, c["geometry"]["surfaces"][0])
+        self.assertEqual(pose["position"], c["geometry"]["hands"][1])
+        for actual, expected in zip(hit, result["target_point"]):
+            self.assertAlmostEqual(actual, expected, places=6)
+
+    def test_application_ray_offset_preserves_world_view_ray(self):
+        c = capture()
+        c["geometry"]["surfaces"] = []
+        offset = {"position": [.03, .02, -.01], "orientation": [math.sin(.1), 0, 0, math.cos(.1)]}
+        result = resolve_target(c, 305, 115, origin_mode="eye", ray_offset=offset)
+        pose = result["aim_pose"]
+        direction = rotate(offset["orientation"], rotate(pose["orientation"], [0, 0, -1]))
+        for actual, expected in zip(direction, result["ray_direction"]):
+            self.assertAlmostEqual(actual, expected, places=6)
+        for a, b, expected in zip(pose["position"], offset["position"], result["ray_origin"]):
+            self.assertAlmostEqual(a+b, expected, places=6)
+
+    def test_invalid_application_ray_offsets(self):
+        for offset in ({}, {"position": [0, 0], "orientation": [0, 0, 0, 1]},
+                       {"position": [0, math.inf, 0], "orientation": [0, 0, 0, 1]},
+                       {"position": [0, 0, 0], "orientation": [0, 0, 0, 2]}):
+            with self.assertRaisesRegex(ValueError, "ray_offset"):
+                resolve_target(capture(), 250, 200, ray_offset=offset)
+
 
 if __name__ == "__main__":
     unittest.main()

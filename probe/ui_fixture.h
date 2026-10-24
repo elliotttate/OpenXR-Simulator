@@ -60,9 +60,16 @@ struct UiFixture {
         xrGetActionStateBoolean(session,&get,&again);
         if (state.currentState!=again.currentState || state.changedSinceLastSync!=again.changedSinceLastSync || state.lastChangeTime!=again.lastChangeTime) ++syncErrors;
         const auto& q=loc.pose.orientation;
-        const float dx=-2*(q.x*q.z+q.w*q.y),dy=-2*(q.y*q.z-q.w*q.x),dz=-(1-2*(q.x*q.x+q.y*q.y));
+        float dx=-2*(q.x*q.z+q.w*q.y),dy=-2*(q.y*q.z-q.w*q.x),dz=-(1-2*(q.x*q.x+q.y*q.y));
+        auto p=loc.pose.position;
+        if (getenv("XR_PROBE_APP_RAY_OFFSET")) {
+            // FlatOut's pointer adds a reference-space 3cm origin shift and -5deg yaw.
+            // Keep this application-side operation independent of the MCP solver.
+            const float a=-5.f*3.14159265f/180.f, oldX=dx;
+            dx=cosf(a)*dx+sinf(a)*dz; dz=-sinf(a)*oldX+cosf(a)*dz;
+            p.x+=.03f;
+        }
         const float c=cosf(0.22f),s=sinf(0.22f);
-        const auto& p=loc.pose.position;
         const float ox=c*(p.x-pose.position.x)-s*(p.z-pose.position.z);
         const float oy=p.y-pose.position.y;
         const float oz=s*(p.x-pose.position.x)+c*(p.z-pose.position.z);
