@@ -189,8 +189,10 @@ class UiAutomation:
         capture_id = uuid.uuid4().hex
         atomic_json(self.directory/"screenshot_request.json", {
             "capture_id": capture_id, "eye": eye, "layer": "all", "after_sync": after_sync})
-        status = await self.wait_json(self.directory/"screenshot_status.json",
+        status_path = self.directory/f"screenshot_status.{capture_id}.json"
+        status = await self.wait_json(status_path,
                                       lambda s: s.get("capture_id") == capture_id, timeout)
+        status_path.unlink(missing_ok=True)
         raw_path = self.directory/f"screenshot.{capture_id}.bmp"
         with Image.open(raw_path) as source:
             image = source.convert("RGB")
@@ -248,9 +250,9 @@ class UiAutomation:
     async def interact(self, action, capture_id, x=0, y=0, hand="right", button="trigger",
                        origin_mode="hand", surface_id=None, surface=None, dwell_frames=2,
                        hold_frames=2, timeout=5.0, command_id=None, ray_offset=None):
-        if action not in ("hover", "click", "release"):
+        if action not in ("hover", "click", "hold", "release"):
             raise ValueError("Unknown UI interaction")
-        if hand not in ("left", "right") or button not in ("trigger", "primary", "menu", "select"):
+        if hand not in ("left", "right") or button not in ("trigger", "primary", "secondary", "menu", "select"):
             raise ValueError("Invalid hand or button")
         if not all(isinstance(n, int) and 1 <= n <= 90 for n in (dwell_frames, hold_frames)):
             raise ValueError("dwell_frames and hold_frames must be integers in 1..90")

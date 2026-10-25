@@ -520,7 +520,7 @@ def ui_interaction_tools() -> list[Tool]:
         "y": {"type": "number", "description": "Pixel y in the returned image, top-left origin"},
         "hand": {"type": "string", "enum": ["left", "right"], "default": "right"},
         "origin_mode": {"type": "string", "enum": ["hand", "eye"], "default": "hand",
-                        "description": "hand requires a quad or explicit surface; eye uses the captured view ray"},
+                        "description": "hand requires a quad or explicit surface and keeps a normal controller origin. eye starts at the captured eye camera; the beam can collapse to a dot in that eye while remaining visible in the other."},
         "surface_id": {"type": "integer", "description": "Optional quad ID from screenshot geometry"},
         "surface": surface,
         "ray_offset": {**surface["properties"]["pose"], "additionalProperties": False,
@@ -533,8 +533,12 @@ def ui_interaction_tools() -> list[Tool]:
              inputSchema={"type": "object", "properties": common, "required": ["capture_id", "x", "y"], "additionalProperties": False}),
         Tool(name="click_ui_at", description="Aim at a screenshot pixel, dwell, press once, release, and capture the result. Application feedback confirms activation; delivery alone does not.",
              inputSchema={"type": "object", "properties": {**common,
-                 "button": {"type": "string", "enum": ["trigger", "select", "primary", "menu"], "default": "trigger"},
+                 "button": {"type": "string", "enum": ["trigger", "select", "primary", "secondary", "menu"], "default": "trigger"},
                  "hold_frames": {"type": "integer", "minimum": 1, "maximum": 90, "default": 2}},
+                 "required": ["capture_id", "x", "y"], "additionalProperties": False}),
+        Tool(name="hold_ui_at", description="Press and hold at a screenshot pixel, or move an already held ray without another press. Supports independent left/right hands for two-handed gestures. Refresh within 10 seconds and finish each hand with release_ui_pointer; focus loss or expiry releases it automatically.",
+             inputSchema={"type": "object", "properties": {**common,
+                 "button": {"type": "string", "enum": ["trigger", "select", "primary", "secondary", "menu"], "default": "trigger"}},
                  "required": ["capture_id", "x", "y"], "additionalProperties": False}),
         Tool(name="release_ui_pointer", description="Release all injected buttons and return this controller to normal input.",
              inputSchema={"type": "object", "properties": {k: common[k] for k in ("capture_id", "hand", "timeout", "command_id")},
@@ -860,8 +864,8 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
 
-    if name in ("hover_ui_at", "click_ui_at", "release_ui_pointer"):
-        action = {"hover_ui_at": "hover", "click_ui_at": "click", "release_ui_pointer": "release"}[name]
+    if name in ("hover_ui_at", "click_ui_at", "hold_ui_at", "release_ui_pointer"):
+        action = {"hover_ui_at": "hover", "click_ui_at": "click", "hold_ui_at": "hold", "release_ui_pointer": "release"}[name]
         try:
             async with ui_automation.lock:
                 result, pixels = await ui_automation.interact(action, **arguments)

@@ -127,7 +127,7 @@ static void WriteUiResult(ui_auto::Pointer& p, bool success, const char* error="
 
 static void ClearUiButtons(int hand) {
     auto& ctrl=hand ? rt::g_rightController:rt::g_leftController;
-    ctrl.triggerPressed=ctrl.primaryPressed=ctrl.menuPressed=false;
+    ctrl.triggerPressed=ctrl.primaryPressed=ctrl.secondaryPressed=ctrl.menuPressed=false;
     ctrl.triggerValue=0;
 }
 
@@ -227,13 +227,16 @@ static void PollUiPointerCommand() {
         if (p.pending) WriteUiResult(p,false,"Pointer released");
         WriteUiResult(incoming,true); return;
     }
-    if (incoming.action!="hover" && incoming.action!="click") { WriteUiResult(incoming,false,"Invalid action"); return; }
-    if (incoming.button!="trigger" && incoming.button!="select" && incoming.button!="primary" && incoming.button!="menu") {
+    if (incoming.action!="hover" && incoming.action!="click" && incoming.action!="hold") { WriteUiResult(incoming,false,"Invalid action"); return; }
+    if (incoming.button!="trigger" && incoming.button!="select" && incoming.button!="primary" && incoming.button!="secondary" && incoming.button!="menu") {
         WriteUiResult(incoming,false,"Invalid button"); return;
     }
     if (p.pending) {
         if (p.id==incoming.id) return;
         WriteUiResult(incoming,false,"Controller already has a pending interaction"); return;
+    }
+    if (p.owned && p.down && (incoming.action!="hold" || incoming.button!=p.button)) {
+        WriteUiResult(incoming,false,"Release the held pointer before changing interaction or button"); return;
     }
     auto capture=g_captures.find(o.string("capture_id"));
     if (capture==g_captures.end() || GetTickCount64()-capture->second.savedAt>30000 ||
@@ -253,6 +256,7 @@ static void PollUiPointerCommand() {
         WriteUiResult(incoming,false,"Invalid sync-cycle duration"); return;
     }
     incoming.owned=true; incoming.pending=true;
+    incoming.down=incoming.action=="hold";
     incoming.captureId=o.string("capture_id"); incoming.surfaceId=o.number("surface_id",-1);
     incoming.appliedFrame=mcp::g_runtimeFrameCount.load()+1;
     incoming.expires=GetTickCount64()+10000;
@@ -266,8 +270,9 @@ static void ApplyUiPointerButtons() {
         ctrl.triggerPressed=p.down && (p.button=="trigger" || p.button=="select");
         ctrl.triggerValue=ctrl.triggerPressed ? 1.0f:0.0f;
         ctrl.primaryPressed=p.down && p.button=="primary";
+        ctrl.secondaryPressed=p.down && p.button=="secondary";
         ctrl.menuPressed=p.down && p.button=="menu";
-        ctrl.gripPressed=ctrl.secondaryPressed=ctrl.thumbstickPressed=false;
+        ctrl.gripPressed=ctrl.thumbstickPressed=false;
         ctrl.gripValue=0; ctrl.thumbstick={0,0};
     }
 }
@@ -279,7 +284,7 @@ static void AdvanceUiPointersAfterSync(const bool observed[2]) {
         if (!observed[hand]) continue;
         if (++p.cycles < (p.phase==0 ? p.dwell : p.phase==1 ? p.hold : 2)) continue;
         p.cycles=0;
-        if (p.action=="hover") WriteUiResult(p,true);
+        if (p.action=="hover" || p.action=="hold") WriteUiResult(p,true);
         else if (p.phase==0) { p.down=true; p.phase=1; }
         else if (p.phase==1) { p.down=false; p.phase=2; }
         else WriteUiResult(p,true);
