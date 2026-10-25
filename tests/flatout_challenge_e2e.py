@@ -63,6 +63,10 @@ class Challenge(Frontend):
 
     async def run(self):
         menu, cards, initial_page = await self.layout()
+        if self.args.preview_only:
+            await self.preview(initial_page)
+            assert (await self.query("game.errors"))["total"] == self.errors_before
+            return
         await self.reading_comfort("flatout-mode")
         if self.args.layout_only:
             return
@@ -104,21 +108,56 @@ class Challenge(Frontend):
         while (await self.layout())[2] > initial_page:
             await self.click("challenge.page.prev")
         if self.args.preview_round_trip:
-            menu, cards, _ = await self.layout()
-            event = next(t for t in cards if not menu["items"][int(t["name"].split(".")[-1])]["locked"])
-            index = int(event["name"].split(".")[-1])
-            await self.click(event["name"])
-            current = await self.query("menu.get_state")
-            assert current["current_menu"] == "CARS" and current["item_count"] == 1, current
-            await self.audit("challenge-fixed-vehicle-preview-actions")
-            back = next(t["name"] for t in (await self.query("vr.targets"))["targets"] if t["name"].startswith("helper.Cancel."))
-            await self.click(back)
-            current = await self.query("menu.get_state")
-            assert current["current_menu"] == "INSANITY" and current["selection_index"] == index, current
-            assert (await self.layout())[2] == initial_page
-            self.cases.append({"case": "event-preview-and-back-preserve-page-without-starting-race", "passed": True,
-                               "title": menu["items"][index]["title"]})
+            await self.preview(initial_page)
         assert (await self.query("game.errors"))["total"] == self.errors_before
+
+    async def preview(self, initial_page):
+        menu, cards, _ = await self.layout()
+        event = next(t for t in cards if not menu["items"][int(t["name"].split(".")[-1])]["locked"])
+        index = int(event["name"].split(".")[-1])
+        await self.click(event["name"])
+        # FOSingleCarMenu intentionally has no carousel items. It previews one
+        # fixed event car; menu item_count cannot establish that it loaded.
+        current = await self.query("menu.get_state")
+        assert current["current_menu"] == "CARS", current
+        targets = await self.query("vr.targets")
+        assert not any(t["rect"][2] - t["rect"][0] > 1500 and t["rect"][3] - t["rect"][1] > 800
+                       for t in targets["targets"]), "Aiming at the car/blank preview must not start a race"
+        deadline = asyncio.get_running_loop().time() + 20
+        while not any(t["name"] == "helper.Validate.1" for t in targets["targets"]):
+            assert asyncio.get_running_loop().time() < deadline, ("Fixed event car did not become ready", targets)
+            await asyncio.sleep(.1)
+            targets = await self.query("vr.targets")
+        await self.audit("challenge-fixed-vehicle-preview-actions")
+        start = next(t for t in targets["targets"] if t["name"] == "helper.Validate.1")
+        assert start["rect"][2] - start["rect"][0] >= 240 and start["rect"][3] - start["rect"][1] >= 80, start
+        assert start["rect"][1] >= 960, start
+        before = targets["clicks"]
+        cap = await self.capture("fixed-car-blank-source")
+        from flatout_livery_e2e import screenshot_pixel, ui_surface
+        from flatout_frontend_e2e import RAY_OFFSET, quad_pixel
+        if cap["geometry"]["surfaces"]:
+            x, y = quad_pixel(cap, (960, 540, 960, 540))
+            extra = {}
+        else:
+            state = {"vr": {"frame": targets["vr_frame"]}}
+            x, y = screenshot_pixel(state, cap, 960, 540)
+            extra = {"surface": ui_surface(state)}
+        args = {"capture_id": cap["capture_id"], "x": float(x), "y": float(y), "hand": self.args.hand,
+                "origin_mode": "hand", "ray_offset": RAY_OFFSET, "dwell_frames": 30,
+                "hold_frames": 45, "timeout": 30, "command_id": uuid.uuid4().hex, **extra}
+        receipt = await self.tool("click_ui_at", args, "fixed-car-blank-held-click")
+        assert receipt["status"] == "input_delivered", receipt
+        assert (await self.query("vr.targets"))["clicks"] == before, "Blank preview started an action"
+        assert (await self.query("menu.get_state"))["current_menu"] == "CARS"
+        assert not (await self.query("game.get_state"))["is_loading"]
+        back = next(t["name"] for t in targets["targets"] if t["name"].startswith("helper.Cancel."))
+        await self.click(back)
+        current = await self.query("menu.get_state")
+        assert current["current_menu"] == "INSANITY" and current["selection_index"] == index, current
+        assert (await self.layout())[2] == initial_page
+        self.cases.append({"case": "event-preview-blank-click-safety-and-back-preserve-page", "passed": True,
+                           "title": menu["items"][index]["title"]})
 
 
 async def main(args):
@@ -126,8 +165,10 @@ async def main(args):
     env = {**os.environ, "SIMXR_DATA_DIR": str(args.data_dir.resolve())}
     params = StdioServerParameters(command=sys.executable,
                                    args=[str(ROOT / "mcp-server/openxr_simulator_mcp.py")], env=env)
-    result = {"passed": False, "pid": args.pid, "hand": args.hand,
-              "scope": "Complete FlatOut Mode browser layout, 42-event paging, actual XR hover/click and safe vehicle preview"}
+    scope = "Fixed event-car preview spacing, blank held-click safety and Back" if args.preview_only else (
+        "FlatOut Mode layout and head-height comfort" if args.layout_only else
+        "Complete FlatOut Mode browser layout, 42-event paging, actual XR hover/click" + (" and safe vehicle preview" if args.preview_round_trip else ""))
+    result = {"passed": False, "pid": args.pid, "hand": args.hand, "scope": scope}
     async with stdio_client(params) as streams:
         async with ClientSession(*streams) as session:
             await session.initialize()
@@ -155,4 +196,5 @@ if __name__ == "__main__":
     parser.add_argument("--hand", choices=("left", "right"), default="right")
     parser.add_argument("--layout-only", action="store_true")
     parser.add_argument("--preview-round-trip", action="store_true")
+    parser.add_argument("--preview-only", action="store_true")
     asyncio.run(main(parser.parse_args()))
