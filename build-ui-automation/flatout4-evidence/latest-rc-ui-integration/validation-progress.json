@@ -681,6 +681,13 @@
       "pid": 56808,
       "scope": "Single informational dialog through real XR actions",
       "case_count": 4
+    },
+    {
+      "directory": "rc906-options-grey-left-complete",
+      "passed": true,
+      "pid": 21068,
+      "scope": "104 settings, every category/page, rendered separate footer buttons, grey endpoint clicks inert, left ray",
+      "case_count": 133
     }
   ],
   "scope_note": "Latest-RC native shared HUD-dialog physical depth is integrated behind an experimental startup flag. Credits, Options, Quick Start, Party and Statistics increments are native validated; the entire non-Wreck UI audit remains active. Other menu transports and physical-headset evaluation remain outstanding.",
@@ -740,12 +747,12 @@
   },
   "native_review": "../hover-depth-evidence/native-review.html",
   "current_native_run": {
-    "pid": 56808,
-    "running": false,
-    "normal_exit": 0,
-    "wrapper_exit": 0,
-    "native_log_problems": 0,
-    "test_slot": 991025003
+    "pid": 21068,
+    "running": true,
+    "wrapper_session": 38822,
+    "helper_session": 78685,
+    "input_test_session": 97971,
+    "purpose": "Options simple up/down buttons, spacing, grey/inert endpoints; full right-ray paging audit"
   },
   "career_welcome": {
     "native_red": "rc00c-career-welcome-black-red",
@@ -809,11 +816,11 @@
     "mode": "Debug",
     "data": "C:\\Users\\ellio\\Documents\\GitHub\\OpenXR-Simulator\\build-ui-automation\\flatout4-evidence\\20261024-rc-livery",
     "test_slot": "991025003",
-    "pid": 56808,
+    "pid": 21068,
     "exe": "D:\\FoxWorktrees\\ui-raycast-rc9-20261025\\PlayAll\\Libs\\vs2022\\x64\\DllLauncher64_d.exe",
     "rc": "906721488adde53a92cba6c8ac8a59813b85ceef",
     "branch": "codex/ui-raycast-rc9-20261025",
-    "game_dll_sha256": "3d15ec663375deca83d09295613ef65486b6a44897c042c1e548b99db0a2f38e",
+    "game_dll_sha256": "73d35fc438a60907041eb418e62ca09302327da52b0ee945a6e1f3ca218d1510",
     "engine_dll_sha256": "219be31b93d8100f4294623da61c7673e8a5f053ad4f5a0ccad89568162e7adc",
     "runtime_dll_sha256": "76d8a35ed92b2d9c0f14716f1edaf9618b9541ea0d9580abe99254a98c3ac857"
   },
@@ -840,10 +847,10 @@
   },
   "backups": {
     "branch": "backup/ui-raycast-2026-10-25",
-    "fox": "32d2eb38025dae1645735c60da5305c052939646",
-    "simulator": "d03d365fc4e0a6bf4c8a43c13d54b831eebc4248",
+    "fox": "3cb429eba12e2ee1cfbd21c6ebb64b775f0a3391",
+    "simulator": "a5859eb517a6ef5446b2bfbaef495c808ef0e048",
     "remote_verified": true,
-    "note": "Atlas native/GPU passed and initial audio source+LFS checkpoint. Later native audio corrections and verification pending."
+    "note": "Final audio source/tests/compact evidence checkpoint. Current Options and all-menu grey-endpoint work not yet checkpointed."
   },
   "rc906_adoption": {
     "previous": "00c4999b0b0d7184b20aa75ff0ab9bb8342c86b5",
@@ -907,5 +914,21 @@
     "speaker_source_matches": 29,
     "music_restore_pending": false,
     "headset_tested": false
-  }
+  },
+  "options_footer": {
+    "status": "Simple independent UP/DOWN buttons implemented; complete left audit passes, right paging audit running",
+    "user_constraints": [
+      "No full footer background",
+      "Grey unavailable directions on all scrolling menus"
+    ],
+    "left_native": "rc906-options-grey-left-complete/result.json",
+    "right_native_pending": "rc906-options-grey-right-paging/result.json",
+    "reds": [
+      "rc906-options-footer-native-red/result.json",
+      "rc906-options-footer-background-red/result.json",
+      "rc906-options-binding-footer-width-red-r2/result.json"
+    ],
+    "note": "First full left sweep of an earlier layout was interrupted after visual review; not completion evidence. Final buttons-only layout preserves seven rows/page, body bottom padding, separate up/down, ample room for three binding actions."
+  },
+  "scrolling_endpoint_inventory": "scrolling-endpoint-audit.json"
 }

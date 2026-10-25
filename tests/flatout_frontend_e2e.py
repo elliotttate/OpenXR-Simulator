@@ -798,7 +798,7 @@ class Frontend:
         targets = (await self.query("vr.targets"))["targets"]
         scroll = [t for t in targets if t["name"].startswith("settings.scroll.")]
         if box["scroll"]["scrollable"]:
-            assert scroll and all(t["rect"][2]-t["rect"][0]>=240 and t["rect"][3]-t["rect"][1]>=72 for t in scroll), "Page buttons need full-size ray targets"
+            assert scroll and all(t["rect"][2]-t["rect"][0]>=160 and t["rect"][3]-t["rect"][1]>=72 for t in scroll), "Up/down buttons need spacious ray targets"
         else:
             assert not scroll, "A category that fits should not offer paging"
 

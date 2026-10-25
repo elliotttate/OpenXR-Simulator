@@ -1,0 +1,63 @@
+{
+  "status": "in progress",
+  "requirements": [
+    "Separate up/down ray buttons without a full footer background",
+    "Unavailable directions remain visible in grey",
+    "Unavailable directions cannot activate or click through",
+    "Check every non-Wreck menu that scrolls"
+  ],
+  "source_reviewed": [
+    {
+      "surface": "Options",
+      "state": "explicit grey labels, icons and plates; disabled targets excluded; full native sweep running"
+    },
+    {
+      "surface": "Statistics",
+      "state": "grey endpoint chevrons and bounded targets already present; native review pending"
+    },
+    {
+      "surface": "Party stunt pages",
+      "state": "grey endpoint chevrons and bounded targets already present; native review pending"
+    },
+    {
+      "surface": "Challenge pages",
+      "state": "grey endpoint chevrons and bounded targets already present; native review pending"
+    },
+    {
+      "surface": "Career event pages",
+      "state": "grey endpoint chevrons and bounded targets already present; native review pending"
+    },
+    {
+      "surface": "Livery layer/saved galleries",
+      "state": "enabled flags already provided; native endpoint review pending"
+    },
+    {
+      "surface": "Workshop result pages",
+      "state": "previous/next enabled flags already provided; native endpoint review pending"
+    },
+    {
+      "surface": "Credits",
+      "state": "rewind/forward currently always enabled; verify start/end behavior and fix unavailable directions"
+    },
+    {
+      "surface": "Livery sticker library",
+      "state": "category list and thumbnail grid scroll; explicit bounded ray up/down controls need review/implementation"
+    },
+    {
+      "surface": "Leaderboard pages",
+      "state": "Current Flash arrows disappear at endpoints; replace with visible grey inactive directions and bounded targets; backend availability may limit native data cases"
+    },
+    {
+      "surface": "Workshop description pane",
+      "state": "Scrollable description currently uses right stick; explicit bounded ray up/down controls need review/implementation"
+    }
+  ],
+  "current_native": {
+    "pid": 21068,
+    "wrapper_session": 38822,
+    "input_test_session": 39066,
+    "helper_session": 78685,
+    "scope": "Options all categories/rows, left ray"
+  },
+  "excluded": "Wreck Run remains deferred"
+}
