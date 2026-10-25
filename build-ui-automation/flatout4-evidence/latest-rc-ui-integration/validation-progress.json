@@ -748,11 +748,8 @@
   "native_review": "../hover-depth-evidence/native-review.html",
   "current_native_run": {
     "pid": 21068,
-    "running": true,
-    "wrapper_session": 38822,
-    "helper_session": 78685,
-    "input_test_session": 97971,
-    "purpose": "Options simple up/down buttons, spacing, grey/inert endpoints; full right-ray paging audit"
+    "running": false,
+    "normal_exit_requested": true
   },
   "career_welcome": {
     "native_red": "rc00c-career-welcome-black-red",
@@ -916,19 +913,19 @@
     "headset_tested": false
   },
   "options_footer": {
-    "status": "Simple independent UP/DOWN buttons implemented; complete left audit passes, right paging audit running",
+    "status": "Buttons-only layout and grey inert endpoints passed both hands",
     "user_constraints": [
       "No full footer background",
       "Grey unavailable directions on all scrolling menus"
     ],
     "left_native": "rc906-options-grey-left-complete/result.json",
-    "right_native_pending": "rc906-options-grey-right-paging/result.json",
     "reds": [
       "rc906-options-footer-native-red/result.json",
       "rc906-options-footer-background-red/result.json",
       "rc906-options-binding-footer-width-red-r2/result.json"
     ],
-    "note": "First full left sweep of an earlier layout was interrupted after visual review; not completion evidence. Final buttons-only layout preserves seven rows/page, body bottom padding, separate up/down, ample room for three binding actions."
+    "note": "First full left sweep of an earlier layout was interrupted after visual review; not completion evidence. Final buttons-only layout preserves seven rows/page, body bottom padding, separate up/down, ample room for three binding actions.",
+    "right_native": "rc906-options-grey-right-paging/result.json"
   },
   "scrolling_endpoint_inventory": "scrolling-endpoint-audit.json"
 }

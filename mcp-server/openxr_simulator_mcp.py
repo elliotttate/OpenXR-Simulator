@@ -523,8 +523,11 @@ def ui_interaction_tools() -> list[Tool]:
                         "description": "hand requires a quad or explicit surface and keeps a normal controller origin. eye starts at the captured eye camera; the beam can collapse to a dot in that eye while remaining visible in the other."},
         "surface_id": {"type": "integer", "description": "Optional quad ID from screenshot geometry"},
         "surface": surface,
-        "ray_offset": {**surface["properties"]["pose"], "additionalProperties": False,
-            "description": "Optional application ray calibration in XR world axes: app origin = aim position + position; app direction = orientation applied to aim direction. Metres, unit quaternion [x,y,z,w]. Omit for unmodified XR aim."},
+        "ray_offset": {**surface["properties"]["pose"],
+            "properties": {**surface["properties"]["pose"]["properties"],
+                "position_space": {"type": "string", "enum": ["world", "aim"], "default": "world"}},
+            "additionalProperties": False,
+            "description": "Application ray calibration: origin offset in world or rotating aim axes, plus world-space direction rotation. Metres, unit quaternion [x,y,z,w]. Use aim for controller-shell emitters; omit for unmodified native aim."},
         "dwell_frames": {"type": "integer", "minimum": 1, "maximum": 90, "default": 2},
         "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 30, "default": 5},
         "command_id": {"type": "string", "description": "Optional alphanumeric idempotency key; reuse for retries"}}
@@ -540,6 +543,11 @@ def ui_interaction_tools() -> list[Tool]:
              inputSchema={"type": "object", "properties": {**common,
                  "button": {"type": "string", "enum": ["trigger", "select", "primary", "secondary", "menu"], "default": "trigger"}},
                  "required": ["capture_id", "x", "y"], "additionalProperties": False}),
+        Tool(name="scroll_ui_at", description="Aim a controller ray at a screenshot pixel and deflect its thumbstick for a bounded number of action syncs. Positive Y scrolls up; negative Y scrolls down. The stick returns to neutral before capture, without pressing any button.",
+             inputSchema={"type": "object", "properties": {**common,
+                 "stick": {"type": "array", "items": {"type": "number", "minimum": -1, "maximum": 1}, "minItems": 2, "maxItems": 2},
+                 "hold_frames": {"type": "integer", "minimum": 1, "maximum": 90, "default": 30}},
+                 "required": ["capture_id", "x", "y", "stick"], "additionalProperties": False}),
         Tool(name="release_ui_pointer", description="Release all injected buttons and return this controller to normal input.",
              inputSchema={"type": "object", "properties": {k: common[k] for k in ("capture_id", "hand", "timeout", "command_id")},
                           "required": ["capture_id"], "additionalProperties": False})]
@@ -864,8 +872,10 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
 
-    if name in ("hover_ui_at", "click_ui_at", "hold_ui_at", "release_ui_pointer"):
-        action = {"hover_ui_at": "hover", "click_ui_at": "click", "hold_ui_at": "hold", "release_ui_pointer": "release"}[name]
+    if name in ("hover_ui_at", "click_ui_at", "hold_ui_at", "scroll_ui_at", "release_ui_pointer"):
+        action = {"hover_ui_at": "hover", "click_ui_at": "click", "hold_ui_at": "hold", "scroll_ui_at": "scroll", "release_ui_pointer": "release"}[name]
+        if action == "scroll":
+            arguments.setdefault("hold_frames", 30)
         try:
             async with ui_automation.lock:
                 result, pixels = await ui_automation.interact(action, **arguments)

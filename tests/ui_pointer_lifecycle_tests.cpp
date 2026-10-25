@@ -69,6 +69,21 @@ int main() {
     auto hover = Pending("hover", 3);
     Check(!ui_auto::AdvancePointerAfterSync(hover, true) && ui_auto::NeedsPrepressValidation(hover),
           "hover geometry validation retains its existing dwell behavior");
+
+    auto scroll = Pending("scroll", 2);
+    scroll.stick = {.25f, -.75f};
+    Check(!ui_auto::AdvancePointerAfterSync(scroll, false) && scroll.cycles == 0,
+          "scroll waits for an observed bound thumbstick action");
+    for (int i = 0; i < 6; ++i) {
+        const auto axis = ui_auto::PointerThumbstick(scroll);
+        Check(axis.y == (i >= 2 && i < 4 ? -.75f : 0.f),
+              "scroll publishes axes only during its bounded deflection phase");
+        const bool finished = ui_auto::AdvancePointerAfterSync(scroll, true);
+        Check(!scroll.down, "a thumbstick scroll never presses a trigger");
+        Check(finished == (i == 5), "scroll neutralizes the stick before reporting completion");
+    }
+    scroll.owned = false;
+    Check(ui_auto::PointerThumbstick(scroll).y == 0, "releasing a controller clears its thumbstick lease");
     if (failures) return 1;
     std::puts("ui_pointer_lifecycle_tests: PASS");
     return 0;

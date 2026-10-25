@@ -122,6 +122,13 @@ class LiveryTest:
         return state
 
     async def tool(self, name, arguments, label):
+        if name in ('hover_ui_at','click_ui_at','hold_ui_at','scroll_ui_at'):
+            from flatout_frontend_e2e import read_game
+            from flatout_ray_offset import native_pointer_offset
+            native=await asyncio.to_thread(read_game,self.args.pid,'vr.get_state')
+            calibration=native_pointer_offset(native,arguments.get('hand','right'))
+            if calibration is not None:
+                arguments={**arguments,'ray_offset':calibration}
         result = await self.session.call_tool(name, arguments)
         self.sequence += 1
         stem = self.args.evidence/f"{self.sequence:03}-{label}"

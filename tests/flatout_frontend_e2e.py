@@ -75,6 +75,11 @@ class Frontend:
         return await asyncio.wait_for(asyncio.to_thread(read_game, self.args.pid, method, params), 15)
 
     async def tool(self, name, args, label):
+        if name in ('hover_ui_at','click_ui_at','hold_ui_at','scroll_ui_at'):
+            from flatout_ray_offset import native_pointer_offset
+            calibration=native_pointer_offset(await self.query('vr.get_state'),args.get('hand',self.args.hand))
+            if calibration is not None:
+                args={**args,'ray_offset':calibration}
         response = await self.session.call_tool(name, args)
         self.sequence += 1
         stem = self.args.evidence/f"{self.sequence:03}-{label}"

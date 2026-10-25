@@ -1,0 +1,17 @@
+[
+  {
+    "sha256": "7f3043e7dcbf1fe5526ea1f7f146b0ee4d7a69ae4c89baa4446c8a6a1d9f1f17",
+    "name": "Flatout64_d.dll",
+    "path": "D:\\FoxWorktrees\\ui-raycast-rc9-20261025\\Flatout\\Bin\\x64\\Flatout64_d.dll"
+  },
+  {
+    "sha256": "63ba7beb38ba88f468b294754fc409f110bca67a0fd94d3dc5ebee4d5d421ce5",
+    "name": "EngineDLL64_d.dll",
+    "path": "D:\\FoxWorktrees\\ui-raycast-rc9-20261025\\PlayAll\\Libs\\vs2022\\x64\\EngineDLL64_d.dll"
+  },
+  {
+    "sha256": "64ef1eb970a591070e9fdc50f43d884e34983d1dd69f4898d5b8d6ea0cb58708",
+    "name": "openxr_simulator.dll",
+    "path": "C:\\Users\\ellio\\Documents\\GitHub\\OpenXR-Simulator\\bin\\ui-scroll\\openxr_simulator.dll"
+  }
+]

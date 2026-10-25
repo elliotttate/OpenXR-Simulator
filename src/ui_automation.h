@@ -90,6 +90,7 @@ struct Pointer {
     std::string id, session, captureId, requestDigest, action, button = "trigger";
     int surfaceId = -1;
     bool down = false;
+    XrVector2f stick{};
     // 0=dwell, 1=pressed, 2=released/settling; advanced after action snapshots.
     int phase = 0, cycles = 0, dwell = 2, hold = 2;
     uint64_t appliedFrame = 0;
@@ -111,10 +112,14 @@ inline bool AdvancePointerAfterSync(Pointer& p, bool observed) {
     if (++p.cycles < (p.phase==0 ? p.dwell : p.phase==1 ? p.hold : 2)) return false;
     p.cycles=0;
     if (p.action=="hover" || p.action=="hold") return true;
-    if (p.phase==0) { p.down=true; p.phase=1; }
+    if (p.phase==0) { p.down=p.action!="scroll"; p.phase=1; }
     else if (p.phase==1) { p.down=false; p.phase=2; }
     else return true;
     return false;
+}
+
+inline XrVector2f PointerThumbstick(const Pointer& p) {
+    return p.owned && p.action=="scroll" && p.phase==1 ? p.stick:XrVector2f{0,0};
 }
 
 inline bool ValidId(const std::string& s) {

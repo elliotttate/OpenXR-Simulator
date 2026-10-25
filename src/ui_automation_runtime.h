@@ -128,7 +128,7 @@ static void WriteUiResult(ui_auto::Pointer& p, bool success, const char* error="
 static void ClearUiButtons(int hand) {
     auto& ctrl=hand ? rt::g_rightController:rt::g_leftController;
     ctrl.triggerPressed=ctrl.primaryPressed=ctrl.secondaryPressed=ctrl.menuPressed=false;
-    ctrl.triggerValue=0;
+    ctrl.triggerValue=0; ctrl.thumbstick={0,0};
 }
 
 static void ReleaseUiPointers(const char* reason) {
@@ -227,7 +227,7 @@ static void PollUiPointerCommand() {
         if (p.pending) WriteUiResult(p,false,"Pointer released");
         WriteUiResult(incoming,true); return;
     }
-    if (incoming.action!="hover" && incoming.action!="click" && incoming.action!="hold") { WriteUiResult(incoming,false,"Invalid action"); return; }
+    if (incoming.action!="hover" && incoming.action!="click" && incoming.action!="hold" && incoming.action!="scroll") { WriteUiResult(incoming,false,"Invalid action"); return; }
     if (incoming.button!="trigger" && incoming.button!="select" && incoming.button!="primary" && incoming.button!="secondary" && incoming.button!="menu") {
         WriteUiResult(incoming,false,"Invalid button"); return;
     }
@@ -251,6 +251,11 @@ static void PollUiPointerCommand() {
     if (!std::isfinite(norm) || std::fabs(norm-1)>0.001f || !std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)) {
         WriteUiResult(incoming,false,"Invalid aim pose"); return;
     }
+    incoming.stick={o.number("stick_x",0.f),o.number("stick_y",0.f)};
+    if (!std::isfinite(incoming.stick.x) || !std::isfinite(incoming.stick.y) ||
+        std::fabs(incoming.stick.x)>1.f || std::fabs(incoming.stick.y)>1.f) {
+        WriteUiResult(incoming,false,"Invalid thumbstick vector"); return;
+    }
     incoming.dwell=o.number("dwell_frames",2); incoming.hold=o.number("hold_frames",2);
     if (incoming.dwell<1 || incoming.dwell>90 || incoming.hold<1 || incoming.hold>90) {
         WriteUiResult(incoming,false,"Invalid sync-cycle duration"); return;
@@ -273,7 +278,7 @@ static void ApplyUiPointerButtons() {
         ctrl.secondaryPressed=p.down && p.button=="secondary";
         ctrl.menuPressed=p.down && p.button=="menu";
         ctrl.gripPressed=ctrl.thumbstickPressed=false;
-        ctrl.gripValue=0; ctrl.thumbstick={0,0};
+        ctrl.gripValue=0; ctrl.thumbstick=ui_auto::PointerThumbstick(p);
     }
 }
 
