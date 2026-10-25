@@ -115,20 +115,31 @@ class LiveryTest:
     def __init__(self, args, session):
         self.args, self.session, self.sequence, self.cases = args, session, 0, []
         self.last_capture = None
+        self.calibrated_commands = {}
+        self.query_lock = asyncio.Lock()
 
     async def state(self):
-        state = await asyncio.wait_for(asyncio.to_thread(game_read, self.args.pid), 15)
+        async with self.query_lock:
+            state = await asyncio.wait_for(asyncio.to_thread(game_read, self.args.pid), 15)
         assert state["ready"] and state["vr"]["active"] and not state["vr"]["test_pointer"], state
         return state
 
     async def tool(self, name, arguments, label):
         if name in ('hover_ui_at','click_ui_at','hold_ui_at','scroll_ui_at'):
+            arguments={**arguments,'timeout':arguments.get('timeout',30)}
+        key=arguments.get('command_id')
+        if key in self.calibrated_commands:
+            arguments=self.calibrated_commands[key]
+        elif name in ('hover_ui_at','click_ui_at','hold_ui_at','scroll_ui_at'):
             from flatout_frontend_e2e import read_game
             from flatout_ray_offset import native_pointer_offset
-            native=await asyncio.to_thread(read_game,self.args.pid,'vr.get_state')
+            async with self.query_lock:
+                native=await asyncio.to_thread(read_game,self.args.pid,'vr.get_state')
             calibration=native_pointer_offset(native,arguments.get('hand','right'))
             if calibration is not None:
                 arguments={**arguments,'ray_offset':calibration}
+            if key:
+                self.calibrated_commands[key]=dict(arguments)
         result = await self.session.call_tool(name, arguments)
         self.sequence += 1
         stem = self.args.evidence/f"{self.sequence:03}-{label}"
@@ -143,7 +154,9 @@ class LiveryTest:
         return values[0]
 
     async def capture(self, label):
-        self.last_capture = await self.tool("capture_screenshot", {"eye": "left", "max_width": 1280}, label)
+        capture = await self.tool("capture_screenshot", {"eye": "left", "max_width": 1280, "timeout": 30}, label)
+        assert 'capture_id' in capture,capture
+        self.last_capture = capture
         return self.last_capture
 
     async def click(self, label, index=0, hold_frames=2, retry=False, hand="right"):

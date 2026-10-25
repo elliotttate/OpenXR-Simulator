@@ -9,11 +9,11 @@
   "source_reviewed": [
     {
       "surface": "Options",
-      "state": "explicit grey labels, icons and plates; disabled targets excluded; full native sweep running"
+      "state": "Buttons-only layout, gray endpoints, padded body; prior133/122nativecases and r4smooth4casespassed; r5fullrepeatpending"
     },
     {
       "surface": "Statistics",
-      "state": "grey endpoint chevrons and bounded targets already present; native review pending"
+      "state": "Pixel scrolling and clipped native rows implemented; r4inputpassed butbodyink0red; r5textcolorfixpendingnativepixelproof"
     },
     {
       "surface": "Party stunt pages",
@@ -37,27 +37,27 @@
     },
     {
       "surface": "Credits",
-      "state": "rewind/forward currently always enabled; verify start/end behavior and fix unavailable directions"
+      "state": "Gray inertRewind/start andreactivation native4passed; ray-localmanualstickimplemented; r5end/bothhandspending"
     },
     {
       "surface": "Livery sticker library",
-      "state": "category list and thumbnail grid scroll; explicit bounded ray up/down controls need review/implementation"
+      "state": "Grid/categorybuttonsandproportionalstickimplemented;64stickersandleftsmoothnativepassed; categoryviewportboundsredfixedr5, finalbothhandspending"
     },
     {
       "surface": "Leaderboard pages",
-      "state": "Current Flash arrows disappear at endpoints; replace with visible grey inactive directions and bounded targets; backend availability may limit native data cases"
+      "state": "r5matchedheaderpairvisible; oldFlasharrows/Headerstriphiddentestpassed; exactrayhover/heldsingleclick/retrypassing throughpopulated1229entrytable;fullendpointtraversalrunning"
     },
     {
       "surface": "Workshop description pane",
-      "state": "Scrollable description currently uses right stick; explicit bounded ray up/down controls need review/implementation"
+      "state": "StandaloneboundedUP/DOWNbuttonsandray-localstickimplemented; actualpopulatedWorkshopnativeverificationpending"
     }
   ],
   "current_native": {
-    "pid": 21068,
-    "wrapper_session": 38822,
-    "input_test_session": 39066,
-    "helper_session": 78685,
-    "scope": "Options all categories/rows, left ray"
+    "pid": 53548,
+    "wrapper_session": 32248,
+    "input_test_session": 75986,
+    "helper_session": 72832,
+    "scope": "Full actualSteamleaderboardtraversal"
   },
   "excluded": "Wreck Run remains deferred"
 }

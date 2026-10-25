@@ -64,7 +64,8 @@ class FooterTest(Frontend):
         assert all(row['rect'][3]<=body['rect'][3]-23.5 for row in rows),('Settings need bottom padding',rows,body)
         box=state['boxes'][state['selection_index']]
         first,last,total=(box['scroll'][k] for k in ('first','last','total'))
-        expected={'settings.scroll.up':first>0,'settings.scroll.down':last+1<total}
+        expected={'settings.scroll.up':box['scroll'].get('position',first*92)>.5,
+                  'settings.scroll.down':box['scroll'].get('position',first*92)+.5<box['scroll'].get('maximum',max(0,total-7)*92)}
         for name,enabled in expected.items():
             assert any(c['name']==name for c in controls)==enabled,(name,enabled,controls)
         self.cases.append(dict(case='separate-buttons-visible-and-spaced',passed=True,settings=body,scroll=box['scroll'],pixels=observations))
@@ -115,7 +116,7 @@ class FooterTest(Frontend):
             await self.click('settings.category.'+str(index))
             for _ in range(10):
                 box=(await self.query('options.get_state'))['boxes'][index]
-                if box['scroll']['first']==0:break
+                if box['scroll'].get('position',box['scroll']['first']*92)<=.5:break
                 await self.click('settings.scroll.up')
             else:raise AssertionError('Cannot reach first settings page')
             seen=set()
@@ -131,7 +132,7 @@ class FooterTest(Frontend):
                 if last+1>=total:break
                 await self.click('settings.scroll.down')
                 after=(await self.query('options.get_state'))['boxes'][index]
-                assert after['scroll']['first']==last+1,after
+                assert first<after['scroll']['first']<=last+1,after
             else:raise AssertionError('Cannot reach last settings page')
             present={r['index'] for r in box['rows'] if r['present']}
             assert seen==present,(index,seen,present)

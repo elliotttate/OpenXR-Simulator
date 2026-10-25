@@ -26,6 +26,11 @@ class LiveryScroll(LiveryTest):
     async def disabled(self,label):
         before=await self.state();control=self.control(before,label)
         assert control['enabled'] is False,(label,control)
+        park=next(c for c in before['vr']['controls'] if c['label'] in ('BACK TO LAYERS','BACK'))
+        source=await self.capture('park-before-grey')
+        px,py=screenshot_pixel(before,source,park['x']+park['width']/2,park['y']+park['height']/2)
+        await self.tool('hover_ui_at',dict(capture_id=source['capture_id'],x=float(px),y=float(py),
+            hand=self.args.hand,origin_mode='hand',surface=ui_surface(before),dwell_frames=8),'park-reticle-away-from-grey-icon')
         capture=await self.capture('grey-'+label.replace(' ','-'))
         x0,y0=screenshot_pixel(before,capture,control['x'],control['y'])
         x1,y1=screenshot_pixel(before,capture,control['x']+control['width'],control['y']+control['height'])
@@ -33,7 +38,7 @@ class LiveryScroll(LiveryTest):
         grey=(np.min(patch,axis=2)>48)&(np.max(patch,axis=2)<150)&(np.ptp(patch,axis=2)<28)
         assert int(np.sum(grey))>=4,('Disabled button needs visible grey ink',label)
         after=await self.press(label)
-        for key in ('document','generation','category','catalog_selection','selected','library_scroll'):
+        for key in ('document','generation','category','catalog_selection','selected','library_scroll','categories_scroll'):
             assert after[key]==before[key],('Disabled direction changed state',label,key)
         self.cases.append(dict(case='grey-and-inert-'+label,passed=True,control=control,grey_pixels=int(np.sum(grey))))
 
@@ -46,12 +51,13 @@ class LiveryScroll(LiveryTest):
         command=dict(capture_id=capture['capture_id'],x=float(x),y=float(y),hand=self.args.hand,
             origin_mode='hand',surface=ui_surface(before),dwell_frames=8,hold_frames=30,
             stick=[0,-.65],timeout=30,command_id=uuid.uuid4().hex)
-        pending=asyncio.create_task(self.tool('scroll_ui_at',command,'library-thumbstick'))
         samples=[]
-        while not pending.done():
+        for _ in range(3):
+            capture=await self.capture('stick-scroll-step-source')
+            command={**command,'capture_id':capture['capture_id'],'hold_frames':4,'command_id':uuid.uuid4().hex}
+            receipt=await self.tool('scroll_ui_at',command,'library-thumbstick')
+            assert receipt['status']=='input_delivered',receipt
             samples.append((await self.state())['library_scroll']['position'])
-            await asyncio.sleep(.04)
-        receipt=await pending;assert receipt['status']=='input_delivered',receipt
         after=await self.state();position=after['library_scroll']['position']
         assert position>before['library_scroll']['position']+1,('Stick did not scroll its hovered grid',samples)
         assert len(set(samples))>=3,('Scrolling jumped rather than moving continuously',samples)
@@ -67,6 +73,7 @@ class LiveryScroll(LiveryTest):
         original=await self.state()
         if original['tab']!=1:await self.press('STICKERS')
         if (await self.state())['page']!=1:await self.press('ADD STICKER')
+        while self.control(await self.state(),'Categories up')['enabled']:await self.press('Categories up')
         if (await self.state())['category']!=0:await self.press('Category: Basic shapes')
         for _ in range(12):
             state=await self.state()
@@ -87,12 +94,17 @@ class LiveryScroll(LiveryTest):
         while self.control(await self.state(),'Stickers up')['enabled']:await self.press('Stickers up')
         await self.smooth()
         while self.control(await self.state(),'Stickers up')['enabled']:await self.press('Stickers up')
+        categories=set()
+        category=(await self.state())['category']
         for _ in range(100):
             state=await self.state()
+            categories.update(c['label'] for c in state['vr']['controls'] if c['label'].startswith('Category: '))
+            assert state['category']==category,'Category paging must not change the selection'
             if not self.control(state,'Categories down')['enabled']:break
             await self.press('Categories down')
         else:raise AssertionError('Category navigation wrapped past its last category')
         await self.disabled('Categories down')
+        self.cases.append(dict(case='category-viewport-bounds-preserve-selection',passed=True,seen=sorted(categories)))
         # Return through the visible list rather than resetting state through MCP.
         while self.control(await self.state(),'Categories up')['enabled']:await self.press('Categories up')
         await self.press('BACK TO LAYERS')

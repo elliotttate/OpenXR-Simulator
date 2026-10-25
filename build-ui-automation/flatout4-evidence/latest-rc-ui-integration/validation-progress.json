@@ -747,9 +747,11 @@
   },
   "native_review": "../hover-depth-evidence/native-review.html",
   "current_native_run": {
-    "pid": 21068,
-    "running": false,
-    "normal_exit_requested": true
+    "pid": 48744,
+    "running": true,
+    "wrapper_session": 71674,
+    "helper_session": 72832,
+    "input_test_session": 40225
   },
   "career_welcome": {
     "native_red": "rc00c-career-welcome-black-red",
@@ -813,13 +815,13 @@
     "mode": "Debug",
     "data": "C:\\Users\\ellio\\Documents\\GitHub\\OpenXR-Simulator\\build-ui-automation\\flatout4-evidence\\20261024-rc-livery",
     "test_slot": "991025003",
-    "pid": 21068,
+    "pid": 48744,
     "exe": "D:\\FoxWorktrees\\ui-raycast-rc9-20261025\\PlayAll\\Libs\\vs2022\\x64\\DllLauncher64_d.exe",
     "rc": "906721488adde53a92cba6c8ac8a59813b85ceef",
     "branch": "codex/ui-raycast-rc9-20261025",
-    "game_dll_sha256": "73d35fc438a60907041eb418e62ca09302327da52b0ee945a6e1f3ca218d1510",
-    "engine_dll_sha256": "219be31b93d8100f4294623da61c7673e8a5f053ad4f5a0ccad89568162e7adc",
-    "runtime_dll_sha256": "76d8a35ed92b2d9c0f14716f1edaf9618b9541ea0d9580abe99254a98c3ac857"
+    "game_dll_sha256": "7f3043e7dcbf1fe5526ea1f7f146b0ee4d7a69ae4c89baa4446c8a6a1d9f1f17",
+    "engine_dll_sha256": "63ba7beb38ba88f468b294754fc409f110bca67a0fd94d3dc5ebee4d5d421ce5",
+    "runtime_dll_sha256": "64ef1eb970a591070e9fdc50f43d884e34983d1dd69f4898d5b8d6ea0cb58708"
   },
   "foreground_beam_issue": {
     "status": "fixed_and_native_gpu_verified",
@@ -843,11 +845,11 @@
     "remaining": "Broader non-Wreck UI audit remains active. Livery material/layout/dialog tests now passed on906 with quad ray rendering."
   },
   "backups": {
-    "branch": "backup/ui-raycast-2026-10-25",
-    "fox": "3cb429eba12e2ee1cfbd21c6ebb64b775f0a3391",
-    "simulator": "a5859eb517a6ef5446b2bfbaef495c808ef0e048",
+    "fox": "88bdf8db99f064bb402fc4da4220bf0aa453ea8d",
+    "simulator": "0548632bcc3848e02352dca1b3a67887e8442b87",
     "remote_verified": true,
-    "note": "Final audio source/tests/compact evidence checkpoint. Current Options and all-menu grey-endpoint work not yet checkpointed."
+    "includes_controller_assets": true,
+    "note": "Subsequent leaderboard and helper fixes are outside this WIP checkpoint."
   },
   "rc906_adoption": {
     "previous": "00c4999b0b0d7184b20aa75ff0ab9bb8342c86b5",
@@ -927,5 +929,6 @@
     "note": "First full left sweep of an earlier layout was interrupted after visual review; not completion evidence. Final buttons-only layout preserves seven rows/page, body bottom padding, separate up/down, ample room for three binding actions.",
     "right_native": "rc906-options-grey-right-paging/result.json"
   },
-  "scrolling_endpoint_inventory": "scrolling-endpoint-audit.json"
+  "scrolling_endpoint_inventory": "scrolling-endpoint-audit.json",
+  "scrolling_validation": "scrolling-validation.json"
 }

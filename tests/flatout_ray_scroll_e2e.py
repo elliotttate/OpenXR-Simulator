@@ -10,10 +10,22 @@ import os
 from pathlib import Path
 import sys
 import uuid
+import numpy as np
+from PIL import Image
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from flatout_frontend_e2e import Frontend, ROOT, RAY_OFFSET, quad_pixel
 from flatout_livery_e2e import screenshot_pixel, ui_surface
+
+
+def statistics_body_ink(capture,image_path):
+    pixels=np.asarray(Image.open(image_path).convert('RGB')).astype(float)
+    (x0,y0),(x1,y1)=[quad_pixel(capture,(x,y,x,y)) for x,y in ((115,186),(1760,898))]
+    patch=pixels[int(min(y0,y1)):int(max(y0,y1))+1,int(min(x0,x1)):int(max(x0,x1))+1]
+    ink=(np.min(patch,axis=2)>155)&(np.ptp(patch,axis=2)<35)
+    count=int(np.sum(ink))
+    assert count>=100,('Statistics descriptions and values must render legibly',count)
+    return count
 
 
 class RayScroll(Frontend):
@@ -41,16 +53,21 @@ class RayScroll(Frontend):
         assert (await self.query('menu.get_state'))['current_menu']==('PLAYER STATS' if self.args.surface=='statistics' else 'OPTIONS')
         if self.args.surface=='options':
             await self.click('settings.category.0')
+            while any(t['name']=='settings.scroll.up' for t in (await self.query('vr.targets'))['targets']):
+                await self.click('settings.scroll.up')
         before=await self.sample()
         args=await self.aim(1050,540)
-        command={**args,'stick':[0,-.65],'hold_frames':30,'command_id':uuid.uuid4().hex}
-        pending=asyncio.create_task(self.tool('scroll_ui_at',command,'smooth-scroll-down'))
+        if self.args.surface=='statistics':
+            count=statistics_body_ink(self.last_capture,self.last_image_path)
+            self.cases.append(dict(case='statistics-body-text-readable',passed=True,bright_pixels=count))
+        command={**args,'stick':[0,-.65],'hold_frames':4,'command_id':uuid.uuid4().hex}
         samples=[]
-        while not pending.done():
+        for _ in range(3):
+            args=await self.aim(1050,540)
+            command={**args,'stick':[0,-.65],'hold_frames':4,'command_id':uuid.uuid4().hex}
+            result=await self.tool('scroll_ui_at',command,'smooth-scroll-down')
+            assert result['status']=='input_delivered',result
             samples.append(await self.sample())
-            await asyncio.sleep(.03)
-        result=await pending
-        assert result['status']=='input_delivered',result
         # At least one row must move by a fractional row, rather than a page
         # jump or repeated digital menu-selection events.
         initial={r['name']:r['rect'][1] for r in before['rows']}

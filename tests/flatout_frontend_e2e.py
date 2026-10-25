@@ -30,7 +30,7 @@ RAY_OFFSET = {"position": [.03, 0, 0], "orientation": [0, -.043619387365336, 0, 
 
 def read_game(pid, method, params=None):
     # RenderDoc records the rendered frame; it cannot activate or navigate UI.
-    assert method in {"game.get_state", "game.errors", "menu.get_state", "vr.targets", "hud.pause_menu", "ui.get_message_box", "options.get_state", "statistics.get_state", "party.get_state", "race.end_screen", "leaderboard.get_state", "hud.rects", "hud.get_node", "rogue.state", "rogue.route_map", "renderdoc.capture", "audio.ui_feedback"}
+    assert method in {"game.get_state", "game.errors", "menu.get_state", "vr.targets", "vr.get_state", "hud.pause_menu", "ui.get_message_box", "options.get_state", "statistics.get_state", "party.get_state", "race.end_screen", "leaderboard.get_state", "hud.rects", "hud.get_node", "rogue.state", "rogue.route_map", "renderdoc.capture", "audio.ui_feedback"}
     if params is None:
         params = {"action": "list"} if method == "hud.pause_menu" else {}
     request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
@@ -70,16 +70,26 @@ class Frontend:
     def __init__(self, args, session):
         self.args, self.session, self.sequence, self.cases = args, session, 0, []
         self.last_capture = None
+        self.calibrated_commands = {}
+        self.query_lock = asyncio.Lock()
 
     async def query(self, method, params=None):
-        return await asyncio.wait_for(asyncio.to_thread(read_game, self.args.pid, method, params), 15)
+        async with self.query_lock:
+            return await asyncio.wait_for(asyncio.to_thread(read_game, self.args.pid, method, params), 15)
 
     async def tool(self, name, args, label):
         if name in ('hover_ui_at','click_ui_at','hold_ui_at','scroll_ui_at'):
+            args={**args,'timeout':args.get('timeout',30)}
+        key=args.get('command_id')
+        if key in self.calibrated_commands:
+            args=self.calibrated_commands[key]
+        elif name in ('hover_ui_at','click_ui_at','hold_ui_at','scroll_ui_at'):
             from flatout_ray_offset import native_pointer_offset
             calibration=native_pointer_offset(await self.query('vr.get_state'),args.get('hand',self.args.hand))
             if calibration is not None:
                 args={**args,'ray_offset':calibration}
+            if key:
+                self.calibrated_commands[key]=dict(args)
         response = await self.session.call_tool(name, args)
         self.sequence += 1
         stem = self.args.evidence/f"{self.sequence:03}-{label}"
@@ -94,7 +104,9 @@ class Frontend:
         return values[0]
 
     async def capture(self, label):
-        self.last_capture = await self.tool("capture_screenshot", {"eye": "left", "max_width": 1280}, label)
+        capture = await self.tool("capture_screenshot", {"eye": "left", "max_width": 1280, "timeout": 30}, label)
+        assert 'capture_id' in capture,capture
+        self.last_capture = capture
         return self.last_capture
 
     async def credits_layout(self):
@@ -760,7 +772,7 @@ class Frontend:
             values = [r["value"] for r in box["rows"]]
             present = [r["index"] for r in box["rows"] if r["present"]]
             seen = set()
-            while (await self.query("options.get_state"))["boxes"][index]["scroll"]["first"]:
+            while (await self.query("options.get_state"))["boxes"][index]["scroll"].get('position',0)>.5:
                 await self.click("settings.scroll.up")
             for _ in range(len(present)+1):
                 current = (await self.query("options.get_state"))["boxes"][index]
@@ -777,7 +789,8 @@ class Frontend:
                     assert not any(t["name"]=="settings.scroll.down" for t in (await self.query("vr.targets"))["targets"])
                     break
                 await self.click("settings.scroll.down")
-                assert (await self.query("options.get_state"))["boxes"][index]["scroll"]["first"]==last+1, "Page skipped or repeated settings"
+                next_first=(await self.query("options.get_state"))["boxes"][index]["scroll"]["first"]
+                assert first<next_first<=last+1, "Paging must advance without skipping settings"
             else:
                 raise AssertionError(("Never reached the final settings page",title))
             assert seen==set(present), (title,seen,present)
