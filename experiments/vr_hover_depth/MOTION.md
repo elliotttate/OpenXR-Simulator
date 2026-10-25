@@ -96,6 +96,20 @@ and same-ID retry produce one click and retire the tile immediately. The actual
 production-header fixture covers the 6 mm press destination and timing; closing
 dialogs deliberately do not wait at that destination before dispatching.
 
+The scoped startup setting `Engine.Renderer.VR.HudButtonReducedMotion = true`
+(default false) keeps this experimental shared native HUD-action transport active,
+but its production motion helper fixes hover, press and return at exactly zero
+metric lift. The coplanar tile supplies a white hover outline, including on the
+primary amber action; both reticles and immediate callbacks remain. Legacy 1.1x
+growth stays suppressed for eligible actions. This setting only applies when
+`Engine.Renderer.VR.ExperimentalHudButtonDepth` is enabled. It adds no save
+schema or public Options preference and does not consume the Wreck Run setting.
+The production-header fixture covers zero travel for all states, interrupted
+motion and resuming ordinary depth. Native reduced-mode tests now pass with both
+hands: zero travel, a visible white outline in each eye, fixed size, rapid focus
+and return, one held-trigger click/retry and immediate tile cleanup. Ordinary
+mode retains its separately verified real 30 mm lift.
+
 Quick Start, Party's player selector and stunt picker, and Statistics now use
 the same head-height reading surface as Options. Native tests verify fixed world
 placement during head motion and visible controls in both eyes with either hand.
@@ -132,8 +146,23 @@ Native evidence for this increment lives under the ignored
 - `rc17f-popup-spacing-renderdoc/rc00c-credits-reader-final`:
   the captured RC `00c4999b0` HUD has alpha 0 outside the plate and in the footer
   gap; pixel history records two stencil-rejected text fragments in that gap.
+- `rc00c-native-normal-final-right` and `rc00c-native-normal-final-left`:
+  real 30 mm movement, stable size, rapid focus and return, raised-face edge input
+  outside the original base rectangle, one click/retry and layer cleanup.
+- `rc00c-native-reduced-motion-green-right` and
+  `rc00c-native-reduced-motion-green-left`: intentional zero-distance feedback,
+  visible white outlines in both eyes, fixed geometry and the same input gates.
+- `rc17f-popup-spacing-renderdoc/native-button-source-atlas-pixels.json`:
+  source-label pixels disappear, the GPU atlas contains the isolated label,
+  guard texels remain transparent and both composed eyes show the same plate.
+- `rc00c-statistics-page-count-green`, `rc00c-statistics-reader-pages-green`
+  and `rc17f-popup-spacing-renderdoc/statistics-reader-alpha-verification.json`:
+  readable white page count, separate paging/actions and a bounded opaque plate
+  with transparent exterior and footer gap. The heading binds its localization
+  ID and aligns with the page controls.
 
-For production motion integration, add rapid open/close and replacement during
-the entrance, cancel during appearance, screen destruction during hover,
-disabled/loading actions, both eyes, both rays, reduced motion, fixed geometry,
-raised-edge clicks, and RenderDoc checks on both quad-layer and world-space paths.
+Before global enablement, finish replacement during entrance/held input,
+recenter/resize, constrained layer budgets, disabled/loading actions and the
+remaining menu transports. Extend the existing both-eye, both-ray, fixed-target,
+reduced-motion and GPU checks when adding the world-space path. A public
+preference and physical-headset evaluation are separate remaining work.

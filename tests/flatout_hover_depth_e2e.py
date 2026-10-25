@@ -15,6 +15,7 @@ import uuid
 import numpy as np
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from PIL import Image
 
 from flatout_frontend_e2e import Frontend, RAY_OFFSET, quad_pixel
 from flatout_livery_e2e import quaternion_matrix
@@ -82,9 +83,22 @@ class NativeDepth(Frontend):
         head = np.array(raised["geometry"]["head"]["position"])
         approach = float(np.linalg.norm(center-head)-np.linalg.norm(np.array(tile["pose"]["position"])-head))
         assert np.linalg.norm(delta[:2]) < .006, ("Button slid sideways", delta.tolist())
-        assert .020 <= delta[2] <= .035 and approach >= .018, ("Button did not physically approach the camera", delta.tolist(), approach)
+        if self.args.reduced_motion:
+            assert np.linalg.norm(delta)<.001 and abs(approach)<.001,("Reduced motion still changes physical distance",delta.tolist(),approach)
+            pixels=np.asarray(Image.open(self.last_image_path).convert("RGB")).astype(float)
+            face=copy.deepcopy(raised);face["geometry"]["surfaces"]=[tile]
+            feedback=[]
+            for eye in ("left","right"):
+                x0,y0=quad_pixel(face,(0,0,0,0),eye);x1,y1=quad_pixel(face,(76.8,1080,76.8,1080),eye)
+                patch=pixels[int(np.floor(min(y0,y1))):int(np.ceil(max(y0,y1))),int(np.floor(min(x0,x1))):int(np.ceil(max(x0,x1)))]
+                white=(np.min(patch,axis=2)>160)&(np.max(patch,axis=2)-np.min(patch,axis=2)<30)
+                count=int(np.sum(white));feedback.append({"eye":eye,"white_border_pixels":count})
+                assert count>=8,("Reduced motion lacks flat hover feedback",feedback)
+            self.cases.append({"case":"reduced-motion-keeps-flat-color-feedback-in-both-eyes","passed":True,"feedback":feedback})
+        else:
+            assert .020 <= delta[2] <= .035 and approach >= .018, ("Button did not physically approach the camera", delta.tolist(), approach)
         assert np.allclose(tile["size"], expected_size, atol=.006), ("Hover changed the physical button size", tile["size"], expected_size)
-        self.cases.append({"case": "native-button-physically-approaches-without-scaling", "passed": True,
+        self.cases.append({"case": "native-button-flat-without-scaling" if self.args.reduced_motion else "native-button-physically-approaches-without-scaling", "passed": True,
                            "local_delta_m": delta.tolist(), "camera_approach_m": approach,
                            "tile": tile, "source_rect": action["rect"]})
         if self.args.raised_edge_top:
@@ -128,7 +142,8 @@ async def main(args):
     args.evidence.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, "SIMXR_DATA_DIR": str(args.data_dir.resolve())}
     params = StdioServerParameters(command=sys.executable, args=[str(ROOT/"mcp-server/openxr_simulator_mcp.py")], env=env)
-    result = {"passed": False, "pid": args.pid, "hand": args.hand, "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click"}
+    result = {"passed": False, "pid": args.pid, "hand": args.hand, "reduced_motion":args.reduced_motion,
+              "scope": "Native dialog intentional flat feedback, BOTH-eye XR layers and one ray click" if args.reduced_motion else "Native dialog physical depth, actual BOTH-eye XR layers and one ray click"}
     async with stdio_client(params) as streams:
         async with ClientSession(*streams) as session:
             await session.initialize()
@@ -155,4 +170,8 @@ if __name__ == "__main__":
     parser.add_argument("--hand", choices=("left", "right"), default="right")
     parser.add_argument("--raised-edge-top", action="store_true", help="Hover and click the raised face near its top edge, proving the hand ray misses the original base rectangle")
     parser.add_argument("--motion-lifecycle", action="store_true", help="Move Cancel to Validate to Cancel, then exit and verify transient layers return before the final hover/click")
-    asyncio.run(main(parser.parse_args()))
+    parser.add_argument("--reduced-motion", action="store_true", help="Require zero physical travel with visible flat hover feedback in both eyes")
+    args=parser.parse_args()
+    if args.reduced_motion and args.raised_edge_top:
+        parser.error("--raised-edge-top needs physical movement; test reduced motion separately")
+    asyncio.run(main(args))

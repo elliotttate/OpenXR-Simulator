@@ -44,5 +44,21 @@ int main()
 	const float unchanged = fast.meters;
 	fast.Update(false, false, 0.f); fast.Update(false, false, -1.f);
 	require(std::fabs(fast.meters - unchanged) < .000001f, "Paused or invalid negative elapsed time cannot teleport the face");
+	HudButtonMotion reduced;
+	for (int i = 0; i < 90; ++i)
+	{
+		reduced.Update(true, false, 1.f / 90.f, true);
+		require(reduced.meters == 0.f, "Reduced hover stays exactly on the source plane");
+		reduced.Update(true, true, 1.f / 90.f, true);
+		require(reduced.meters == 0.f, "Reduced press has zero physical travel");
+		reduced.Update(false, false, 1.f / 90.f, true);
+		require(reduced.meters == 0.f, "Reduced exit has zero return travel");
+	}
+	fast.Update(true, false, .3f);
+	require(fast.meters > .029f, "Ordinary depth remains active when reduced motion is false");
+	fast.Update(true, false, 0.f, true);
+	require(fast.meters == 0.f, "Reducing an interrupted or paused hover immediately removes depth travel");
+	fast.Update(true, false, .135f, false);
+	require(fast.meters > .0284f && fast.meters < .030f, "Ordinary hover can resume from the plane without overshoot");
 	std::puts("production HUD button motion: PASS");
 }

@@ -210,7 +210,12 @@ screenshot precision is reported, not presented as a submillimeter display
 measurement. Before global enablement, cover dialog replacement, recenter/resize,
 disabled/loading actions, localized labels, slider ownership and the remaining
 menu transports. A production reduced-motion option is still needed: disabling
-the experiment currently restores the legacy flat hover treatment.
+the experiment currently restores the legacy flat hover treatment. Within the
+enabled experimental transport, startup setting
+`Engine.Renderer.VR.HudButtonReducedMotion = true` now provides an intentional
+flat alternative. Native tests with both hands verify zero travel, visible white
+outlines, fixed size, rapid focus/return and one click/retry. There is no public
+in-game preference for this experimental setting yet.
 
 ## Primary research
 
@@ -261,3 +266,6 @@ With the rebuilt native game running and a cancelable dialog already open:
 
 Repeat with `--hand left` and a fresh dialog/evidence directory. Diagnostics are
 read-only; hover and click are delivered through actual XR action input.
+For the startup reduced setting, replace `--raised-edge-top` with
+`--reduced-motion`; that gate requires zero travel and visible flat feedback in
+each eye. Keep `--motion-lifecycle` to exercise return and cleanup.
