@@ -251,6 +251,13 @@ class Frontend:
         assert intermediate,"The popup snapped on without an observable entrance fade"
         assert samples[-1]["alpha"]>=.99,"The popup did not become fully readable"
         assert all(b["alpha"]>=a["alpha"] for a,b in zip(samples,samples[1:])),"The entrance fade restarted or reversed"
+        if self.args.max_popup_fade_seconds is not None:
+            assert len(intermediate)>=2,"Need two intermediate native frames to measure the fade"
+            slope=float(np.polyfit([s["seconds"]for s in intermediate],[s["alpha"]for s in intermediate],1)[0])
+            duration=1./slope
+            self.cases.append({"case":"popup-entrance-response-time","passed":0<duration<=self.args.max_popup_fade_seconds,
+                               "estimated_seconds":duration,"maximum_seconds":self.args.max_popup_fade_seconds})
+            assert 0<duration<=self.args.max_popup_fade_seconds,("Dialog entrance is too slow",duration)
         await self.popup_spacing()
         await self.popup_no_prompts()
 
@@ -2138,6 +2145,7 @@ if __name__ == "__main__":
     parser.add_argument("--credits-only", action="store_true", help="From Credits: check the clipped reading panel, pause/resume, held forward/rewind and one Back click")
     parser.add_argument("--credits-layout-only", action="store_true", help="From Credits: check its bounded panel, separate transport dock and both-eye standing visibility")
     parser.add_argument("--popup-motion-only", action="store_true", help="From the spatial main menu: ray-hover Quit, click it once, observe the native entrance fade, then ray-cancel once")
+    parser.add_argument("--max-popup-fade-seconds", type=float, help="With --popup-motion-only: bound the entrance duration estimated from intermediate native alpha frames")
     parser.add_argument("--popup-no-prompts-only", action="store_true", help="From a cancelable modal: verify soundtrack prompts are hidden, ray Cancel fires once and the same menu returns")
     parser.add_argument("--popup-anchor-only", action="store_true", help="From an open popup at the default standing head pose: check visibility in both eyes, stable placement during head motion and actual ray hover")
     parser.add_argument("--popup-spacing-only", action="store_true", help="From an open popup: verify content padding, caption spacing and the separate ray-button action row")
