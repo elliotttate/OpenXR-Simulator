@@ -1,0 +1,911 @@
+{
+  "rc": "906721488adde53a92cba6c8ac8a59813b85ceef",
+  "native_results": [
+    {
+      "directory": "rc00c-credits-startup-green",
+      "passed": true,
+      "pid": 65024,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-credits-immediate-stop-green",
+      "passed": true,
+      "pid": 65024,
+      "scope": "Credits Pause freezes the reading position immediately through real XR actions",
+      "case_count": 1
+    },
+    {
+      "directory": "rc00c-credits-controls-green-right",
+      "passed": true,
+      "pid": 65024,
+      "scope": "Credits readable viewport, transport controls and live scene through real XR actions",
+      "case_count": 9
+    },
+    {
+      "directory": "rc00c-credits-controls-green-left",
+      "passed": true,
+      "pid": 65024,
+      "scope": "Credits readable viewport, transport controls and live scene through real XR actions",
+      "case_count": 8
+    },
+    {
+      "directory": "rc00c-credits-complete-roll-green",
+      "passed": true,
+      "pid": 65024,
+      "scope": "Complete Credits playback, continuous ray hold and automatic ending fade through real XR actions",
+      "case_count": 3
+    },
+    {
+      "directory": "rc00c-dialog-motion-startup-green",
+      "passed": true,
+      "pid": 34120,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-popup-quick-motion-green-right",
+      "passed": true,
+      "pid": 34120,
+      "scope": "Native popup entrance fade and interruption-free ray input through real XR actions",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-popup-quick-motion-green-left",
+      "passed": true,
+      "pid": 34120,
+      "scope": "Native popup entrance fade and interruption-free ray input through real XR actions",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-options-categories-green",
+      "passed": true,
+      "pid": 34120,
+      "scope": "Options categories and ray scrolling through real XR actions",
+      "case_count": 87,
+      "categories": 7,
+      "settings": 104
+    },
+    {
+      "directory": "rc00c-options-interactions-green",
+      "passed": true,
+      "pid": 34120,
+      "scope": "Options choices, toggles, sliders, reset and binding capture through real XR actions",
+      "case_count": 22
+    },
+    {
+      "directory": "rc00c-options-comfort-native-green-right",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Options head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-options-comfort-native-green-left",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Options head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-options-head-height-categories-green",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Options categories and ray scrolling through real XR actions",
+      "case_count": 87
+    },
+    {
+      "directory": "rc00c-options-head-height-dual-rays-green",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Dual-hand Options slider ownership through real XR actions",
+      "case_count": 3
+    },
+    {
+      "directory": "rc00c-options-head-height-interactions-green",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Options choices, toggles, sliders, reset and binding capture through real XR actions",
+      "case_count": 22
+    },
+    {
+      "directory": "rc00c-options-head-height-footer-green",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Footer background and action hover through real XR actions",
+      "case_count": 3
+    },
+    {
+      "directory": "rc00c-options-seated-comfort-green",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Options head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-options-seated-footer-green",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Footer background and action hover through real XR actions",
+      "case_count": 3
+    },
+    {
+      "directory": "rc00c-options-head-height-stereo-rays-green",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Both menu rays in both eyes through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-quick-start-native-sweep",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Quick Start event cards, settings and next step through real XR actions",
+      "case_count": 79
+    },
+    {
+      "directory": "rc00c-party-player-choice-left",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Party player-count layout and selection through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-party-stunts-left",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Party stunt pages, playlist and Start through real XR actions",
+      "case_count": 32
+    },
+    {
+      "directory": "rc00c-multiplayer-spatial-left",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Spatial menu labels and screenshot aiming through real XR actions",
+      "case_count": 3
+    },
+    {
+      "directory": "rc00c-multiplayer-spatial-back",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Spatial Back visibility, edge misses, both hands and one activation through real XR actions",
+      "case_count": 10
+    },
+    {
+      "directory": "rc00c-online-unavailable-dialog-right",
+      "passed": true,
+      "pid": 48488,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-native-depth-startup-dialog",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-native-hover-depth-green-right",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click",
+      "case_count": 3
+    },
+    {
+      "directory": "rc00c-native-hover-depth-green-left",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click",
+      "case_count": 3
+    },
+    {
+      "directory": "rc00c-native-depth-popup-motion-left",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Native popup entrance fade and interruption-free ray input through real XR actions",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-quick-start-comfort-green-right",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Quick Start head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-quick-start-comfort-green-left",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Quick Start head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-quick-start-head-height-sweep",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Quick Start event cards, settings and next step through real XR actions",
+      "case_count": 79
+    },
+    {
+      "directory": "rc00c-party-players-comfort-green-right",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Reading-menu head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-party-players-comfort-green-left",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Reading-menu head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-party-head-height-players",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Party player-count layout and selection through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-party-stunts-comfort-green-right",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Reading-menu head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-party-stunts-comfort-green-left",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Reading-menu head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-party-head-height-stunts",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Party stunt pages, playlist and Start through real XR actions",
+      "case_count": 32
+    },
+    {
+      "directory": "rc00c-multiplayer-back-depth-build",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Spatial Back visibility, edge misses, both hands and one activation through real XR actions",
+      "case_count": 10
+    },
+    {
+      "directory": "rc00c-statistics-comfort-green-right",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Reading-menu head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-statistics-comfort-green-left",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Reading-menu head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-statistics-header-arrows-green",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Statistics page controls and category navigation through real XR actions",
+      "case_count": 12
+    },
+    {
+      "directory": "rc00c-native-hover-lifecycle-edge-right",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-native-hover-lifecycle-edge-left",
+      "passed": true,
+      "pid": 95288,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-stats-reading-startup",
+      "passed": true,
+      "pid": 45012,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-statistics-page-count-green",
+      "passed": true,
+      "pid": 45012,
+      "scope": "Statistics page-count legibility through real XR actions",
+      "case_count": 1
+    },
+    {
+      "directory": "rc00c-statistics-reader-comfort-right",
+      "passed": true,
+      "pid": 45012,
+      "scope": "Reading-menu head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-statistics-reader-comfort-left",
+      "passed": true,
+      "pid": 45012,
+      "scope": "Reading-menu head-height placement and world-locked both-eye visibility through real XR actions",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-statistics-reader-pages-green",
+      "passed": true,
+      "pid": 45012,
+      "scope": "Statistics page controls and category navigation through real XR actions",
+      "case_count": 12
+    },
+    {
+      "directory": "rc00c-statistics-reader-back-green",
+      "passed": true,
+      "pid": 45012,
+      "scope": "Footer background and action hover through real XR actions",
+      "case_count": 3
+    },
+    {
+      "directory": "rc00c-extras-back-reading-build",
+      "passed": true,
+      "pid": 45012,
+      "scope": "Spatial Back visibility, edge misses, both hands and one activation through real XR actions",
+      "case_count": 10
+    },
+    {
+      "directory": "rc00c-native-normal-final-right",
+      "passed": true,
+      "pid": 45012,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-native-normal-final-left",
+      "passed": true,
+      "pid": 45012,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-reduced-motion-startup",
+      "passed": true,
+      "pid": 5156,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-native-reduced-motion-green-right",
+      "passed": true,
+      "pid": 5156,
+      "scope": "Native dialog intentional flat feedback, BOTH-eye XR layers and one ray click",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-native-reduced-motion-green-left",
+      "passed": true,
+      "pid": 5156,
+      "scope": "Native dialog intentional flat feedback, BOTH-eye XR layers and one ray click",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-normal-restored-startup",
+      "passed": true,
+      "pid": 61160,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-normal-restored-depth",
+      "passed": true,
+      "pid": 61160,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-extras-back-postmotion",
+      "passed": true,
+      "pid": 61160,
+      "scope": "Spatial Back visibility, edge misses, both hands and one activation through real XR actions",
+      "case_count": 10
+    },
+    {
+      "directory": "rc00c-career-welcome-build-startup",
+      "passed": true,
+      "pid": 4888,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-career-welcome-scene-green-right",
+      "passed": true,
+      "pid": 4888,
+      "scope": "First Career welcome preserves the live scene and opens car selection after acknowledgement through real XR actions",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-career-welcome-scene-green-left",
+      "passed": true,
+      "pid": 4888,
+      "scope": "First Career welcome preserves the live scene and opens car selection after acknowledgement through real XR actions",
+      "case_count": 5
+    },
+    {
+      "directory": "rc00c-hold-lifecycle-startup",
+      "passed": true,
+      "pid": 70772,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-native-modal-replacement-green-right",
+      "passed": true,
+      "pid": 70772,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click; setup-only same native BASE modal injection and real XR held-input/replacement lifecycle",
+      "case_count": 8
+    },
+    {
+      "directory": "rc00c-native-modal-replacement-green-left",
+      "passed": true,
+      "pid": 70772,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click; setup-only same native BASE modal injection and real XR held-input/replacement lifecycle",
+      "case_count": 8
+    },
+    {
+      "directory": "rc00c-challenge-startup-r3-green",
+      "passed": true,
+      "pid": 4024,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-preview-dock-startup-green",
+      "passed": true,
+      "pid": 33328,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-challenge-browser-dock-green-right",
+      "passed": true,
+      "pid": 33328,
+      "scope": "Complete FlatOut Mode browser layout, 42-event paging, actual XR hover/click and safe vehicle preview",
+      "case_count": 91
+    },
+    {
+      "directory": "rc00c-challenge-browser-dock-green-left",
+      "passed": true,
+      "pid": 33328,
+      "scope": "Complete FlatOut Mode browser layout, 42-event paging, actual XR hover/click and safe vehicle preview",
+      "case_count": 91
+    },
+    {
+      "directory": "rc00c-quad-ray-startup-r2",
+      "passed": true,
+      "pid": 97068,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc00c-quad-ray-world-r2-plane",
+      "passed": true,
+      "pid": 97068,
+      "scope": "Both real hand beams in front of an opaque compositor UI, with surface cursors in both eyes",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-quad-ray-world-head-native-r2",
+      "passed": true,
+      "pid": 97068,
+      "scope": "Both real hand beams in front of an opaque compositor UI, with surface cursors in both eyes",
+      "case_count": 2
+    },
+    {
+      "directory": "rc00c-quad-ray-stereo-click-final-r2-native",
+      "passed": true,
+      "pid": 97068,
+      "scope": "Both real hand beams in front of an opaque compositor UI, with surface cursors in both eyes",
+      "case_count": 6
+    },
+    {
+      "directory": "rc00c-quad-ray-car-preview-r2",
+      "passed": true,
+      "pid": 97068,
+      "scope": "Fixed event-car preview spacing, blank held-click safety and Back",
+      "case_count": 13
+    },
+    {
+      "directory": "rc00c-quad-ray-raised-dialog-left-r2",
+      "passed": true,
+      "pid": 97068,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click",
+      "case_count": 6
+    },
+    {
+      "directory": "rc00c-quad-ray-raised-dialog-right-r2",
+      "passed": true,
+      "pid": 97068,
+      "scope": "Native dialog physical depth, actual BOTH-eye XR layers and one ray click",
+      "case_count": 6
+    },
+    {
+      "directory": "rc906-livery-startup",
+      "passed": true,
+      "pid": 102968,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "name": "rc906-direct-final-startup",
+      "path": "build-ui-automation\\flatout4-evidence\\rc906-direct-final-startup\\result.json",
+      "passed": true,
+      "cases": 4,
+      "pid": 65688
+    },
+    {
+      "name": "rc906-direct-final-fixed-artwork",
+      "path": "build-ui-automation\\flatout4-evidence\\rc906-direct-final-fixed-artwork\\result.json",
+      "passed": true,
+      "cases": 16,
+      "pid": 65688
+    },
+    {
+      "name": "rc906-direct-final-placement",
+      "path": "build-ui-automation\\flatout4-evidence\\rc906-direct-final-placement\\result.json",
+      "passed": true,
+      "cases": 7,
+      "pid": 65688
+    },
+    {
+      "name": "rc906-direct-sticker-final-bounded",
+      "path": "build-ui-automation\\flatout4-evidence\\rc906-direct-sticker-final-bounded\\result.json",
+      "passed": true,
+      "cases": 19,
+      "pid": 65688
+    },
+    {
+      "name": "rc906-direct-final-stereo",
+      "path": "build-ui-automation\\flatout4-evidence\\rc906-direct-final-stereo\\result.json",
+      "passed": true,
+      "cases": 3,
+      "pid": 65688
+    },
+    {
+      "directory": "rc906-atlas-green-ready-startup",
+      "passed": true,
+      "pid": 39196,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc906-atlas-green-material",
+      "passed": true,
+      "pid": 39196,
+      "scope": "Material-only ray edits preserve atlas; real sticker edits and release update it",
+      "case_count": 31
+    },
+    {
+      "directory": "rc906-atlas-green-layout",
+      "passed": true,
+      "pid": 39196,
+      "scope": "Actual RC livery UI through simulator XR actions; game diagnostics read only",
+      "case_count": 38
+    },
+    {
+      "directory": "rc906-atlas-green-ray-dialogs",
+      "passed": true,
+      "pid": 39196,
+      "scope": "Actual RC livery UI through simulator XR actions; game diagnostics read only",
+      "case_count": 55
+    },
+    {
+      "directory": "rc906-ui-audio-startup",
+      "passed": true,
+      "pid": 45944,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    },
+    {
+      "directory": "rc906-ui-audio-world-quiet",
+      "passed": true,
+      "pid": 45944,
+      "scope": "world",
+      "case_count": 6
+    },
+    {
+      "directory": "rc906-ui-audio-volume",
+      "passed": true,
+      "pid": 45944,
+      "scope": "Sound FX and Master mute and restoration",
+      "case_count": 11
+    },
+    {
+      "directory": "rc906-ui-audio-quad",
+      "passed": true,
+      "pid": 45944,
+      "scope": "Real compositor quad ray audio with both hands and speaker waveform verification",
+      "case_count": 7
+    },
+    {
+      "directory": "rc906-ui-audio-final-world",
+      "passed": true,
+      "pid": 56808,
+      "scope": "world",
+      "case_count": 6
+    },
+    {
+      "directory": "rc906-ui-audio-final-quad",
+      "passed": true,
+      "pid": 56808,
+      "scope": "quad",
+      "case_count": 7
+    },
+    {
+      "directory": "rc906-ui-audio-corrective-modal",
+      "passed": true,
+      "pid": 56808,
+      "scope": "modal",
+      "case_count": 6
+    },
+    {
+      "directory": "rc906-ui-audio-corrective-livery",
+      "passed": true,
+      "pid": 56808,
+      "scope": "livery",
+      "case_count": 26
+    },
+    {
+      "directory": "rc906-ui-audio-corrective-livery-exit",
+      "passed": true,
+      "pid": 56808,
+      "scope": "livery-exit",
+      "case_count": 5
+    },
+    {
+      "directory": "rc906-ui-audio-final-volume",
+      "passed": true,
+      "pid": 56808,
+      "scope": "Sound FX and Master mute and restoration",
+      "case_count": 12
+    },
+    {
+      "directory": "rc906-ui-audio-corrective-startup",
+      "passed": true,
+      "pid": 56808,
+      "scope": "Single informational dialog through real XR actions",
+      "case_count": 4
+    }
+  ],
+  "scope_note": "Latest-RC native shared HUD-dialog physical depth is integrated behind an experimental startup flag. Credits, Options, Quick Start, Party and Statistics increments are native validated; the entire non-Wreck UI audit remains active. Other menu transports and physical-headset evaluation remain outstanding.",
+  "credits_gpu": "rc17f-popup-spacing-renderdoc/rc00c-credits-reader-final/renderdoc-credits-stencil.json",
+  "backup": {
+    "branch": "backup/ui-raycast-2026-10-25",
+    "fox": "dd9ea4a6a5cbab1a34312929364b6598ceeeee04",
+    "simulator": "5638cb7dc98aa76336e5f9858e54d8178a7fadf7",
+    "remote_verified": true
+  },
+  "options_placement": {
+    "original_red": "rc00c-options-comfort-native-red",
+    "routing_red": "rc00c-options-comfort-ray-routing-red",
+    "in_progress": false,
+    "native_green": [
+      "rc00c-options-comfort-native-green-right",
+      "rc00c-options-comfort-native-green-left"
+    ],
+    "gpu_red": "rc17f-popup-spacing-renderdoc/rc00c-options-comfort-red/anchor-composed-proof.json",
+    "gpu_green": "rc17f-popup-spacing-renderdoc/rc00c-options-comfort-green/anchor-composed-proof.json"
+  },
+  "final_game_errors": {
+    "entries": [],
+    "queue_mode": true,
+    "returned": 0,
+    "total": 0
+  },
+  "original_profile_and_liveries_unchanged": true,
+  "pending_current_source_validation": [
+    "Experimental shared HUD-action scope: entrance-time replacement, recenter/resize, constrained layer budgets, disabled/loading actions and other menu transports remain before global enablement.",
+    "No public in-game preference yet for the experimental startup-only reduced-motion setting.",
+    "The new replacement/held-trigger gate passed in ordinary motion; its reduced-motion variant remains untested."
+  ],
+  "limitations": [
+    "Online entry reaches Connection Error; lobby/browser coverage awaits reachable backend.",
+    "Native simulation and GPU rendering checked; physical-headset feel/performance remain unmeasured."
+  ],
+  "latest_backup": {
+    "branch": "backup/ui-raycast-2026-10-25",
+    "fox": "e4bd9d29977a66aa4486c78f5e8f32ec36372876",
+    "simulator": "644172ca6f918606b927c32e099816569fe5443e",
+    "remote_verified": true,
+    "note": "Direct artwork + fixed-artwork capability support; final functional tests/harness cleanup. Broader UI audit and Debug capture latency remain open."
+  },
+  "gpu_results": [
+    "rc17f-popup-spacing-renderdoc/native-button-source-atlas-pixels.json",
+    "rc17f-popup-spacing-renderdoc/rc00c-quick-start-comfort-green/anchor-composed-proof.json",
+    "rc17f-popup-spacing-renderdoc/statistics-reader-alpha-verification.json",
+    "rc17f-popup-spacing-renderdoc/rc00c-career-welcome-scene-green-r2/career-welcome-alpha-verification.json",
+    "latest-rc-ui-integration/quad-ray-native-order-verification.json"
+  ],
+  "resolved_runtime_staging": {
+    "buick": "11 generated lists, currentRC source+253 runtime-reference hashes matched",
+    "jason": "16 generated lists, currentRC source+430 runtime-reference hashes matched",
+    "fresh_native_routes": "45012 driver +garage actual XR routes game.errors0; normal exit wrapper0",
+    "reduced_native_run": "5156 game.errors0 and normal exit wrapper0"
+  },
+  "native_review": "../hover-depth-evidence/native-review.html",
+  "current_native_run": {
+    "pid": 56808,
+    "running": false,
+    "normal_exit": 0,
+    "wrapper_exit": 0,
+    "native_log_problems": 0,
+    "test_slot": 991025003
+  },
+  "career_welcome": {
+    "native_red": "rc00c-career-welcome-black-red",
+    "native_green": [
+      "rc00c-career-welcome-scene-green-right",
+      "rc00c-career-welcome-scene-green-left"
+    ],
+    "scene_fraction_red": [
+      0.0,
+      0.0
+    ],
+    "scene_fraction_green": [
+      1.0,
+      1.0
+    ],
+    "gpu_green": "rc17f-popup-spacing-renderdoc/rc00c-career-welcome-scene-green-r2/career-welcome-alpha-verification.json",
+    "original_profile_and_liveries_unchanged": true
+  },
+  "held_modal_replacement": {
+    "native_red": "rc00c-native-modal-replacement-right",
+    "native_green": [
+      "rc00c-native-modal-replacement-green-right",
+      "rc00c-native-modal-replacement-green-left"
+    ],
+    "simulator_ctest": "latest-rc-ui-integration/simulator-hold-lifecycle-ctest.log",
+    "selected_ctest_result": "7/7 passed",
+    "scope": "Same BASE descriptor A/B/C fixtures set up by explicitly journaled non-Retail bridge; all hover/hold/release/activation by screenshot-derived actual XR actions. Ordinary motion only for new replacement gate."
+  },
+  "latest_rc_verified": "origin/rc/2026-10-22=906721488adde53a92cba6c8ac8a59813b85ceef (native current RC906 with preserved111-file UI overlay)",
+  "runtime_loaded_module_evidence": "rc906-direct-final-loaded-modules.json",
+  "source_tree_snapshot_ready": {
+    "fox": "8ea68cea0cbb60392823d9dadf49a847106e6e42",
+    "simulator": "112365245db735adb5e618fd8d1b80a5c64bfd19",
+    "push_pending": false
+  },
+  "panel_volume_prototype": {
+    "directory": "experiments/ui_panel_volume",
+    "renderer": "D3D11 SM5 WARP software, isolated from game",
+    "run": "experiments/ui_panel_volume/test.ps1",
+    "passed": true,
+    "strict_panel_head_on_changed_pixels": [
+      0,
+      0
+    ],
+    "panel_thickness_mm": [
+      4,
+      8
+    ],
+    "button_rest_mm": 3,
+    "hover_additional_mm": 30,
+    "negative_controls": [
+      "flat_geometry",
+      "flat_GPU",
+      "duplicated_eye"
+    ],
+    "production_integrated": false,
+    "results": "experiments/ui_panel_volume/evidence/volume/results.json"
+  },
+  "native_current": {
+    "runtime": "C:\\Users\\ellio\\Documents\\GitHub\\OpenXR-Simulator\\bin\\ui-sweep-3\\openxr_simulator.json",
+    "mode": "Debug",
+    "data": "C:\\Users\\ellio\\Documents\\GitHub\\OpenXR-Simulator\\build-ui-automation\\flatout4-evidence\\20261024-rc-livery",
+    "test_slot": "991025003",
+    "pid": 56808,
+    "exe": "D:\\FoxWorktrees\\ui-raycast-rc9-20261025\\PlayAll\\Libs\\vs2022\\x64\\DllLauncher64_d.exe",
+    "rc": "906721488adde53a92cba6c8ac8a59813b85ceef",
+    "branch": "codex/ui-raycast-rc9-20261025",
+    "game_dll_sha256": "3d15ec663375deca83d09295613ef65486b6a44897c042c1e548b99db0a2f38e",
+    "engine_dll_sha256": "219be31b93d8100f4294623da61c7673e8a5f053ad4f5a0ccad89568162e7adc",
+    "runtime_dll_sha256": "76d8a35ed92b2d9c0f14716f1edaf9618b9541ea0d9580abe99254a98c3ac857"
+  },
+  "foreground_beam_issue": {
+    "status": "fixed_and_native_gpu_verified",
+    "implementation": "Two physical BOTH-eye LOCAL ribbon quad layers, after UI and raised tiles, premultiplied shared color palette; original scene beam suppressed. Owner cleanup and six-layer budget; omit near-hand ribbons shorter than5cm.",
+    "simulator": "One-texel thin ribbons exported as decorations, preserving metric diagnostic geometry and excluding automatic UI targeting.",
+    "native_r2_results": [
+      "rc00c-quad-ray-startup-r2",
+      "rc00c-quad-ray-world-r2-plane",
+      "rc00c-quad-ray-world-head-native-r2",
+      "rc00c-quad-ray-stereo-click-final-r2-native",
+      "rc00c-quad-ray-car-preview-r2",
+      "rc00c-quad-ray-raised-dialog-left-r2",
+      "rc00c-quad-ray-raised-dialog-right-r2"
+    ],
+    "gpu_proof": "C:\\Users\\ellio\\Documents\\GitHub\\OpenXR-Simulator\\build-ui-automation\\flatout4-evidence\\latest-rc-ui-integration\\quad-ray-native-order-verification.json",
+    "profile_hashes": "C:\\Users\\ellio\\Documents\\GitHub\\OpenXR-Simulator\\build-ui-automation\\flatout4-evidence\\latest-rc-ui-integration\\protected-profile-hashes-after-quad-rays.json",
+    "native_errors": 0,
+    "normal_exit": 0,
+    "simulator_checks_passed": 8,
+    "headset_or_performance_tested": false,
+    "remaining": "Broader non-Wreck UI audit remains active. Livery material/layout/dialog tests now passed on906 with quad ray rendering."
+  },
+  "backups": {
+    "branch": "backup/ui-raycast-2026-10-25",
+    "fox": "32d2eb38025dae1645735c60da5305c052939646",
+    "simulator": "d03d365fc4e0a6bf4c8a43c13d54b831eebc4248",
+    "remote_verified": true,
+    "note": "Atlas native/GPU passed and initial audio source+LFS checkpoint. Later native audio corrections and verification pending."
+  },
+  "rc906_adoption": {
+    "previous": "00c4999b0b0d7184b20aa75ff0ab9bb8342c86b5",
+    "current": "906721488adde53a92cba6c8ac8a59813b85ceef",
+    "new_root": "D:/FoxWorktrees/ui-raycast-rc9-20261025",
+    "overlay_preservation": "rc906-ui-overlay-source.json",
+    "runtime_seed": "rc906-runtime-seed.json",
+    "upstream_paths": 18,
+    "overlay_tracked": 109,
+    "overlay_untracked": 2,
+    "overlap": 0,
+    "old_source_and_index_unchanged": true
+  },
+  "direct_sticker_editing": {
+    "status": "Implemented and native verified",
+    "portable_checks": 356,
+    "native_green": "rc906-direct-sticker-final-bounded/result.json",
+    "native_fixed_size_green": "rc906-direct-final-fixed-artwork/result.json",
+    "native_final_placement_green": "rc906-direct-final-placement/result.json",
+    "gpu_proof": "rc906-direct-grab-gpu/gpu-proof.json",
+    "reference": "LiveryStudio f3ee13783cca888a7647924d17968d96fc893dc4",
+    "pending": [
+      "broader non-Wreck UI audit",
+      "actual headset comfort/performance"
+    ],
+    "native_stereo_green": "rc906-direct-final-stereo/result.json",
+    "normal_exit": 0,
+    "native_errors": 0,
+    "protected_profile_files_unchanged": 9
+  },
+  "livery_atlas_updates": {
+    "status": "implemented-native-and-gpu-verified",
+    "fox_rc": "906721488adde53a92cba6c8ac8a59813b85ceef",
+    "game_dll_sha256": "f78707b78d6a69d38c64f7ea33bb78a5ea41d24b08eecc61a334451d07e6dc9b",
+    "pid": 39196,
+    "native_red": "rc906-paint-atlas-native-red/result.json",
+    "native_green": [
+      "rc906-atlas-green-material/result.json",
+      "rc906-atlas-green-layout/result.json",
+      "rc906-atlas-green-ray-dialogs/result.json"
+    ],
+    "gpu_proof": "rc906-atlas-green-material/gpu-proof.json",
+    "portable_livery_assertions": 105040,
+    "portable_vr_checks": 356,
+    "normal_exit": 0,
+    "native_log_errors": 0,
+    "protected_profile_files_unchanged": 9,
+    "scope": "Material and metadata edits retain full sticker atlas; sticker edits invalidate preview then release rebuilds full quality",
+    "limits": "Debug update measurements are not VR frame-time or hardware comfort benchmarks. Broader non-Wreck UI audit and native audio integration remain active.",
+    "native_case_counts": [
+      31,
+      38,
+      55
+    ]
+  },
+  "ui_audio": {
+    "status": "Implemented and native verified",
+    "validation": "audio-validation.json",
+    "native_cases": 62,
+    "portable_checks": 509,
+    "speaker_source_matches": 29,
+    "music_restore_pending": false,
+    "headset_tested": false
+  }
+}

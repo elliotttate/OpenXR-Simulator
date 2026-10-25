@@ -1,0 +1,15 @@
+{
+  "recording": "build-ui-automation\\flatout4-evidence\\rc906-ui-audio-corrective-modal\\accepted-msgbox.cancel-right-2.wav",
+  "legacy_back": {
+    "correlation": 0.06607346469090605,
+    "gain": 0.0036741994570146986,
+    "offset_seconds": 1.5370416666666666,
+    "template_seconds": 0.5180833333333333
+  },
+  "trombone_click": {
+    "correlation": 0.8676903462695501,
+    "gain": 0.7141616029969599,
+    "offset_seconds": 0.903,
+    "template_seconds": 0.2626041666666667
+  }
+}

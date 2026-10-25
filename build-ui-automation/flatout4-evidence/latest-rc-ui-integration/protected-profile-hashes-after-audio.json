@@ -1,0 +1,59 @@
+{
+  "passed": true,
+  "files": [
+    {
+      "path": "C:\\Users\\ellio\\Documents\\My Games\\Flatout VR\\UserSettings.cfg",
+      "sha256": "3ed38929010b95e5810f7ee7e1a6b75b495170f4c5c0f8aa247b83ae3139847b",
+      "sha256_now": "3ed38929010b95e5810f7ee7e1a6b75b495170f4c5c0f8aa247b83ae3139847b",
+      "unchanged": true
+    },
+    {
+      "path": "C:\\Users\\ellio\\Documents\\My Games\\Flatout VR\\Save",
+      "sha256": "e8c1dea7d441fdaaa13d0b4f6631a2ea4a0b27b9e254da7646d540eb7e3054b4",
+      "sha256_now": "e8c1dea7d441fdaaa13d0b4f6631a2ea4a0b27b9e254da7646d540eb7e3054b4",
+      "unchanged": true
+    },
+    {
+      "path": "C:\\Users\\ellio\\Documents\\My Games\\Flatout VR\\WreckRunA",
+      "sha256": "0d290ecf64ec68ca56d53e4fd2874905b2b71dd6e4b5bcb8d6aac4621b31a154",
+      "sha256_now": "0d290ecf64ec68ca56d53e4fd2874905b2b71dd6e4b5bcb8d6aac4621b31a154",
+      "unchanged": true
+    },
+    {
+      "path": "C:\\Users\\ellio\\Documents\\My Games\\Flatout VR\\WreckRunB",
+      "sha256": "82d8feccf6854532079e6888e9c55e2a29102772ae1dd4aeda3daa7b6cfbb6d3",
+      "sha256_now": "82d8feccf6854532079e6888e9c55e2a29102772ae1dd4aeda3daa7b6cfbb6d3",
+      "unchanged": true
+    },
+    {
+      "path": "C:\\Users\\ellio\\Documents\\My Games\\Flatout VR\\WreckRunUI.cfg",
+      "sha256": "fc47795cdb12bccaf26d27b08554020df140540a26296fcd34ac7eb1163e995f",
+      "sha256_now": "fc47795cdb12bccaf26d27b08554020df140540a26296fcd34ac7eb1163e995f",
+      "unchanged": true
+    },
+    {
+      "path": "C:\\Users\\ellio\\Documents\\My Games\\Flatout VR Test 991024002\\Liveries\\car_0_applied.json",
+      "sha256": "f2aa4fd168d67f6d2b1f621b53566486754bbec8508736800a2f0e34cbcf3fec",
+      "sha256_now": "f2aa4fd168d67f6d2b1f621b53566486754bbec8508736800a2f0e34cbcf3fec",
+      "unchanged": true
+    },
+    {
+      "path": "C:\\Users\\ellio\\Documents\\My Games\\Flatout VR Test 991024002\\Liveries\\car_0_slot_0.json",
+      "sha256": "f2aa4fd168d67f6d2b1f621b53566486754bbec8508736800a2f0e34cbcf3fec",
+      "sha256_now": "f2aa4fd168d67f6d2b1f621b53566486754bbec8508736800a2f0e34cbcf3fec",
+      "unchanged": true
+    },
+    {
+      "path": "C:\\Users\\ellio\\Documents\\My Games\\Flatout VR Test 991024002\\Liveries\\car_0_slot_31.json",
+      "sha256": "57ece1580ba26115c184be7f0e13de5e1782b6bebc28234b3a153988060b9449",
+      "sha256_now": "57ece1580ba26115c184be7f0e13de5e1782b6bebc28234b3a153988060b9449",
+      "unchanged": true
+    },
+    {
+      "path": "C:\\Users\\ellio\\Documents\\My Games\\Flatout VR Test 991024002\\Liveries\\car_0_slot_6.json",
+      "sha256": "57ece1580ba26115c184be7f0e13de5e1782b6bebc28234b3a153988060b9449",
+      "sha256_now": "57ece1580ba26115c184be7f0e13de5e1782b6bebc28234b3a153988060b9449",
+      "unchanged": true
+    }
+  ]
+}

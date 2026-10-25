@@ -1,0 +1,20 @@
+[
+  {
+    "pid": 56808,
+    "name": "Flatout64_d.dll",
+    "path": "D:\\FoxWorktrees\\ui-raycast-rc9-20261025\\Flatout\\Bin\\x64\\Flatout64_d.dll",
+    "sha256": "3d15ec663375deca83d09295613ef65486b6a44897c042c1e548b99db0a2f38e"
+  },
+  {
+    "pid": 56808,
+    "name": "EngineDLL64_d.dll",
+    "path": "D:\\FoxWorktrees\\ui-raycast-rc9-20261025\\PlayAll\\Libs\\vs2022\\x64\\EngineDLL64_d.dll",
+    "sha256": "219be31b93d8100f4294623da61c7673e8a5f053ad4f5a0ccad89568162e7adc"
+  },
+  {
+    "pid": 56808,
+    "name": "openxr_simulator.dll",
+    "path": "C:\\Users\\ellio\\Documents\\GitHub\\OpenXR-Simulator\\bin\\ui-sweep-3\\openxr_simulator.dll",
+    "sha256": "76d8a35ed92b2d9c0f14716f1edaf9618b9541ea0d9580abe99254a98c3ac857"
+  }
+]
