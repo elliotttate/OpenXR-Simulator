@@ -12,7 +12,7 @@ import uuid
 import numpy as np
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from flatout_livery_e2e import LiveryTest, ROOT, screenshot_pixel, ui_surface
+from flatout_livery_e2e import LiveryTest, ROOT, screenshot_pixel, ui_surface, game_read
 
 
 class LiveryScroll(LiveryTest):
@@ -71,8 +71,17 @@ class LiveryScroll(LiveryTest):
 
     async def run_scroll(self):
         original=await self.state()
+        async with self.query_lock:
+            catalog=await asyncio.to_thread(game_read,self.args.pid,'catalog')
         if original['tab']!=1:await self.press('STICKERS')
         if (await self.state())['page']!=1:await self.press('ADD STICKER')
+        layout=await self.state()
+        back=self.control(layout,'BACK TO LAYERS')
+        scroll=[self.control(layout,label) for label in ('Categories up','Categories down','Stickers up','Stickers down')]
+        assert all(c['height']>=72 and c['width']>=81 for c in scroll),('Scroll targets are too small',scroll)
+        assert all(c['y']+c['height']+18<=back['y'] for c in scroll),('List navigation must stay with its list, clear of the action dock',scroll,back)
+        assert self.control(layout,'Categories down')['x']<self.control(layout,'Stickers up')['x']
+        self.cases.append(dict(case='large-scroll-buttons-grouped-with-lists',passed=True,controls=scroll))
         while self.control(await self.state(),'Categories up')['enabled']:await self.press('Categories up')
         if (await self.state())['category']!=0:await self.press('Category: Basic shapes')
         for _ in range(12):
@@ -104,6 +113,7 @@ class LiveryScroll(LiveryTest):
             await self.press('Categories down')
         else:raise AssertionError('Category navigation wrapped past its last category')
         await self.disabled('Categories down')
+        assert len(categories)==catalog['categories'],('Some categories cannot be reached through the arrows',categories,catalog['categories'])
         self.cases.append(dict(case='category-viewport-bounds-preserve-selection',passed=True,seen=sorted(categories)))
         # Return through the visible list rather than resetting state through MCP.
         while self.control(await self.state(),'Categories up')['enabled']:await self.press('Categories up')

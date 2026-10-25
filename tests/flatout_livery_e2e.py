@@ -645,13 +645,13 @@ class LiveryTest:
         await self.click("BACK TO LAYERS")
         await self.click("ADD STICKER")
         before = await self.state()
-        assert any(c["label"]=="SEARCH" and c["window"]=="Livery footer" for c in before["vr"]["controls"])
-        assert (await self.click("SEARCH"))["keyboard_target"]==1
+        assert any(c["label"]=="Search stickers" and c["window"]=="Sticker library" for c in before["vr"]["controls"])
+        assert (await self.click("Search stickers"))["keyboard_target"]==1
         await self.click("CLEAR")
         for key in "circle": await self.click(key)
         searched = await self.click("DONE")
         assert searched["search"]=="circle" and 0<searched["filtered_stickers"]<before["filtered_stickers"], searched
-        await self.click("SEARCH")
+        await self.click("Search stickers")
         await self.click("CLEAR")
         assert (await self.click("DONE"))["search"]==""
         await self.click("MY LIVERIES")

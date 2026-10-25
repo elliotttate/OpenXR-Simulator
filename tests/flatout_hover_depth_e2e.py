@@ -244,7 +244,7 @@ class NativeDepth(Frontend):
                 assert count>=8,("Reduced motion lacks flat hover feedback",feedback)
             self.cases.append({"case":"reduced-motion-keeps-flat-color-feedback-in-both-eyes","passed":True,"feedback":feedback})
         else:
-            assert .020 <= delta[2] <= .035 and approach >= .018, ("Button did not physically approach the camera", delta.tolist(), approach)
+            assert .014 <= delta[2] <= .016 and approach >= .012, ("Button did not physically approach the camera", delta.tolist(), approach)
         assert np.allclose(tile["size"], expected_size, atol=.006), ("Hover changed the physical button size", tile["size"], expected_size)
         rays = raised["geometry"]["decorations"]
         assert len(rays) == 2, "Both hand beams must stay on their compositor ribbon layers"

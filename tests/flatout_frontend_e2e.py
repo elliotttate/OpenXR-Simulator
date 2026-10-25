@@ -433,16 +433,16 @@ class Frontend:
         l, t, r, b = rect
         px, py = l+(r-l)*fraction[0], t+(b-t)*fraction[1]
         surface = None
-        if capture["geometry"]["surfaces"]:
-            x, y = quad_pixel(capture, (px, py, px, py))
-        else:
-            frame = before.get("vr_frame")
-            if frame is None:
-                frame = (await self.query("options.get_state")).get("vr_frame")
-            assert frame, "The game must expose the active world-space panel geometry"
+        frame = before.get("vr_frame")
+        if frame is not None:
+            # Raised controls are compositor quads even when the base is an RTT.
+            # Use the independently reported carrier, never the first hover tile.
             state = {"vr": {"frame": frame}}
             x, y = screenshot_pixel(state, capture, px, py)
             surface = ui_surface(state)
+        else:
+            assert capture["geometry"]["surfaces"], "No native or world-space menu carrier"
+            x, y = quad_pixel(capture, (px, py, px, py))
         args = {"capture_id": capture["capture_id"], "x": float(x), "y": float(y),
                 "hand": hand or self.args.hand, "origin_mode": "hand", "ray_offset": RAY_OFFSET, "dwell_frames": 30}
         if surface:

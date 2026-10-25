@@ -96,6 +96,21 @@ in `finally`. Refresh a hold within 10 seconds; expiry and focus loss release
 injected buttons automatically. Use fresh captures as the scene changes. A held
 pointer must be released before changing its button or starting hover/click.
 
+`scroll_ui_at` aims at the screenshot pixel, dwells with neutral input, supplies
+the selected hand's `stick: [x, y]` for `hold_frames` action-sync cycles, then
+returns the stick to neutral before acknowledging delivery. Each axis is in
+`[-1, 1]`; positive Y points up. It never presses a trigger. Applications must
+bind a thumbstick action and implement scrolling under the ray. For example:
+
+```python
+scroll_ui_at(capture_id="...", x=475, y=313, hand="left",
+             stick=[0, -0.65], hold_frames=12, command_id="scrollOnce")
+```
+
+Retry the same command ID and arguments to recover its receipt without applying
+the scroll twice. `input_delivered` confirms synchronized axis delivery; inspect
+the application's list position and screenshot to verify the resulting scroll.
+
 Common parameters:
 
 - `capture_id`, `x`, `y`: Target a pixel in a capture from this MCP session.
@@ -114,9 +129,11 @@ Common parameters:
   `origin_mode="eye"`; the runtime does not infer scene depth from image colour.
 - `ray_offset`: Optional correction for an application that modifies its XR aim
   ray before hit-testing. Supply `{"position":[x,y,z],"orientation":[qx,qy,qz,qw]}`.
-  These are independent offsets in simulator world axes: the app adds the
-  translation to the controller origin and rotates its direction by the unit
-  quaternion. The MCP inverts those operations when aiming. Omit this for apps
+  By default these are independent offsets in simulator world axes: the app adds
+  the translation to the controller origin and rotates its direction by the unit
+  quaternion. Set `position_space: "aim"` when the translation rotates with the
+  controller, such as a physical controller-shell emitter. The MCP solves the
+  resulting pose and translation together. Omit this for apps
   that use the XR aim pose directly. Eye mode keeps the resulting application
   ray at the captured eye; hand mode keeps the controller at its natural origin.
 - `dwell_frames`: 1–90 action-sync cycles before completion/press (default 2).
@@ -214,6 +231,17 @@ Release recipe with `XR_RUNTIME_JSON` pointing to this build's manifest and a
 shared, isolated `SIMXR_DATA_DIR` for the game and MCP. Use `origin_mode="eye"`
 for the main menu and hand mode with the captured `surface_id` for the native
 quad dialog. Fresh screenshots and application telemetry are still required.
+
+The later RC controller integration uses each native controller's shell emitter
+and removes that older translation/yaw calibration. Do not apply the historical
+constant to these builds. The FlatOut tests derive an aim-space translation from
+read-only `vr.get_state` controller and pointer poses using
+`tests/flatout_ray_offset.py`, then send actual XR input. The helper caches the
+calibrated arguments per command ID so retries preserve their original digest.
+Current menu tests cover screenshot-derived leaderboard paging, visible gray
+inactive endpoints, and proportional joystick scrolling in Options, Statistics
+and the livery library. Run them against a fresh isolated native profile and
+inspect their `result.json`, captures, native error queue and complete game log.
 
 Each run uses its own `SIMXR_DATA_DIR` for IPC and settings, and saves before,
 hover, click, retry, and release JPEGs plus JSON evidence under

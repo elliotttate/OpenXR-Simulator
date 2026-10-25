@@ -15,7 +15,7 @@ from flatout_frontend_e2e import Frontend, ROOT, quad_pixel, RAY_OFFSET
 
 class LeaderboardScroll(Frontend):
     async def layout(self):
-        nodes=(await self.query('hud.rects',{'root':'menu','max_depth':18}))['nodes']
+        nodes=(await self.query('hud.rects',{'root':'menu','max_depth':32}))['nodes']
         legacy=[n for n in nodes if n['visible'] and
                 (n['path'].endswith(('/ArrowUp','/ArrowDown')) or '/Header/Bloc_Nav' in n['path'])]
         assert not legacy,('Legacy leaderboard arrows/header remain visible',legacy)
@@ -24,11 +24,25 @@ class LeaderboardScroll(Frontend):
         assert arrows and all(t['rect'][2]-t['rect'][0]>=80 and
                               t['rect'][3]-t['rect'][1]>=72 for t in arrows),arrows
         self.cases.append(dict(case='matched-header-arrows-without-legacy-controls',passed=True,targets=arrows))
+        state=await self.settled()
+        label=next(n for n in nodes if n['visible'] and n['path'].endswith('/LeaderboardPageRange'))
+        players=state['players']
+        expected=f"{players[0]['rank']} - {players[-1]['rank']} / {state['total']}"
+        assert label['text']==expected,(label,expected)
+        assert label['rect'][2]<=1620-24,('Range label crowds paging',label)
+        rendered=[n['text'] for n in nodes if n['visible'] and n['path'].endswith('/TXT_Name')]
+        assert rendered==[p['name'] for p in players],('Steam names lost Unicode or changed order',rendered,players)
+        self.cases.append(dict(case='native-range-and-utf8-player-names',passed=True,label=label,
+                               unicode_names=sum(not p['name'].isascii() for p in players)))
 
     async def settled(self):
         for _ in range(120):
             state=await self.query('leaderboard.get_state')
             if not state['busy'] and not (await self.query('ui.get_message_box'))['open']:
+                errors=await self.query('game.errors',{'count':128})
+                if errors['total']:
+                    (self.args.evidence/'native-errors.json').write_text(json.dumps(errors,indent=2))
+                assert errors['total']==0,('Native error while browsing leaderboard',errors)
                 await asyncio.sleep(.1)
                 return state
             await asyncio.sleep(.25)
