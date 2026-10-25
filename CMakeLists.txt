@@ -73,6 +73,11 @@ if(BUILD_TESTING)
     target_compile_definitions(ui_pointer_lifecycle_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     add_test(NAME ui_pointer_lifecycle COMMAND ui_pointer_lifecycle_tests)
 
+    add_executable(ui_surface_classification_tests tests/ui_surface_classification_tests.cpp)
+    target_include_directories(ui_surface_classification_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(ui_surface_classification_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME ui_surface_classification COMMAND ui_surface_classification_tests)
+
     option(SIMXR_ENABLE_UI_AUTOMATION_TESTS "Run real MCP screenshot/hover/click tests (requires Python dependencies)" OFF)
     if(SIMXR_ENABLE_UI_AUTOMATION_TESTS)
         find_package(Python3 REQUIRED COMPONENTS Interpreter)

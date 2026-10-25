@@ -29,7 +29,8 @@ RAY_OFFSET = {"position": [.03, 0, 0], "orientation": [0, -.043619387365336, 0, 
 
 
 def read_game(pid, method, params=None):
-    assert method in {"game.get_state", "game.errors", "menu.get_state", "vr.targets", "hud.pause_menu", "ui.get_message_box", "options.get_state", "statistics.get_state", "party.get_state", "race.end_screen", "leaderboard.get_state", "hud.rects", "hud.get_node", "rogue.state", "rogue.route_map"}
+    # RenderDoc records the rendered frame; it cannot activate or navigate UI.
+    assert method in {"game.get_state", "game.errors", "menu.get_state", "vr.targets", "hud.pause_menu", "ui.get_message_box", "options.get_state", "statistics.get_state", "party.get_state", "race.end_screen", "leaderboard.get_state", "hud.rects", "hud.get_node", "rogue.state", "rogue.route_map", "renderdoc.capture"}
     if params is None:
         params = {"action": "list"} if method == "hud.pause_menu" else {}
     request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()

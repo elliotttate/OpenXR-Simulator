@@ -140,6 +140,16 @@ end clears injected buttons. The application must synchronize its relevant aim
 and button actions for an interaction to complete. Moving/animated scene UI still
 requires a fresh capture or application-provided feedback.
 
+Screenshot metadata separates `geometry.decorations` from targetable
+`geometry.surfaces`. A quad sampling one texel, at most 4 mm across, at least
+5 cm long and with aspect ratio at least 12:1 is treated as a decorative ribbon.
+This keeps controller-ray quads from intercepting automatic UI targeting. Its
+real layer id, BOTH/eye visibility, metric size and pose remain in the capture.
+Large solid panels, textured narrow UI and small square buttons remain targetable.
+Applications using shorter ray ribbons should omit those quads (retain the hit
+cursor) or supply explicit target geometry; this classifier is deliberately
+geometric and does not infer whether arbitrary application content is a button.
+
 ### End-to-end UI tests
 
 Install the requirements in a Python environment, then enable the optional CTest

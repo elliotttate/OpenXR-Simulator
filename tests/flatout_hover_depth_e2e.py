@@ -246,6 +246,21 @@ class NativeDepth(Frontend):
         else:
             assert .020 <= delta[2] <= .035 and approach >= .018, ("Button did not physically approach the camera", delta.tolist(), approach)
         assert np.allclose(tile["size"], expected_size, atol=.006), ("Hover changed the physical button size", tile["size"], expected_size)
+        rays = raised["geometry"]["decorations"]
+        assert len(rays) == 2, "Both hand beams must stay on their compositor ribbon layers"
+        origin = np.array(hovered["target"]["application_ray"]["position"])
+        direction = np.array(hovered["target"]["application_ray"]["direction"])
+        def endpoints(ray):
+            axis = quaternion_matrix(ray["pose"]["orientation"])[:, 1] * ray["size"][1] * .5
+            midpoint = np.array(ray["pose"]["position"])
+            return midpoint-axis, midpoint+axis
+        ray = min(rays, key=lambda r: np.linalg.norm(endpoints(r)[0] - origin - direction*.05))
+        end_on_face = rotation.T @ (endpoints(ray)[1] - np.array(tile["pose"]["position"]))
+        assert abs(end_on_face[2]) < .002, ("Ray extends past the raised button face", end_on_face.tolist())
+        assert all(abs(end_on_face[i]) <= tile["size"][i]*.5+.002 for i in range(2)), end_on_face.tolist()
+        assert ray["visibility"] == 0 and ray["id"] > max(s["id"] for s in layers), ray
+        self.cases.append({"case": "compositor-ray-stops-at-raised-button-face", "passed": True,
+                           "endpoint_on_face_m": end_on_face.tolist(), "ray": ray})
         self.cases.append({"case": "native-button-flat-without-scaling" if self.args.reduced_motion else "native-button-physically-approaches-without-scaling", "passed": True,
                            "local_delta_m": delta.tolist(), "camera_approach_m": approach,
                            "tile": tile, "source_rect": action["rect"]})

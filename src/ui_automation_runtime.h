@@ -102,7 +102,7 @@ static ui_auto::Frame BuildUiFrame(const XrFrameEndInfo* info, uint64_t frame) {
             }
         } else if (layer->type==XR_TYPE_COMPOSITION_LAYER_QUAD) {
             const auto& q=*(const XrCompositionLayerQuad*)layer;
-            g.surfaces.push_back({(int)i,q.eyeVisibility,rt::QuadWorldPose(q,rt::g_headYaw,rt::g_headPitch,rt::g_headRoll),q.size.width,q.size.height});
+            AddQuadSurface(g,(int)i,q,rt::QuadWorldPose(q,rt::g_headYaw,rt::g_headPitch,rt::g_headRoll));
         } else {
             g.supported=false;
         }

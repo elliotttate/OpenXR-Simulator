@@ -255,6 +255,89 @@ not establish a full per-eye compositor mirror. Therefore use Fox's verified
 LOCAL-corner/per-eye-FOV math above rather than claim Roboquest mirror parity.
 [Roboquest laser-material commit](https://github.com/Flat2VRStudios/RoboquestVR/commit/a4d8f8e9bccdc3eb1a15a8cb2ab85e6c7e60bd8e)
 
+## Meta Unreal guide and its linked samples
+
+The user-requested [Meta Unreal compositor guide](https://developers.meta.com/vr/documentation/unreal/unreal-overlay/)
+(updated April 17, 2026) explains that layers normally cover scene geometry,
+higher Priority controls layer order, and Supports Depth permits scene occlusion
+with a possible performance cost. It recommends matching widget/layer dimensions
+and pivot, binding the widget RT, and disabling the widget's original main pass.
+These directly support separate visual transport with stable input geometry.
+Its advertised 16-layer Quest limit is platform guidance; Fox must still query
+the active OpenXR runtime's `maxLayerCount`. Unreal's Supports Depth checkbox is
+not a core-OpenXR depth-order guarantee for Fox's current layers.
+
+The following refs were resolved through the primary GitHub connector on
+2026-10-25, then inspected at their exact commits. No sample checkout was changed,
+fetched, built or run.
+
+| Linked sample | Inspected commit | Scope actually inspected |
+| --- | --- | --- |
+| `oculus-samples/Unreal-LayerSample` | `b2db97d919c18d305c714a3cd035fad4d923c4c7` | README, tree, Blueprint file identities; tip identifies UE 5.8 / Meta XR 207 |
+| `oculus-samples/Unreal-RenderingTechniques` | `529bce5721b2d163e255ae78e2d7d7d98f9e9a6b` | README, text/map/material identities, project source tree |
+| `oculus-samples/Unreal-Phanto` | `f2d7e02afdd7c1c9fcd1bd2b942c3e0dec5af109` | README, project C++, config, UI asset identities; UE 5.6 / Meta XR 81 |
+
+**Layer Sample.** Its README describes `MenuActor` assigning the Menu widget's
+RT to the stereo layer in `Tick`, and `OnToggleClicked_Event` disabling in-scene
+widget rendering. Interaction is right-controller pointing plus trigger. The
+specific implementation assets are `Content/Blueprints/MenuActor.uasset`,
+`Menu_CompositorLayer.uasset`, `SimpleCompositorLayerActor.uasset` and
+`VRCharacter.uasset`. This is good primary documentation for texture promotion
+without duplicate UI; the binary graphs were not decoded. The repository has
+no project C++ source tree proving a metric ribbon, per-eye beam visibility,
+ray priority or scene-beam suppression. Do not infer those from the screenshot
+or the fact that its menu is interactable.
+[Pinned Layer Sample README](https://github.com/oculus-samples/Unreal-LayerSample/blob/b2db97d919c18d305c714a3cd035fad4d923c4c7/README.md),
+[Pinned MenuActor asset](https://github.com/oculus-samples/Unreal-LayerSample/blob/b2db97d919c18d305c714a3cd035fad4d923c4c7/Content/Blueprints/MenuActor.uasset)
+
+**Rendering Techniques.** The README identifies the TextRendering map as a
+comparison of texture filtering and stereo-layer text. Its transparency note
+uses unpremultiplied text for that sample. This is not a reason to change Fox's
+already premultiplied HUD/ribbon output independently of its layer flags and
+mirror blend. The pixel representation, blend factors and OpenXR flags must
+agree. Relevant assets include
+`Content/RenderingTechniques/Maps/TextRendering.umap`, the
+`Art/Materials/TextMaterial-*` variants, `PointerMaterial.uasset`,
+`Widget3DPassThroughRenderOnTop.uasset` and
+`Core/VRPawn/BP_MotionController.uasset`. These are binary assets; their names
+do not prove a compositor pointer or its ordering. The inspected project C++
+module does not implement that path. Its portal example is separately documented
+as stereo render targets, which should not be confused with the text layers.
+[Pinned Rendering Techniques README](https://github.com/oculus-samples/Unreal-RenderingTechniques/blob/529bce5721b2d163e255ae78e2d7d7d98f9e9a6b/README.md),
+[Pinned text map](https://github.com/oculus-samples/Unreal-RenderingTechniques/blob/529bce5721b2d163e255ae78e2d7d7d98f9e9a6b/Content/RenderingTechniques/Maps/TextRendering.umap)
+
+**Phanto.** The user-supplied local `Unreal-Phanto` checkout was read-only,
+clean, on `main` at the same pinned commit. Its resolved `BP_GameUI.uasset`
+(207297 bytes) contains real Unreal asset data; the Git blob contains its LFS
+pointer. Read-only asset-name inspection identifies `StereoLayer`,
+`StereoLayerShapeCylinder`, `GetRenderTarget`, `WidgetRT`, `TickWhenOffscreen`,
+`StateChangeTime`, and Wave/GameOver/GameWin widgets. This corroborates the
+guide's game-round popup example, but does not decode node connections or prove
+the actual Priority, Supports Depth boolean, lock type or show/hide sequence.
+`WBP_WaveUI.uasset` and `BP_PhantoPlayer.uasset` are also present as real local
+assets. No claim of a quad-layer ray follows from this popup implementation.
+[Pinned Phanto popup asset](https://github.com/oculus-samples/Unreal-Phanto/blob/f2d7e02afdd7c1c9fcd1bd2b942c3e0dec5af109/Content/Phanto/Gameplay/BP_GameUI.uasset)
+
+Phanto's `Config/DefaultEngine.ini:173` explicitly propagates alpha;
+`bCompositesDepth=True` at 288 and `bCompositeDepthMobile=True` at 309 enable
+Meta's depth-composition paths. Those settings show that alpha/depth integration
+is deliberate; they do not establish a portable inter-layer depth solution or
+that every popup uses depth. The project C++ source has no stereo-layer pointer
+submission. `Private/RotateToAction.cpp` does provide a distinct lifecycle
+example: a weak world context, 10 ms timer, quaternion Slerp, exact final rotation
+and explicit cancellation clearing the timer. The popup's use of this helper is
+not proven by source. Fox's pointer descriptors should remain immediate
+current-frame data, while any UI motion must retain owner/generation invalidation
+and interrupted-return behavior rather than borrow delayed action callbacks.
+[Pinned Phanto rendering config](https://github.com/oculus-samples/Unreal-Phanto/blob/f2d7e02afdd7c1c9fcd1bd2b942c3e0dec5af109/Config/DefaultEngine.ini),
+[Pinned cancellable rotation helper](https://github.com/oculus-samples/Unreal-Phanto/blob/f2d7e02afdd7c1c9fcd1bd2b942c3e0dec5af109/Source/Phanto/Private/RotateToAction.cpp)
+
+The samples strengthen the RT ownership, no-ghost and alpha/depth requirements;
+none of the inspected text/C++ establishes the requested native ribbon beam.
+WayVR remains the directly inspectable quad-ray precedent. Fox's native
+both-hand/both-eye, metric-depth, targeting and mirror gates below must provide
+the implementation evidence.
+
 ## Larger alternatives
 
 **Transparent late stereo projection** can render arbitrary interaction meshes

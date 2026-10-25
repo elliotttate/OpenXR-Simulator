@@ -66,7 +66,18 @@ struct Frame {
     XrVector3f hands[2]{};
     std::vector<Eye> eyes, projectionEyes;
     std::vector<Surface> surfaces;
+    std::vector<Surface> decorations;
 };
+// Keep the actual compositor geometry for diagnostics without allowing a
+// one-texel controller ribbon to intercept screenshot-based UI targeting.
+inline void AddQuadSurface(Frame& frame, int id, const XrCompositionLayerQuad& quad, XrPosef worldPose) {
+    const float narrow = (std::min)(quad.size.width,quad.size.height);
+    const float length = (std::max)(quad.size.width,quad.size.height);
+    const bool ribbon = quad.subImage.imageRect.extent.width==1 && quad.subImage.imageRect.extent.height==1 &&
+                        narrow>0 && narrow<=.004f && length>=.05f && length/narrow>=12.f;
+    auto& destination = ribbon ? frame.decorations : frame.surfaces;
+    destination.push_back({id,quad.eyeVisibility,worldPose,quad.size.width,quad.size.height});
+}
 struct SavedCapture { Frame geometry; ULONGLONG savedAt = 0; };
 inline std::string g_session;
 inline uint64_t g_sync = 0;
@@ -139,6 +150,12 @@ inline void WriteGeometry(FILE* f, const Frame& g) {
     for (size_t i=0; i<g.surfaces.size(); ++i) {
         const auto& s=g.surfaces[i];
         fprintf(f, "%s{\"id\":%d,\"visibility\":%d,\"size\":[%.9g,%.9g],\"pose\":",i ? "," : "",s.id,(int)s.visibility,s.width,s.height);
+        WritePose(f,s.pose); fprintf(f,"}");
+    }
+    fprintf(f,"],\"decorations\":[");
+    for (size_t i=0; i<g.decorations.size(); ++i) {
+        const auto& s=g.decorations[i];
+        fprintf(f, "%s{\"id\":%d,\"role\":\"one_texel_ribbon\",\"visibility\":%d,\"size\":[%.9g,%.9g],\"pose\":",i ? "," : "",s.id,(int)s.visibility,s.width,s.height);
         WritePose(f,s.pose); fprintf(f,"}");
     }
     fprintf(f,"]}");

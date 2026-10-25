@@ -16,8 +16,8 @@ from PIL import Image
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from flatout_frontend_e2e import Frontend, ROOT
-from flatout_livery_e2e import quaternion_matrix
+from flatout_frontend_e2e import Frontend, ROOT, ui_surface, RAY_OFFSET
+from flatout_livery_e2e import quaternion_matrix, world_pixel
 
 
 def stage_pixel(capture, point, eye_name, projection=False):
@@ -44,24 +44,61 @@ def color_count(pixels, point, hand):
 
 class PointerVisibility(Frontend):
     async def run(self):
-        assert (await self.query("menu.get_state"))["current_menu"] == "INSANITY"
+        assert (await self.query("menu.get_state"))["current_menu"] == ("MAIN MENU" if self.args.world_menu else "INSANITY")
         failures = []
         for hand in ("left", "right"):
-            before, aim = await self.point_args(self.args.target, (.83, .43), hand)
-            assert self.last_capture["geometry"]["surfaces"], "This regression requires a compositor quad"
+            if self.args.world_menu:
+                menu = await self.query("menu.get_state")
+                before = await self.query("vr.targets")
+                source = await self.capture("world-label-source-" + hand)
+                assert not source["geometry"]["surfaces"], "World-menu test must not accidentally use a HUD carrier"
+                item = menu["items"][1]
+                # Native spatial hit testing uses the first item's common plane.
+                # The hovered label's animated face can move off that plane.
+                frame = {**before["vr_frame"], "panel": {**menu["spatial_layout"], "origin": menu["items"][0]["rest_position"]},
+                         "panel_width": 1.0, "panel_height": 1.0}
+                state = {"vr": {"frame": frame}}
+                x, y = world_pixel(state, source, item["rendered_position"], "left")
+                aim = {"capture_id": source["capture_id"], "x": float(x), "y": float(y), "hand": hand,
+                       "surface": ui_surface(state), "origin_mode": "hand", "ray_offset": RAY_OFFSET, "dwell_frames": 30}
+            else:
+                before, aim = await self.point_args(self.args.target, (.83, .43), hand)
+                assert self.last_capture["geometry"]["surfaces"], "This regression requires a compositor quad"
             for other in ("left", "right"):
                 await self.tool("release_ui_pointer", {"capture_id": aim["capture_id"], "hand": other}, "release-" + other)
             receipt = await self.tool("hover_ui_at", aim, "hover-" + hand)
             assert receipt["status"] == "input_delivered", receipt
             # No settle sleep or expensive diagnostic call before this image:
             # otherwise the aim lease could expire and manufacture a false red.
-            cap = await self.tool("capture_screenshot", {"eye": "both", "max_width": 2048}, "pointer-both-eyes-" + hand)
+            cap = await self.tool("capture_screenshot", {"eye": "both", "max_width": 4096}, "pointer-both-eyes-" + hand)
+            native_capture = None
+            if self.args.gpu_capture:
+                native_capture = await self.query("renderdoc.capture", {"path": str(self.args.gpu_capture) + "-" + hand})
             pixels = np.asarray(Image.open(self.last_image_path).convert("RGB"))
             current = await self.query("vr.targets")
-            assert current["hovered"] == self.args.target and current["clicks"] == before["clicks"], current
+            if self.args.world_menu:
+                assert (await self.query("menu.get_state"))["selection_index"] == 1
+            else:
+                assert current["hovered"] == self.args.target, current
+            assert current["clicks"] == before["clicks"], current
             target = receipt["target"]
             origin = np.array(target["application_ray"]["position"])
             hit = np.array(target["target_point"])
+            rays = cap["geometry"]["decorations"]
+            assert len(rays) == 2, "Both hand rays must be compositor quads"
+            assert all(r["visibility"] == 0 and abs(r["size"][0] - .002) < 1e-6 for r in rays), rays
+            assert all(r["id"] > max((s["id"] for s in cap["geometry"]["surfaces"]), default=0) for r in rays), rays
+            direction = (hit - origin) / np.linalg.norm(hit - origin)
+            expected_start = origin + direction * .05
+            endpoint_errors = []
+            for ray in rays:
+                matrix = quaternion_matrix(ray["pose"]["orientation"])
+                center = np.array(ray["pose"]["position"])
+                start = center - matrix[:, 1] * ray["size"][1] * .5
+                end = center + matrix[:, 1] * ray["size"][1] * .5
+                endpoint_errors.append(float(np.linalg.norm(start - expected_start) + np.linalg.norm(end - hit)))
+                assert abs(np.linalg.det(matrix) - 1) < 1e-4, "Ribbon pose must use a unit right-handed basis"
+            assert min(endpoint_errors) < .002, ("Ribbon must physically span the controller-to-hit segment", endpoint_errors)
             observations = []
             for eye in ("left", "right"):
                 cursor = stage_pixel(cap, hit, eye)
@@ -71,7 +108,7 @@ class PointerVisibility(Frontend):
                     # These points are genuinely between the hand and the UI,
                     # rather than a 2D extension painted on the menu face.
                     point = origin + (hit - origin) * fraction
-                    screen = stage_pixel(cap, point, eye, projection=True)
+                    screen = stage_pixel(cap, point, eye)
                     samples.append({"fraction": fraction, "world": point.tolist(),
                                     "pixel": screen.tolist(), "colored_pixels": color_count(pixels, screen, hand)})
                 observations.append({"eye": eye, "cursor_pixel": cursor.tolist(),
@@ -82,8 +119,18 @@ class PointerVisibility(Frontend):
                     failures.append(hand + "/" + eye + " foreground hand beam covered by UI")
             self.cases.append({"case": "quad-foreground-beam-and-cursor-" + hand,
                                "passed": all(o["cursor_colored_pixels"] > 0 and all(s["colored_pixels"] > 0 for s in o["beam_samples"]) for o in observations),
-                               "observations": observations, "aim": target, "capture": cap})
+                               "observations": observations, "aim": target, "capture": cap,
+                               "ribbon_endpoint_error_m": min(endpoint_errors), "native_capture": native_capture})
         assert not failures, failures
+        if self.args.world_menu:
+            return
+        for hand in ("left", "right"):
+            self.args.hand = hand
+            await self.click("challenge.page.next")
+            indices = [int(t["name"].split(".")[-1]) for t in (await self.query("vr.targets"))["targets"]
+                       if t["name"].startswith("challenge.event.")]
+            assert sorted(indices) == list(range(6, 12)), "One held click must advance exactly one page"
+            await self.click("challenge.page.prev")
 
 
 async def main(args):
@@ -117,4 +164,6 @@ if __name__ == "__main__":
     parser.add_argument("--evidence", required=True, type=Path)
     parser.add_argument("--target", default="challenge.event.1")
     parser.add_argument("--hand", default="left")
+    parser.add_argument("--world-menu", action="store_true", help="Check both compositor rays over the main world-space menu instead")
+    parser.add_argument("--gpu-capture", type=Path, help="Also queue a native RenderDoc frame for each live hand aim")
     asyncio.run(main(parser.parse_args()))
