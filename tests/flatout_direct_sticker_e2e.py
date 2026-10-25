@@ -16,7 +16,7 @@ import numpy as np
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from flatout_livery_e2e import LiveryTest, ROOT, world_pixel, screenshot_pixel
+from flatout_livery_e2e import LiveryTest, ROOT, world_pixel
 
 
 class DirectSticker(LiveryTest):
@@ -33,6 +33,36 @@ class DirectSticker(LiveryTest):
         if hold:
             assert hit["grabbed"] == expect_grab, (pixel, hit)
         return state
+
+    def visible_circle_pixel(self):
+        # Locate the large light circle in the actual screenshot, rather than
+        # assume a viewport height: the simulator window can change aspect.
+        pixels = self.last_pixels.astype(float)
+        height, width = pixels.shape[:2]
+        x0, x1, y0, y1 = int(width*.59), int(width*.71), int(height*.31), int(height*.43)
+        roi = pixels[y0:y1, x0:x1]
+        mask = (roi.mean(2)>180) & (roi.max(2)-roi.min(2)<22)
+        seen = np.zeros(mask.shape, bool)
+        components = []
+        for iy, ix in zip(*np.where(mask)):
+            if seen[iy, ix]:
+                continue
+            queue = [(iy, ix)]; seen[iy, ix] = True; points = []
+            while queue:
+                cy, cx = queue.pop(); points.append((cx+x0, cy+y0))
+                for ny, nx in ((cy-1,cx),(cy+1,cx),(cy,cx-1),(cy,cx+1)):
+                    if 0<=ny<mask.shape[0] and 0<=nx<mask.shape[1] and mask[ny,nx] and not seen[ny,nx]:
+                        seen[ny,nx] = True; queue.append((ny,nx))
+            if len(points)>500:
+                components.append(np.array(points))
+        assert components, "The screenshot fixture must show the white circle on the door"
+        region = max(components, key=len)
+        center = region.mean(0)
+        assert np.all(region.max(0)-region.min(0)>30), "Artwork must have a large visible opaque interior"
+        (self.args.evidence/"visible-artwork-target.json").write_text(json.dumps({
+            "image_size": [width,height], "pixel": center.tolist(), "opaque_pixels":len(region),
+            "bounds": [region.min(0).tolist(),region.max(0).tolist()]},indent=2))
+        return center
 
     async def run_direct(self):
         await self.click("STICKERS")  # Leaves explicit placement mode through the actual UI.
@@ -54,7 +84,7 @@ class DirectSticker(LiveryTest):
         # The visible white circle in this screenshot fixture is on the door.
         # First obtain its actual surface depth with an unpressed eye ray;
         # a projector plane can lie inside the curved body and is not a target.
-        x, y = 830., 540.
+        x, y = self.visible_circle_pixel()
         await self.tool("hover_ui_at", {"capture_id": capture["capture_id"], "x": x, "y": y,
             "hand": "left", "origin_mode": "eye", "dwell_frames": 12}, "visible-artwork-depth")
         depth_state = await self.state()
@@ -88,6 +118,9 @@ class DirectSticker(LiveryTest):
                            "before": before, "after": grabbed})
         assert passed, "Pointing at the visible top sticker must select and grab it without Place on Car"
         assert grabbed["document"] == before["document"], "Initial grab must preserve the sticker's placement"
+        assert not any(c["window"] in ("Sticker tools", "Livery camera rail", "Livery layers")
+                       for c in grabbed["vr"]["controls"]), "Near controls must tuck away so the other ray can reach the car"
+        assert grabbed["vr"]["frame"]["camera"] == before["vr"]["frame"]["camera"], "Tucking controls must preserve the camera"
         await asyncio.sleep(.6)
         still = await self.state()
         assert still["vr"]["rendered_frames"] > grabbed["vr"]["rendered_frames"]+2
@@ -106,7 +139,7 @@ class DirectSticker(LiveryTest):
         assert moved_layer["scale"] == initial_layer["scale"]
         assert moved["document"]["layers"][:expected] == before["document"]["layers"][:expected]
         # Join the other ray on this same sticker, then spread and twist.
-        joined = await self.point("right", (x+40, y+10))
+        joined = await self.point("right", (x+40, y+30))
         assert joined["vr"]["grab_mask"] == 3
         assert joined["document"] == moved["document"], "A second hand must join without a jump"
         await self.point("left", (x-10, y-25))
@@ -127,7 +160,9 @@ class DirectSticker(LiveryTest):
         released = await self.release("left")
         assert released["vr"]["grab_mask"] == 2 and released["document"] == changed["document"], "One hand releasing must not jump"
         final = await self.point("right", (x+65, y+20))
-        await self.release("right")
+        released_all = await self.release("right")
+        assert any(c["window"] == "Sticker tools" for c in released_all["vr"]["controls"]), "Tools must return after the last hand releases"
+        assert released_all["document"] == final["document"]
         undone = await self.click("UNDO")
         assert undone["document"] == before["document"], "One Undo must restore the entire direct grab"
         redone = await self.click("REDO")
@@ -152,7 +187,7 @@ class DirectSticker(LiveryTest):
         assert undo_unlock["document"] == locked["document"], "A stationary click must not create an Undo entry"
         restored = await self.click("REDO")
         assert restored["document"] == unlocked["document"]
-        bare = await self.point("left", (600, 520), expect_grab=False)
+        bare = await self.point("left", (600, y-20), expect_grab=False)
         assert bare["vr"]["hands"][0]["hovered_layer"] == -1
         assert bare["vr"]["grab_mask"] == 0 and bare["document"] == restored["document"]
         await self.release("left")
