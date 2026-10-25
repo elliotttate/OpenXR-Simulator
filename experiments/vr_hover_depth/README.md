@@ -15,7 +15,10 @@ Native tests on RC `00c4999b0` plus the UI changes verify a 30 mm normal lift,
 about 28.1 mm approach toward the camera, unchanged button size, both hands,
 rapid focus changes and return, raised-face top-edge clicks whose rays miss the
 base rectangle, one held-trigger activation, same-ID retry and immediate layer
-cleanup. These are native game checks, separate from the standalone probe.
+cleanup. The A/B/C same-type replacement gate also passes with both hands:
+exclusive fixed targets, rejection of an old held press and its retry, release
+without activation, then one fresh click and complete tile cleanup. These are
+native game checks, separate from the standalone probe.
 
 RenderDoc confirms that the source label disappears from the base HUD while the
 GPU atlas contains the isolated button: the captured source region changes from
@@ -207,9 +210,9 @@ The first native integration is experimental; it does not yet promote all menu
 controls or the world-space RTT path. Physical-headset comfort, real-controller
 jitter, GPU performance and runtime compatibility remain unmeasured. The
 screenshot precision is reported, not presented as a submillimeter display
-measurement. Before global enablement, cover dialog replacement, recenter/resize,
-disabled/loading actions, localized labels, slider ownership and the remaining
-menu transports. A production reduced-motion option is still needed: disabling
+measurement. Before global enablement, cover entrance-time dialog replacement,
+recenter/resize, constrained layer budgets, disabled/loading actions, localized
+labels, slider ownership and the remaining menu transports. A production reduced-motion option is still needed: disabling
 the experiment currently restores the legacy flat hover treatment. Within the
 enabled experimental transport, startup setting
 `Engine.Renderer.VR.HudButtonReducedMotion = true` now provides an intentional
@@ -269,3 +272,62 @@ read-only; hover and click are delivered through actual XR action input.
 For the startup reduced setting, replace `--raised-edge-top` with
 `--reduced-motion`; that gate requires zero travel and visible flat feedback in
 each eye. Keep `--motion-lifecycle` to exercise return and cleanup.
+
+Append `--modal-replacement` for the additional non-Retail lifecycle gate. After
+the ordinary screenshot-derived hover and Cancel proof finishes, this phase
+uses the existing `ui.pop_message_box` bridge only to create or replace three
+`YesNo` fixtures in the same native BASE container. Their visible content differs
+(`RAY PRESENTATION A`, `B`, `C`), while title, descriptor, source hit rectangle
+and carrier geometry stay fixed. Each setup request and response is explicitly
+journaled as `setup_only`; the read-only diagnostics whitelist remains unchanged.
+All subsequent hover, hold, release and clicks use actual XR controller input
+resolved from a fresh screenshot.
+
+The phase replaces A while its Cancel hover is active, holds Cancel to dismiss
+B once, and opens C before releasing that same trigger. It retries B's UUID,
+refreshes the continuous hold over C, releases without activating C, then checks
+that one fresh click dismisses C exactly once and retires every transient layer.
+Each open fixture must expose only its two modal targets. The current bridge
+does not expose the native presentation generation; the evidence records that
+limitation alongside the distinct content and verified same-container/type
+setup, rather than inventing a generation number.
+
+The first native right-hand attempt passed the A/B content, exclusive-target and
+fixed-geometry checks, then exposed a simulator delivery-reporting bug. A held
+Cancel closed B correctly, but the simulator continued its prepress geometry
+check while waiting for all 45 observed syncs. The removed dialog carrier caused
+an erroneous stale-geometry failure after button-down had already been delivered.
+The original failing evidence remains in
+`build-ui-automation/flatout4-evidence/rc00c-native-modal-replacement-right/`.
+This is distinct from the earlier flat-depth control failure.
+
+The simulator now ends that prepress check for a hold only after its first bound
+action snapshot is actually published. A new hold or an unobserved action still
+validates; ordinary click dwell, focus/expiry release and UUID handling retain
+their existing behavior. The focused `ui_pointer_lifecycle_tests` fixture fails
+on the previous predicate and passes on the corrected production state helper.
+Its red/green logs are in
+`build-ui-automation/flatout4-evidence/held-pointer-lifecycle-unit/`. The native
+phase also refreshes and reprojects a settled B screenshot before holding its
+explicit base carrier, and records post-error modal/click state if delivery
+fails.
+
+Native reruns now pass all eight case groups with both hands in
+`rc00c-native-modal-replacement-green-right/` and
+`rc00c-native-modal-replacement-green-left/` under the same evidence root. The
+verified loaded `bin/ui-sweep-3` simulator binary has SHA-256 prefix
+`43bf1ab3176c`; the native game binary has prefix `e1200b6b1940`. The fresh
+simulator build also passes all seven selected CTest checks: pointer lifecycle,
+resolution, targeting, D3D11, D3D12, world-surface input and hold input. The A/B/C
+replacement phase was exercised in ordinary physical-depth mode; replacement
+with reduced motion has not been rerun. Earlier both-hand reduced-motion depth,
+outline, fixed-target and ordinary click/cleanup results remain separate.
+
+To run only the focused state fixture in an isolated configured build:
+
+```powershell
+cmake --build $IsolatedBuild --config Debug --target ui_pointer_lifecycle_tests
+ctest --test-dir $IsolatedBuild -C Debug -R '^ui_pointer_lifecycle$' --output-on-failure
+```
+
+This target does not build or launch the simulator DLL or game.

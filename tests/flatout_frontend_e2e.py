@@ -521,6 +521,49 @@ class Frontend:
         await self.audit("options-focused-control-spacing")
         self.cases.append({"case":"options-one-focused-settings-list","passed":True,"selection":selected})
 
+    async def career_welcome(self):
+        menu=await self.query("menu.get_state")
+        assert menu["current_menu"]=="MAIN MENU" and menu["is_3d"],"Start in Main with an isolated profile that owns no Career car"
+        assert not (await self.query("ui.get_message_box"))["open"]
+        item=menu["items"][0];assert item["title"].lower()=="career",item
+        native=await self.query("vr.targets")
+        capture=await self.capture("career-welcome-entry-source")
+        frame={**native["vr_frame"],"panel":{**menu["spatial_layout"],"origin":item["rendered_position"]},"panel_width":1.,"panel_height":1.}
+        state={"vr":{"frame":frame}}
+        x,y=world_pixel(state,capture,item["rendered_position"],"left")
+        aim={"capture_id":capture["capture_id"],"x":float(x),"y":float(y),"hand":self.args.hand,
+             "origin_mode":"hand","surface":ui_surface(state),"ray_offset":RAY_OFFSET,"dwell_frames":30}
+        assert (await self.tool("hover_ui_at",aim,"career-welcome-entry-hover"))["status"]=="input_delivered"
+        assert not (await self.query("ui.get_message_box"))["open"],"Hover opened Career"
+        args={**aim,"hold_frames":45,"timeout":30,"command_id":uuid.uuid4().hex}
+        assert (await self.tool("click_ui_at",args,"career-welcome-entry-click"))["status"]=="input_delivered"
+        assert (await self.query("ui.get_message_box"))["open"],"The first Career welcome did not open"
+        targets=await self.query("vr.targets")
+        assert [t["name"]for t in targets["targets"]]==["msgbox.validate"],targets
+        before_retry=targets["clicks"]
+        assert (await self.tool("click_ui_at",args,"career-welcome-entry-retry"))["status"]=="input_delivered"
+        assert (await self.query("vr.targets"))["clicks"]==before_retry,"Retry activated the popup"
+        self.last_capture=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},"career-welcome-scene-both-eyes")
+        pixels=np.asarray(Image.open(self.last_image_path).convert("RGB"))
+        h,w=pixels.shape[:2];fractions=[]
+        for index,eye in enumerate(("left","right")):
+            # The scene above the modal must retain the road/sky visible before entry.
+            patch=pixels[int(h*.10):int(h*.30),int(w*(index/2+.075)):int(w*(index/2+.425))]
+            fraction=float(np.mean(np.max(patch,axis=2)>45));fractions.append({"eye":eye,"visible_fraction":fraction})
+        self.cases.append({"case":"career-welcome-keeps-live-scene-in-both-eyes","passed":all(f["visible_fraction"]>.5 for f in fractions),"scene":fractions})
+        assert all(f["visible_fraction"]>.5 for f in fractions),("Career welcome replaced the live scene with black",fractions)
+        current=await self.query("menu.get_state")
+        assert current["current_menu"]=="MAIN MENU" and current["is_3d"],"Wait for acknowledgement before starting the showroom transition"
+        await self.popup_spacing()
+        await self.click("msgbox.validate")
+        assert not (await self.query("ui.get_message_box"))["open"],"Welcome reopened after acknowledgement"
+        assert (await self.query("menu.get_state"))["current_menu"]=="CARS","Welcome acknowledgement did not enter car selection"
+        await self.capture("career-welcome-car-selection")
+        cancel=next(t["name"]for t in (await self.query("vr.targets"))["targets"]if t["name"].startswith("helper.Cancel."))
+        await self.click(cancel)
+        assert (await self.query("menu.get_state"))["current_menu"]=="MAIN MENU","Back did not leave first-time car selection"
+        self.cases.append({"case":"career-welcome-acknowledge-once-and-back-without-purchase","passed":True,"hand":self.args.hand})
+
     async def career_layout(self):
         native = await self.query("vr.targets")
         assert native["menu"]=="FLATOUT_MODE", "Open Career's cup/event grid first"
@@ -1988,6 +2031,8 @@ class Frontend:
             return await self.career_cancel()
         if self.args.career_cup_only:
             return await self.career_cup()
+        if self.args.career_welcome_only:
+            return await self.career_welcome()
         if self.args.career_only:
             return await self.career_sweep()
         if self.args.career_layout_only:
@@ -2133,6 +2178,7 @@ async def run(args):
              "Quick Start explicit next-step caption" if args.quick_action_copy_only else
              "Coming Soon lock diagnostics and inert ray click" if args.spatial_locked_only else
              "Spatial Back visibility, edge misses, both hands and one activation" if args.spatial_back_only else
+             "First Career welcome preserves the live scene and opens car selection after acknowledgement" if args.career_welcome_only else
              "Career unavailable-class warnings, filtered cars and Back" if args.career_wrong_class_only else
              "Career active-cup cancellation and confirmation" if args.career_cancel_only else
              "Career cup preview, safe background, Back and confirmed race start" if args.career_cup_only else
@@ -2197,6 +2243,7 @@ if __name__ == "__main__":
     parser.add_argument("--audit-only", action="store_true")
     parser.add_argument("--options-interactions-only", action="store_true", help="From Options: edit/restore choices, toggles and volume, confirm/cancel Reset, and start/cancel binding capture")
     parser.add_argument("--options-devices-only", action="store_true", help="From Options: select every available peripheral, page its input settings and restore the original device")
+    parser.add_argument("--career-welcome-only", action="store_true", help="From Main with no owned Career car: verify the welcome keeps the live scene in both eyes, acknowledge once, and return without buying")
     parser.add_argument("--career-layout-only", action="store_true", help="From Career's cup/event grid: check visible page controls and breathing room between cards")
     parser.add_argument("--career-only", action="store_true", help="From Career's cup/event grid: page both ways, hover every card, reject locked events and restore the original page")
     parser.add_argument("--career-cup-only", action="store_true", help="From an unlocked Career cup: check preview actions, blank-area click safety, Back, and a confirmed race start")

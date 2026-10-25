@@ -152,6 +152,14 @@ Native evidence for this increment lives under the ignored
 - `rc00c-native-reduced-motion-green-right` and
   `rc00c-native-reduced-motion-green-left`: intentional zero-distance feedback,
   visible white outlines in both eyes, fixed geometry and the same input gates.
+- `rc00c-native-modal-replacement-green-right` and
+  `rc00c-native-modal-replacement-green-left`: all eight case groups pass in
+  ordinary physical-depth mode, including A/B/C replacement, exclusive stable
+  targets, old-held-press/retry rejection, release without activation, one fresh
+  click/retry and final tile cleanup.
+- `held-pointer-lifecycle-unit/red.txt`, `green.txt` and `ctest-green.txt`:
+  the actual production-state fixture reproduces the post-delivery carrier
+  rejection and verifies the narrow hold fix.
 - `rc17f-popup-spacing-renderdoc/native-button-source-atlas-pixels.json`:
   source-label pixels disappear, the GPU atlas contains the isolated label,
   guard texels remain transparent and both composed eyes show the same plate.
@@ -161,8 +169,31 @@ Native evidence for this increment lives under the ignored
   with transparent exterior and footer gap. The heading binds its localization
   ID and aligns with the page controls.
 
-Before global enablement, finish replacement during entrance/held input,
-recenter/resize, constrained layer budgets, disabled/loading actions and the
-remaining menu transports. Extend the existing both-eye, both-ray, fixed-target,
-reduced-motion and GPU checks when adding the world-space path. A public
-preference and physical-headset evaluation are separate remaining work.
+The optional native `--modal-replacement` gate now covers an active-hover
+replacement and reopening while a trigger remains down. Its A/B/C fixtures use
+only the non-Retail `ui.pop_message_box` method for setup, with distinct visible
+content and unchanged native descriptor, source hit rectangle and base geometry.
+Actual screenshot-derived XR hover/hold/release/click input must prove exclusive
+modal targets, no activation from the previous held press or its UUID retry,
+one fresh activation after release and no transient layers after dismissal.
+Setup mutations are separately journaled. Presentation generation is not exposed
+by the current diagnostic API and is explicitly recorded as unavailable. The
+first right-hand run passed the A/B replacement checks, then exposed a simulator
+hold-reporting error: Cancel closed its carrier after the first held snapshot,
+but the remaining dwell revalidated it as though the press had not yet happened.
+The original failure is preserved separately. A focused production-state fixture
+reproduces that error and passes after ending hold prepress validation only once
+an actual bound action snapshot is published. Unobserved holds and ordinary click
+dwell retain their validation. The harness now refreshes B's settled base capture
+before holding and records native state on any delivery error. Native reruns now
+pass all eight case groups with both hands using the verified `ui-sweep-3`
+runtime. A fresh simulator build passes seven selected CTest checks, including
+pointer lifecycle, targeting, D3D11/D3D12, world-surface and held input. These
+replacement runs use ordinary physical depth; reduced-mode replacement has not
+been rerun, while its earlier both-hand flat-feedback checks remain separate.
+
+Before global enablement, finish entrance-time replacement, recenter/resize,
+constrained layer budgets, disabled/loading actions, reduced-mode replacement
+and the remaining menu transports. Extend the existing both-eye, both-ray,
+fixed-target, reduced-motion and GPU checks when adding the world-space path.
+A public preference and physical-headset evaluation are separate remaining work.

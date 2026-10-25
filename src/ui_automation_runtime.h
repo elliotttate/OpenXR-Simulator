@@ -195,7 +195,7 @@ static void PollUiPointerCommand() {
     }
     for (int h=0;h<2;++h) {
         auto& p=g_pointer[h];
-        if (!p.pending || p.phase!=0) continue;
+        if (!NeedsPrepressValidation(p)) continue;
         const auto capture=g_captures.find(p.captureId);
         if (capture==g_captures.end() || !CompatibleCapture(capture->second.geometry,p.surfaceId)) {
             ClearUiButtons(h); p.down=false; p.owned=false;
@@ -280,13 +280,6 @@ static void ApplyUiPointerButtons() {
 static void AdvanceUiPointersAfterSync(const bool observed[2]) {
     for (int hand=0;hand<2;++hand) {
         auto& p=ui_auto::g_pointer[hand];
-        if (!p.owned || !p.pending) continue;
-        if (!observed[hand]) continue;
-        if (++p.cycles < (p.phase==0 ? p.dwell : p.phase==1 ? p.hold : 2)) continue;
-        p.cycles=0;
-        if (p.action=="hover" || p.action=="hold") WriteUiResult(p,true);
-        else if (p.phase==0) { p.down=true; p.phase=1; }
-        else if (p.phase==1) { p.down=false; p.phase=2; }
-        else WriteUiResult(p,true);
+        if (ui_auto::AdvancePointerAfterSync(p,observed[hand])) WriteUiResult(p,true);
     }
 }

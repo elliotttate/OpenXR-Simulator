@@ -86,6 +86,26 @@ struct Pointer {
 };
 inline Pointer g_pointer[2];
 
+inline bool NeedsPrepressValidation(const Pointer& p) {
+    // Hold publishes button-down immediately, unlike a click's unpressed
+    // dwell. Once a bound action snapshot observed it, closing its carrier is
+    // valid application feedback and must not turn delivery into an error.
+    return p.pending && p.phase==0 && !(p.action=="hold" && p.cycles>0);
+}
+
+// Called only after action snapshots are published. An unobserved sync must
+// neither advance delivery nor imply that the application saw a held press.
+inline bool AdvancePointerAfterSync(Pointer& p, bool observed) {
+    if (!p.owned || !p.pending || !observed) return false;
+    if (++p.cycles < (p.phase==0 ? p.dwell : p.phase==1 ? p.hold : 2)) return false;
+    p.cycles=0;
+    if (p.action=="hover" || p.action=="hold") return true;
+    if (p.phase==0) { p.down=true; p.phase=1; }
+    else if (p.phase==1) { p.down=false; p.phase=2; }
+    else return true;
+    return false;
+}
+
 inline bool ValidId(const std::string& s) {
     if (s.empty() || s.size() > 80) return false;
     for (char c : s) if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
