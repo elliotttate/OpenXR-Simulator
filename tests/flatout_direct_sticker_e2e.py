@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 from mcp import ClientSession, StdioServerParameters
@@ -20,6 +21,20 @@ from flatout_livery_e2e import LiveryTest, ROOT, world_pixel
 
 
 class DirectSticker(LiveryTest):
+    async def tool(self, name, arguments, label):
+        # Debug's CPU atlas bake can delay a composed screenshot. This is a
+        # functional check with a bounded wait, not a VR frame-time benchmark.
+        started = time.monotonic()
+        try:
+            value = await super().tool(name, {"timeout": getattr(self.args,"timeout",15), **arguments}, label)
+            assert value.get("status") != "error", (name,value)
+            return value
+        finally:
+            timings = getattr(self,"timings",[])
+            timings.append({"tool":name,"label":label,"seconds":time.monotonic()-started})
+            self.timings = timings
+            (self.args.evidence/"tool-timings.json").write_text(json.dumps(timings,indent=2))
+
     async def point(self, hand, pixel, hold=True, expect_grab=True):
         capture = await self.capture("direct-gesture-source")
         aim = {"capture_id": capture["capture_id"], "x": float(pixel[0]), "y": float(pixel[1]),
@@ -67,6 +82,8 @@ class DirectSticker(LiveryTest):
     async def run_direct(self):
         await self.click("STICKERS")  # Leaves explicit placement mode through the actual UI.
         before = await self.state()
+        initial_document = before["document"]
+        assert len(initial_document["layers"]) == 1, "Use the single-circle fixture after the two-hand regression"
         assert before["document"]["layers"][before["selected"]]["asset"] == "FO_BASIC_CIRCLE"
         await self.click("DUPLICATE")
         expected = len((await self.state())["document"]["layers"])-1
@@ -195,6 +212,11 @@ class DirectSticker(LiveryTest):
                            "locked": locked, "denied": denied, "bare": bare,
                            "undo_unlock": undo_unlock, "restored": restored})
         print("Locked artwork protection, bare-body safety and no-op click history PASS", flush=True)
+        for _ in range(4):
+            cleaned = await self.click("UNDO")
+        assert cleaned["document"] == initial_document, "Restore the fixture after this unsaved test"
+        self.cases.append({"case":"restore-single-circle-fixture","passed":True,"after":cleaned})
+        print("Direct-edit fixture restored PASS",flush=True)
 
 
 
@@ -223,6 +245,7 @@ async def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--timeout", type=float, default=15, help="Bounded Debug functional input/screenshot wait in seconds")
     p.add_argument("--pid", type=int, required=True)
     p.add_argument("--data-dir", type=Path, required=True)
     p.add_argument("--evidence", type=Path, required=True)
