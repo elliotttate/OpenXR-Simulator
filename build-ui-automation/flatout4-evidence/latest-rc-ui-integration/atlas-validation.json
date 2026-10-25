@@ -1,0 +1,25 @@
+{
+  "status": "implemented-native-and-gpu-verified",
+  "fox_rc": "906721488adde53a92cba6c8ac8a59813b85ceef",
+  "game_dll_sha256": "f78707b78d6a69d38c64f7ea33bb78a5ea41d24b08eecc61a334451d07e6dc9b",
+  "pid": 39196,
+  "native_red": "rc906-paint-atlas-native-red/result.json",
+  "native_green": [
+    "rc906-atlas-green-material/result.json",
+    "rc906-atlas-green-layout/result.json",
+    "rc906-atlas-green-ray-dialogs/result.json"
+  ],
+  "gpu_proof": "rc906-atlas-green-material/gpu-proof.json",
+  "portable_livery_assertions": 105040,
+  "portable_vr_checks": 356,
+  "normal_exit": 0,
+  "native_log_errors": 0,
+  "protected_profile_files_unchanged": 9,
+  "scope": "Material and metadata edits retain full sticker atlas; sticker edits invalidate preview then release rebuilds full quality",
+  "limits": "Debug update measurements are not VR frame-time or hardware comfort benchmarks. Broader non-Wreck UI audit and native audio integration remain active.",
+  "native_case_counts": [
+    31,
+    38,
+    55
+  ]
+}
