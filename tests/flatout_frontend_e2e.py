@@ -30,7 +30,7 @@ RAY_OFFSET = {"position": [.03, 0, 0], "orientation": [0, -.043619387365336, 0, 
 
 def read_game(pid, method, params=None):
     # RenderDoc records the rendered frame; it cannot activate or navigate UI.
-    assert method in {"game.get_state", "game.errors", "menu.get_state", "vr.targets", "vr.get_state", "hud.pause_menu", "ui.get_message_box", "options.get_state", "statistics.get_state", "party.get_state", "race.end_screen", "leaderboard.get_state", "hud.rects", "hud.get_node", "rogue.state", "rogue.route_map", "renderdoc.capture", "audio.ui_feedback"}
+    assert method in {"game.get_state", "game.errors", "menu.get_state", "vr.targets", "vr.get_state", "hud.pause_menu", "ui.get_message_box", "ui.vr_button_map", "options.get_state", "statistics.get_state", "party.get_state", "race.end_screen", "leaderboard.get_state", "hud.rects", "hud.get_node", "rogue.state", "rogue.route_map", "renderdoc.capture", "audio.ui_feedback"}
     if params is None:
         params = {"action": "list"} if method == "hud.pause_menu" else {}
     request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
@@ -434,6 +434,8 @@ class Frontend:
         px, py = l+(r-l)*fraction[0], t+(b-t)*fraction[1]
         surface = None
         frame = before.get("vr_frame")
+        if frame and (await self.query("menu.get_state"))["is_3d"]:
+            frame = None  # Spatial menus retain their anchor while a native modal covers them.
         if frame is not None:
             # Raised controls are compositor quads even when the base is an RTT.
             # Use the independently reported carrier, never the first hover tile.
@@ -1413,6 +1415,8 @@ class Frontend:
         assert menu["is_3d"] and menu.get("spatial_layout"), menu
         assert not (await self.query("vr.targets"))["targets"], "Spatial menus advertise hidden canvas helper buttons"
         for item in menu["items"]:
+            if item["index"] in self.args.skip_menu_index:
+                continue
             current = await self.query("menu.get_state")
             item = current["items"][item["index"]]
             native = await self.query("vr.targets")
@@ -1434,6 +1438,22 @@ class Frontend:
             self.cases.append({"case":"spatial-label-hover-"+str(item["index"]),"passed":passed,
                                "title":item["title"],"pixel":[float(x),float(y)],"item":item,"after":after})
             assert passed, ("Ray did not select the rendered spatial label",item,after)
+            if self.args.require_physical_lift:
+                observed = after["items"][item["index"]]
+                rest = np.array(observed["rest_position"])
+                moved = np.array(observed["rendered_position"])
+                normal = np.array(after["spatial_layout"]["back"])
+                normal /= np.linalg.norm(normal)
+                camera = native["vr_frame"]["camera"]
+                basis = np.column_stack([camera[k] for k in ("right", "up", "back")])
+                eyes = np.array(camera["origin"]) + basis @ np.array(capture["geometry"]["head"]["position"])
+                if np.dot(normal, eyes - rest) < 0:
+                    normal = -normal
+                lift = float(np.dot(moved - rest, normal))
+                expected = 0 if observed.get("locked") else .015
+                assert abs(lift - expected) < .001, ("Incorrect physical spatial lift", observed["title"], lift)
+                assert np.linalg.norm(moved - rest - normal * lift) < .001, "Spatial hover slid sideways"
+                self.cases.append({"case": "spatial-metric-lift", "passed": True, "title": observed["title"], "meters": lift})
         if self.args.spatial_click_index is not None:
             index = self.args.spatial_click_index
             current = await self.query("menu.get_state")
@@ -2270,7 +2290,9 @@ if __name__ == "__main__":
     parser.add_argument("--career-wrong-class-only", action="store_true", help="From Career class selection with a Derby car: verify Classic/AllStar warnings, filtered cars and Back without buying")
     parser.add_argument("--options-redesign-layout-only", action="store_true", help="From Options: require a category rail and a single spacious list with separate page controls")
     parser.add_argument("--return-main-only", action="store_true", help="From in-race Options or Pause: use ray Back and confirm Main Menu exactly once")
+    parser.add_argument("--require-physical-lift", action="store_true", help="Require actual 15mm forward travel for enabled spatial labels")
     parser.add_argument("--spatial-hover-only", action="store_true", help="From a spatial text menu: screenshot and hover each rendered label, optionally activate one")
+    parser.add_argument("--skip-menu-index", action="append", type=int, default=[], help="Exclude an explicitly deferred spatial menu item")
     parser.add_argument("--spatial-back-only", action="store_true", help="From a spatial submenu: check Back in both eyes, reject edge/other-ray presses, verify its chevron and click once; requires --expected-menu")
     parser.add_argument("--spatial-locked-only", action="store_true", help="From this RC's main menu: verify Wreck Run is reported as Coming Soon and a held ray click cannot enter it")
     parser.add_argument("--spatial-click-index", type=int)

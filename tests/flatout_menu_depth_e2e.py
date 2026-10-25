@@ -23,13 +23,23 @@ class MenuDepth(Frontend):
     async def run(self):
         initial = await self.query('vr.targets')
         assert 'WRECK' not in initial.get('menu', '').upper(), 'Wreck Run is deferred'
-        names = self.args.target or [t['name'] for t in initial['targets'] if t.get('enabled', True)]
+        names = (self.args.target or []) + ['legacy.' + str(i) for i in self.args.legacy_index]
+        names = names or [t['name'] for t in initial['targets'] if t.get('enabled', True)]
         for name in names:
             before = await self.query('vr.targets')
-            target = next(t for t in before['targets'] if t['name'] == name)
+            legacy_index = int(name.split('.')[1]) if name.startswith('legacy.') else None
+            if legacy_index is not None:
+                mapping = await self.query('ui.vr_button_map')
+                button = next(b for b in mapping['buttons'] if b['index'] == legacy_index)
+                assert button['hits'] and button['visible'], button
+                target = {'name': name, 'rect': button['top_left'] + button['bottom_right']}
+            else:
+                target = next(t for t in before['targets'] if t['name'] == name)
             assert target.get('enabled', True), ('Disabled control requested', name)
             source = await self.capture('source-' + name)
             frame = before.get('vr_frame')
+            if frame and (await self.query('menu.get_state'))['is_3d']:
+                frame = None
             # An RTT menu has no native base quad, even when its hover tile exists.
             if frame:
                 base = ui_surface({'vr': {'frame': frame}})
@@ -49,14 +59,32 @@ class MenuDepth(Frontend):
             hovered = await self.tool('hover_ui_at', aim, 'hover-' + name)
             assert hovered['status'] == 'input_delivered', hovered
             current = await self.query('vr.targets')
-            assert current['hovered'] == name and current['clicks'] == before['clicks'], current
-            assert next(t['rect'] for t in current['targets'] if t['name'] == name) == target['rect'], 'Hover moved hit bounds'
+            assert current['clicks'] == before['clicks'], current
+            if legacy_index is not None:
+                menu = await self.query('menu.get_state')
+                assert menu['selection_index'] == legacy_index, menu
+            else:
+                assert current['hovered'] == name, current
+                assert next(t['rect'] for t in current['targets'] if t['name'] == name) == target['rect'], 'Hover moved hit bounds'
             raised = await self.tool('capture_screenshot', {'eye': 'both', 'max_width': 4096}, 'raised-' + name)
             self.last_capture = raised
             tiles = [s for s in raised['geometry']['surfaces'] if s['id'] != base['id'] and s['visibility'] == 0]
-            normal = quaternion_matrix(base['pose']['orientation'])[:, 2]
+            basis = quaternion_matrix(base['pose']['orientation'])
+            normal = basis[:, 2]
             lifts = [float(np.dot(np.array(s['pose']['position']) - base['pose']['position'], normal)) for s in tiles]
-            assert any(abs(lift - .015) < .001 for lift in lifts), (name, 'No 15mm physical lift', lifts)
+            l, t, r, b = target['rect']
+            point = (np.array(base['pose']['position']) + basis[:, 0] * ((l+r)/3840-.5) * base['size'][0]
+                     + basis[:, 1] * (.5-(t+b)/2160) * base['size'][1])
+            matching = []
+            for tile, lift in zip(tiles, lifts):
+                local = quaternion_matrix(tile['pose']['orientation']).T @ (point-np.array(tile['pose']['position']))
+                if abs(lift-.015) < .001 and all(abs(local[i]) <= tile['size'][i]/2+.002 for i in (0, 1)):
+                    matching.append(tile)
+            passed = bool(matching)
+            if not passed:
+                self.cases.append({'case': 'physical-hover-' + name, 'passed': False,
+                                   'lift_meters': lifts, 'source_rect': target['rect'], 'base': base, 'tiles': tiles})
+            assert passed, (name, 'No 15mm physical lift', lifts)
             assert len(tiles) <= 2, ('Unbounded transient layers', tiles)
             self.cases.append({'case': 'physical-hover-' + name, 'passed': True, 'lift_meters': lifts,
                                'source_rect': target['rect'], 'base': base, 'tiles': tiles})
@@ -67,6 +95,7 @@ class MenuDepth(Frontend):
             self.cases.append({'case': 'click-result', 'passed': True, 'menu': after['current_menu']})
         errors = await self.query('game.errors')
         self.cases.append({'case': 'game-error-diagnostics', 'diagnostics': errors})
+        assert errors['total'] == 0, errors
 
 
 async def main(args):
@@ -100,6 +129,7 @@ if __name__ == '__main__':
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--hand', choices=('left', 'right'), default='right')
     p.add_argument('--target', action='append')
+    p.add_argument('--legacy-index', action='append', type=int, default=[])
     p.add_argument('--click')
     p.add_argument('--expected-menu')
     p.add_argument('--reading-distance', type=float)
