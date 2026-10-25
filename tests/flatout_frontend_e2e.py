@@ -453,8 +453,11 @@ class Frontend:
 
     async def options_comfort(self):
         assert (await self.query("options.get_state"))["open"],"Start in Options"
+        return await self.reading_comfort("options")
+
+    async def reading_comfort(self, label):
         before=await self.query("vr.targets")
-        capture=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},"options-head-height")
+        capture=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},label+"-head-height")
         self.last_capture=capture
         def surface_for(source,native):
             quads=[s for s in source["geometry"]["surfaces"] if s["visibility"]==0]
@@ -464,9 +467,9 @@ class Frontend:
         assert np.allclose(head["orientation"],[0,0,0,1]),"Start at a neutral head rotation"
         delta=np.array(surface["pose"]["position"])-head["position"]
         pitch=math.degrees(math.atan2(float(delta[1]),float(np.linalg.norm(delta[[0,2]]))))
-        self.cases.append({"case":"options-reading-surface-at-head-height","passed":-12<=pitch<=6,"pitch_degrees":pitch,
+        self.cases.append({"case":label+"-reading-surface-at-head-height","passed":-12<=pitch<=6,"pitch_degrees":pitch,
                            "head":head,"surface":surface})
-        assert -12<=pitch<=6,("Options requires looking too far from the neutral gaze",pitch)
+        assert -12<=pitch<=6,(label+" requires looking too far from the neutral gaze",pitch)
         def visible(source,plane):
             eyes=source["geometry"]["eyes" if source["geometry"]["surfaces"] else "projection_eyes"]
             w,h=source["image_size"];cx,cy,cw,ch=source["crop"]
@@ -481,24 +484,24 @@ class Frontend:
                         ex,ey,ew,eh=eye["viewport"]
                         px=(ex+(local[0]/-local[2]-left)/(right-left)*ew-cx)/cw*w-.5
                         py=(ey+(local[1]/-local[2]-up)/(down-up)*eh-cy)/ch*h-.5
-                        assert index*w/2<=px<(index+1)*w/2 and 0<=py<h,("Options control clipped in an eye",eye["eye"],target,px,py)
+                        assert index*w/2<=px<(index+1)*w/2 and 0<=py<h,(label+" control clipped in an eye",eye["eye"],target,px,py)
         visible(capture,surface)
         try:
             response=await self.session.call_tool("set_head_pose",{"x":.1,"y":head["position"][1]+.12,"z":.05,"yaw_deg":6,"pitch_deg":-4,"roll_deg":2})
             assert not response.isError
             await asyncio.sleep(.3)
-            moved=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},"options-head-moved")
+            moved=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},label+"-head-moved")
             self.last_capture=moved
             current=surface_for(moved,await self.query("vr.targets"))
-            assert np.allclose(current["pose"]["position"],surface["pose"]["position"],atol=1e-4),"Options followed head translation"
-            assert np.allclose(current["pose"]["orientation"],surface["pose"]["orientation"],atol=1e-4),"Options followed head rotation"
+            assert np.allclose(current["pose"]["position"],surface["pose"]["position"],atol=1e-4),label+" followed head translation"
+            assert np.allclose(current["pose"]["orientation"],surface["pose"]["orientation"],atol=1e-4),label+" followed head rotation"
             visible(moved,current)
         finally:
             await self.session.call_tool("set_head_pose",{"x":head["position"][0],"y":head["position"][1],"z":head["position"][2],"yaw_deg":0,"pitch_deg":0,"roll_deg":0})
             await asyncio.sleep(.3)
         cancel=next(t["name"] for t in before["targets"] if t["name"].startswith("helper.Cancel."))
         await self.hover(cancel)
-        self.cases.append({"case":"options-world-locked-both-eye-controls-and-ray-hover","passed":True,"hand":self.args.hand})
+        self.cases.append({"case":label+"-world-locked-both-eye-controls-and-ray-hover","passed":True,"hand":self.args.hand})
 
     async def options_redesign_layout(self):
         native = await self.query("options.get_state")
@@ -1082,6 +1085,8 @@ class Frontend:
         assert not any(t["name"] == "stats.scroll.up" for t in targets), "Page up must be disabled at the beginning"
         page_rect = next(t["rect"] for t in targets if t["name"] == "stats.scroll.down")
         l,t,r,b = page_rect
+        footer_top=min(target["rect"][1] for target in targets if target["name"].startswith("helper."))
+        assert r-l>=80 and b-t>=72 and b<=footer_top-20,("Statistics paging needs a large button clear of the action dock",page_rect,footer_top)
         inactive = "left" if self.args.hand == "right" else "right"
         _, args = await self.point_args("stats.scroll.down", ((100-l)/(r-l),(1040-t)/(b-t)), inactive)
         await self.tool("hover_ui_at", args, "statistics-offhand-rest")
@@ -1943,6 +1948,13 @@ class Frontend:
         print("Cyan left and amber right beams visible in both eyes PASS",flush=True)
 
     async def run(self):
+        if self.args.reading_comfort_only:
+            menu=await self.query("menu.get_state")
+            assert menu["is_open"] and not menu["is_3d"],"Start in a flat reading menu"
+            return await self.reading_comfort(menu["current_menu"].lower().replace(" ","-"))
+        if self.args.quick_comfort_only:
+            assert (await self.query("menu.get_state"))["current_menu"]=="QUICK EVENTS","Start in Quick Play"
+            return await self.reading_comfort("quick-start")
         if self.args.quick_action_copy_only:
             await self.capture("quick-start-action-copy")
             return await self.quick_action_caption()
@@ -2087,7 +2099,9 @@ async def run(args):
     args.evidence.mkdir(parents=True, exist_ok=False)
     params = StdioServerParameters(command=sys.executable, args=[str(ROOT/"mcp-server/openxr_simulator_mcp.py")],
         env={**os.environ, "SIMXR_DATA_DIR": str(args.data_dir.resolve())})
-    scope = ("Options head-height placement and world-locked both-eye visibility" if args.options_comfort_only else
+    scope = ("Reading-menu head-height placement and world-locked both-eye visibility" if args.reading_comfort_only else
+             "Quick Start head-height placement and world-locked both-eye visibility" if args.quick_comfort_only else
+             "Options head-height placement and world-locked both-eye visibility" if args.options_comfort_only else
              "Credits Pause freezes the reading position immediately" if args.credits_stop_only else
              "Complete Credits playback, continuous ray hold and automatic ending fade" if args.credits_finish_only else
              "Credits readable viewport, transport controls and live scene" if args.credits_only or args.credits_layout_only else
@@ -2208,6 +2222,8 @@ if __name__ == "__main__":
     parser.add_argument("--options-only", action="store_true", help="Audit all categories from already-open Options")
     parser.add_argument("--options-layout-only", action="store_true", help="Check dedicated navigation and scroll controls")
     parser.add_argument("--options-comfort-only", action="store_true", help="From Options: check neutral-gaze placement, both-eye control visibility, stable head movement and ray Back hover")
+    parser.add_argument("--quick-comfort-only", action="store_true", help="From Quick Play: check neutral-gaze placement, both-eye control visibility, stable head movement and ray Back hover")
+    parser.add_argument("--reading-comfort-only", action="store_true", help="From a flat reading menu: check neutral-gaze placement, both-eye control visibility, stable head movement and ray Back hover")
     parser.add_argument("--tall-layout-only", action="store_true", help="Check that Options uses the available vertical space")
     parser.add_argument("--hand", choices=("left", "right"), default="right", help="Controller used for pointer interactions")
     parser.add_argument("--dual-hand-options", action="store_true", help="Verify an Audio slider drag owns both rays until release, then restore its value")
