@@ -75,6 +75,9 @@ head-relative, level pose on modal open/recenter and share it with the pointer.
 
 ## Recommended integration
 
+See [the motion direction](MOTION.md) for the popup fade audit, proposed timing,
+interruption rules and native verification of modal prompt suppression.
+
 Use a small, shared **button surface renderer**, with transport matching the menu:
 
 | Technique | Real binocular approach? | Fit for Fox |

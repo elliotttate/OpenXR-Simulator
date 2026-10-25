@@ -91,6 +91,117 @@ class Frontend:
         self.last_capture = await self.tool("capture_screenshot", {"eye": "left", "max_width": 1280}, label)
         return self.last_capture
 
+    async def popup_motion(self):
+        """Observe a native popup entrance during an actual spatial-menu ray click."""
+        assert not (await self.query("ui.get_message_box"))["open"]
+        menu=await self.query("menu.get_state")
+        assert menu["current_menu"]=="MAIN MENU" and menu["is_3d"],"Start in the spatial main menu"
+        item=next(i for i in menu["items"] if i["title"]=="QUIT")
+        async def aim_source():
+            current=await self.query("menu.get_state")
+            native=await self.query("vr.targets")
+            capture=await self.capture("quit-motion-source")
+            point=current["items"][item["index"]]["rendered_position"]
+            frame={**native["vr_frame"],"panel":{**current["spatial_layout"],"origin":point},"panel_width":1.,"panel_height":1.}
+            state={"vr":{"frame":frame}}
+            x,y=world_pixel(state,capture,point,"left")
+            assert 0<=x<capture["image_size"][0] and 0<=y<capture["image_size"][1]
+            return {"capture_id":capture["capture_id"],"x":float(x),"y":float(y),"hand":self.args.hand,
+                    "origin_mode":"hand","surface":ui_surface(state),"ray_offset":RAY_OFFSET,"dwell_frames":30}
+        aim=await aim_source()
+        assert (await self.tool("hover_ui_at",aim,"quit-motion-hover"))["status"]=="input_delivered"
+        assert (await self.query("menu.get_state"))["selection_index"]==item["index"]
+        assert not (await self.query("ui.get_message_box"))["open"],"Hover opened Quit"
+        args={**(await aim_source()),"hold_frames":45,"timeout":30,"command_id":uuid.uuid4().hex}
+        pending=asyncio.create_task(self.tool("click_ui_at",args,"quit-motion-click"))
+        samples=[];start=asyncio.get_running_loop().time()
+        try:
+            while asyncio.get_running_loop().time()-start<3:
+                nodes=(await self.query("hud.rects",{"root":"msgbox","max_depth":1,"all":True}))["nodes"]
+                layer=next((n for n in nodes if n["path"]=="MESSAGEBOX_ROOT/Messagebox Layer 0" and n["visible"]),None)
+                if layer:samples.append({"seconds":asyncio.get_running_loop().time()-start,"alpha":layer["color"]["a"]})
+                if pending.done() and samples and samples[-1]["alpha"]>=.99:break
+                await asyncio.sleep(.015)
+        finally:
+            clicked=await pending
+        assert clicked["status"]=="input_delivered",clicked
+        assert (await self.query("ui.get_message_box"))["open"],"The ray click did not open Quit"
+        await self.tool("click_ui_at",args,"quit-motion-retry")
+        intermediate=[s for s in samples if 0<s["alpha"]<.99]
+        self.cases.append({"case":"native-popup-entrance-fade","passed":bool(intermediate) and samples[-1]["alpha"]>=.99,"samples":samples})
+        assert intermediate,"The popup snapped on without an observable entrance fade"
+        assert samples[-1]["alpha"]>=.99,"The popup did not become fully readable"
+        assert all(b["alpha"]>=a["alpha"] for a,b in zip(samples,samples[1:])),"The entrance fade restarted or reversed"
+        await self.popup_spacing()
+        await self.popup_no_prompts()
+
+    async def popup_no_prompts(self):
+        """A modal suppresses the soundtrack HUD without hiding its underlying menu."""
+        assert (await self.query("ui.get_message_box"))["open"], "Open a cancelable dialog over the front end first"
+        before=await self.query("menu.get_state")
+        nodes=(await self.query("hud.rects",{"root":"menu","max_depth":16,"all":True}))["nodes"]
+        music=[n for n in nodes if "/Music/" in n["path"]]
+        assert music,"The soundtrack HUD must exist for this regression"
+        await self.capture("modal-suppresses-music-prompts")
+        assert not any(n["visible"] for n in music),("Legacy soundtrack controls draw behind the dialog",music)
+        native=await self.query("vr.targets")
+        assert native["targets"] and all(t["name"].startswith("msgbox.") for t in native["targets"]),native
+        await self.hover("msgbox.cancel")
+        assert (await self.query("vr.targets"))["clicks"]==native["clicks"],"Hover activated the dialog"
+        await self.click("msgbox.cancel")
+        assert not (await self.query("ui.get_message_box"))["open"]
+        after=await self.query("menu.get_state")
+        assert after["current_menu"]==before["current_menu"] and after["is_open"],"Cancel lost the underlying menu"
+        assert after["selection_index"]==before["selection_index"],"Cancel changed selection"
+        restored=any(n["visible"] and n["path"].endswith("/Music") for n in (await self.query("hud.rects",{"root":"menu","max_depth":16,"all":True}))["nodes"])
+        assert restored,"Soundtrack HUD did not restore after Cancel"
+        await self.capture("modal-closed-menu-kept")
+        self.cases.append({"case":"modal-suppresses-legacy-music-controls","passed":True,"hand":self.args.hand,"menu":after["current_menu"],"restored":restored})
+
+    async def popup_anchor(self):
+        """A standing modal is visible in both eyes and stays still during head motion."""
+        assert (await self.query("ui.get_message_box"))["open"]
+        before=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},"popup-standing-source")
+        self.last_capture=before
+        head=before["geometry"]["head"]
+        assert head["position"][1]>1.,"Start this regression at the simulator's standing pose"
+        assert np.allclose(head["orientation"],[0,0,0,1]),"Start without a head rotation"
+        base=next(s for s in before["geometry"]["surfaces"] if s["visibility"]==0)
+        assert abs(base["pose"]["position"][1]-head["position"][1])<.1,("The popup must open at the user's eye height",head,base)
+        nodes=(await self.query("hud.rects",{"root":"msgbox","max_depth":14}))["nodes"]
+        frames=[n for n in nodes if n["visible"] and n["path"].endswith("/RayDialogFrame")]
+        assert len(frames)==1,frames
+        l,t,r,b=frames[0]["rect"]
+        def visible(capture):
+            w,h=capture["image_size"]
+            assert capture["geometry"]["layout"]=="side_by_side"
+            for eye,index in (("left",0),("right",1)):
+                points=[quad_pixel(capture,(x,y,x,y),eye)for x,y in ((l,t),(r,t),(r,b),(l,b))]
+                assert all(index*w/2<=x<(index+1)*w/2 and 0<=y<h for x,y in points),("The full dialog must remain visible in each eye",eye,points)
+        visible(before)
+        try:
+            response=await self.session.call_tool("set_head_pose",{"x":.12,"y":1.82,"z":.10,"yaw_deg":8,"pitch_deg":-5,"roll_deg":4})
+            assert not response.isError
+            until=asyncio.get_running_loop().time()+8
+            while True:
+                moved=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},"popup-standing-head-moved")
+                self.last_capture=moved
+                if moved["geometry"]["head"]["position"][1]>1.8:break
+                assert asyncio.get_running_loop().time()<until,"Head movement did not arrive"
+                await asyncio.sleep(.1)
+            current=next(s for s in moved["geometry"]["surfaces"] if s["visibility"]==0)
+            assert np.allclose(current["pose"]["position"],base["pose"]["position"],atol=1e-5),"The dialog followed head translation"
+            assert np.allclose(current["pose"]["orientation"],base["pose"]["orientation"],atol=1e-5),"The dialog followed head rotation"
+            visible(moved)
+            native=await self.query("vr.targets")
+            target=next(t["name"]for t in native["targets"]if t["name"].startswith("msgbox."))
+            await self.hover(target)
+            assert (await self.query("vr.targets"))["clicks"]==native["clicks"],"Hover activated a dialog action"
+            self.cases.append({"case":"standing-popup-world-anchor-and-ray-hover","passed":True,"head_before":head,"head_after":moved["geometry"]["head"],"surface_before":base,"surface_after":current,"dialog":frames[0],"hand":self.args.hand})
+        finally:
+            x,y,z=head["position"]
+            await self.session.call_tool("set_head_pose",{"x":x,"y":y,"z":z,"yaw_deg":0,"pitch_deg":0,"roll_deg":0})
+
     async def popup_spacing(self):
         modal=await self.query("ui.get_message_box")
         assert modal["open"],"Open a message box first"
@@ -1710,6 +1821,12 @@ class Frontend:
             return await self.party()
         if self.args.statistics_only:
             return await self.statistics()
+        if self.args.popup_motion_only:
+            return await self.popup_motion()
+        if self.args.popup_no_prompts_only:
+            return await self.popup_no_prompts()
+        if self.args.popup_anchor_only:
+            return await self.popup_anchor()
         if self.args.popup_spacing_only:
             await self.popup_spacing()
             return
@@ -1785,7 +1902,10 @@ async def run(args):
     args.evidence.mkdir(parents=True, exist_ok=False)
     params = StdioServerParameters(command=sys.executable, args=[str(ROOT/"mcp-server/openxr_simulator_mcp.py")],
         env={**os.environ, "SIMXR_DATA_DIR": str(args.data_dir.resolve())})
-    scope = ("Popup content and action spacing" if args.popup_spacing_only else
+    scope = ("Native popup entrance fade and interruption-free ray input" if args.popup_motion_only else
+             "Modal suppresses legacy soundtrack prompts without hiding its menu" if args.popup_no_prompts_only else
+             "Standing popup placement, stable world anchor and ray hover" if args.popup_anchor_only else
+             "Popup content and action spacing" if args.popup_spacing_only else
              "Quick Start explicit next-step caption" if args.quick_action_copy_only else
              "Coming Soon lock diagnostics and inert ray click" if args.spatial_locked_only else
              "Spatial Back visibility, edge misses, both hands and one activation" if args.spatial_back_only else
@@ -1883,6 +2003,9 @@ if __name__ == "__main__":
     parser.add_argument("--end-results-only", action="store_true", help="From race results: verify no yellow footer, readable actions, and exactly one Continue page with a held trigger")
     parser.add_argument("--party-only", action="store_true", help="From Party Mode's player selector: hover every count and choose eight players exactly once")
     parser.add_argument("--statistics-only", action="store_true", help="From the top of Statistics: scroll both ends with page buttons, check spacing and category navigation")
+    parser.add_argument("--popup-motion-only", action="store_true", help="From the spatial main menu: ray-hover Quit, click it once, observe the native entrance fade, then ray-cancel once")
+    parser.add_argument("--popup-no-prompts-only", action="store_true", help="From a cancelable modal: verify soundtrack prompts are hidden, ray Cancel fires once and the same menu returns")
+    parser.add_argument("--popup-anchor-only", action="store_true", help="From an open popup at the default standing head pose: check visibility in both eyes, stable placement during head motion and actual ray hover")
     parser.add_argument("--popup-spacing-only", action="store_true", help="From an open popup: verify content padding, caption spacing and the separate ray-button action row")
     parser.add_argument("--single-dialog-only", action="store_true", help="From a single-button informational popup: hover and confirm exactly once, then verify dismissal")
     parser.add_argument("--menu-hover-only", action="store_true", help="Hover every target in the current menu; combine with --audit-only for flat menu spacing")
