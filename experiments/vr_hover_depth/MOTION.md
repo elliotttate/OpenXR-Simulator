@@ -44,6 +44,14 @@ separate from the scrolling text. Native tests cover both hands, immediate Pause
 held scrubbing, the complete roll and automatic return to Extras. RenderDoc
 confirms transparent exterior/footer gaps and stencil rejection of text there.
 
+Front-end Options now shares that head-height, world-locked HUD presentation.
+The prior authored RTT anchor put its plane about 32 degrees below a neutral
+standing gaze. Native red/green checks cover placement, all visible controls in
+both eyes, translation/rotation stability and ray Back hover with either hand.
+Its target collector owns the reading surface explicitly so rendering and ray
+intersection use the same HUD pose. Showroom and other world-space menus retain
+their own presentation paths.
+
 `DrawRayActions` refreshes local colors every collection. A new fade must operate
 at a shared presentation parent, or after those local colors are assigned.
 Verify the composed title, illustration, border, plate and label together.
