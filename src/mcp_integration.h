@@ -153,7 +153,11 @@ inline std::string GetScreenshotPath() {
 inline void WriteScreenshotStatus(const char* layer, uint32_t width, uint32_t height,
                                   uint64_t capturedFrame = 0, const ui_auto::Frame* geometry = nullptr) {
     std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex);
-    std::string path = GetSimulatorDataPath() + "\\screenshot_status.json";
+    // A polling Windows reader can hold the old file without FILE_SHARE_DELETE,
+    // making replacement fail. Publish each correlated capture to a new path so
+    // its acknowledgement cannot be lost to a reader of the previous capture.
+    std::string path = GetSimulatorDataPath() + (g_captureId.empty()
+        ? "\\screenshot_status.json" : "\\screenshot_status." + g_captureId + ".json");
     std::string temporary = path + ".tmp";
     FILE* file = nullptr;
     if (fopen_s(&file, temporary.c_str(), "w") != 0 || !file) return;

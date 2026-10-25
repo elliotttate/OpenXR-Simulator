@@ -1,12 +1,14 @@
 import copy
+import asyncio
 import math
 import sys
 import time
 import unittest
+from unittest.mock import AsyncMock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/"mcp-server"))
-from ui_targeting import aim_orientation, intersect_surface, resolve_target, rotate, world_ray
+from ui_targeting import UiAutomation, aim_orientation, intersect_surface, resolve_target, rotate, world_ray
 
 
 def capture():
@@ -21,6 +23,28 @@ def capture():
 
 
 class TargetingTests(unittest.TestCase):
+    def test_scroll_validates_axes_before_sending(self):
+        ui = UiAutomation(Path("unused"))
+        for stick in (None, [], [0], [0, 2], [math.nan, 0], [True, 0], "up"):
+            with self.assertRaisesRegex(ValueError, "stick"):
+                asyncio.run(ui.interact("scroll", "capture", stick=stick))
+
+    def test_scroll_uses_the_same_screenshot_ray_and_never_a_button(self):
+        ui = UiAutomation(Path("unused"))
+        info = capture()
+        info.update(eye="left", max_width=1280)
+        info["geometry"]["session_id"] = "session"
+        ui.captures["source"] = info
+        ui.command = AsyncMock(return_value={"success": True, "sync_id": 42})
+        ui.capture = AsyncMock(return_value=({"capture_id": "after"}, b"pixels"))
+        asyncio.run(ui.interact("scroll", "source", 250, 200, hand="left",
+                               stick=[0, -.6], hold_frames=30))
+        payload = ui.command.call_args.args[0]
+        self.assertEqual((payload["action"], payload["hand"], payload["stick_y"]), ("scroll", 0, -.6))
+        self.assertEqual(payload["hold_frames"], 30)
+        self.assertEqual([payload[k] for k in ("px", "py", "pz")], info["geometry"]["hands"][0])
+        ui.capture.assert_awaited_once_with("left", 5.0, 42, 1280)
+
     def test_crop_resize_and_pixel_centres(self):
         target = resolve_target(capture(), 249.5, 199.5)
         self.assertEqual(target["raw_pixel"], [600, 450])
@@ -131,6 +155,20 @@ class TargetingTests(unittest.TestCase):
                        {"position": [0, 0, 0], "orientation": [0, 0, 0, 2]}):
             with self.assertRaisesRegex(ValueError, "ray_offset"):
                 resolve_target(capture(), 250, 200, ray_offset=offset)
+
+    def test_rotating_controller_emitter_targets_the_pixel(self):
+        offset = {"position": [.018, .043, -.1722], "orientation": [0, 0, 0, 1], "position_space": "aim"}
+        for hand in ("left", "right"):
+            for pixel in ((80, 70), (250, 200), (420, 310)):
+                c = capture()
+                result = resolve_target(c, *pixel, hand=hand, ray_offset=offset)
+                pose = result["aim_pose"]
+                translation = rotate(pose["orientation"], offset["position"])
+                origin = [a+b for a,b in zip(pose["position"], translation)]
+                direction = rotate(pose["orientation"], [0, 0, -1])
+                hit = intersect_surface(origin, direction, c["geometry"]["surfaces"][0])
+                for actual, expected in zip(hit, result["target_point"]):
+                    self.assertAlmostEqual(actual, expected, places=7)
 
 
 if __name__ == "__main__":

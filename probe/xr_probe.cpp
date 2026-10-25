@@ -247,8 +247,8 @@ int main() {
             { jump,     P("/user/hand/right/input/a/click") },
             { grab,     P("/user/hand/left/input/squeeze/value") },
             { rumble,   P("/user/hand/left/output/haptic") },
-            { menuSelect, P("/user/hand/right/input/a/click") },
-            { menuSelect, P("/user/hand/left/input/x/click") },
+            { menuSelect, P(uiTest && EnvOn("XR_PROBE_UI_SECONDARY") ? "/user/hand/right/input/b/click" : "/user/hand/right/input/a/click") },
+            { menuSelect, P(uiTest && EnvOn("XR_PROBE_UI_SECONDARY") ? "/user/hand/left/input/y/click" : "/user/hand/left/input/x/click") },
         };
         XrInteractionProfileSuggestedBinding sb = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
         sb.interactionProfile = P("/interaction_profiles/oculus/touch_controller");

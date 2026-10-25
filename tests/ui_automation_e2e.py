@@ -7,6 +7,7 @@ Each run has an isolated IPC/settings folder and keeps its screenshot evidence.
 import argparse
 import asyncio
 import base64
+import ctypes
 import json
 import math
 import os
@@ -95,6 +96,18 @@ def hit_pixel_error(info, target, state):
 async def run(args):
     directory = (args.evidence/uuid.uuid4().hex).resolve()
     directory.mkdir(parents=True)
+    status_handle = None
+    if args.lock_legacy_status:
+        # A Windows reader without FILE_SHARE_DELETE prevents replacing this file.
+        # Screenshot publication must not depend on updating a shared status path.
+        legacy = directory/"screenshot_status.json"
+        legacy.write_text("{}")
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p,
+                                ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        create_file.restype = ctypes.c_void_p
+        status_handle = create_file(str(legacy), 0x80000000, 3, None, 3, 0x80, None)
+        assert status_handle not in (None, ctypes.c_void_p(-1).value), "Could not lock legacy status file"
     # The unusual aspect, asymmetric FOV, and sub-image rect expose coordinate guessing.
     (directory/"settings.json").write_text(json.dumps({
         "headset_profile": "quest3", "layout": args.layout, "view_mode": "both", "asymmetric_fov": True,
@@ -103,6 +116,7 @@ async def run(args):
            "XR_PROBE_UI_TEST": "1", "XR_PROBE_UI_LEFT": "1" if args.hand == "left" else "0",
            "XR_PROBE_FRAMES": "12000", "XR_PROBE_SLEEP_MS": "3", "XR_PROBE_SUBRECT": "1", "XR_UI_BACKEND": args.backend,
            "XR_PROBE_UI_WORLD": "1" if args.ui_mode == "world" else "0", "SIMXR_AUTOMATION_ONLY": "1"}
+    env["XR_PROBE_UI_SECONDARY"] = "1" if args.activation_button == "secondary" else "0"
     if args.app_ray_offset:
         env["XR_PROBE_APP_RAY_OFFSET"] = "1"
     log = (directory/"probe.log").open("w")
@@ -150,15 +164,30 @@ async def run(args):
                 point = hovered["target"]["target_point"]
                 assert point is not None or args.ui_mode == "world" and args.origin_mode == "eye"
                 key = uuid.uuid4().hex
-                clicked, image = await call(session, "click_ui_at", {**target, "button": "primary", "hold_frames": 5, "command_id": key}, directory, "03-click")
+                clicked, image = await call(session, "click_ui_at", {**target, "button": args.activation_button, "hold_frames": 5, "command_id": key}, directory, "03-click")
                 state = await wait_fixture(directory, lambda s: s["clicks"] == 1 and s["release_edges"] == 1)
                 assert state["press_edges"] == 1 and state["sync_errors"] == 0 and not state["button_down"], state
                 patch = image[max(0, int(y)-2):int(y)+3, max(0, int(x)-2):int(x)+3].mean(axis=(0, 1))
                 assert patch[1] > 180 and patch[0] < 140 and patch[2] < 160, f"Activation result missing: {patch}"
-                await call(session, "click_ui_at", {**target, "button": "primary", "command_id": key}, directory, "04-retry")
+                await call(session, "click_ui_at", {**target, "button": args.activation_button, "command_id": key}, directory, "04-retry")
                 state = await wait_fixture(directory, lambda s: s["frame"] > state["frame"]+8)
                 assert state["clicks"] == state["press_edges"] == state["release_edges"] == 1, state
                 await call(session, "release_ui_pointer", {"capture_id": before["capture_id"], "hand": args.hand}, directory, "05-release")
+                if args.hold_tests:
+                    held = {**target, "button": args.activation_button, "command_id": uuid.uuid4().hex}
+                    await call(session, "hold_ui_at", held, directory, "hold-begin")
+                    state = await wait_fixture(directory, lambda s: s["button_down"])
+                    assert state["press_edges"] == 2 and state["release_edges"] == 1, state
+                    # Move the same held ray; a second command and its retry must
+                    # not synthesize another press or release between poses.
+                    held.update(x=x+1, command_id=uuid.uuid4().hex)
+                    await call(session, "hold_ui_at", held, directory, "hold-move")
+                    await call(session, "hold_ui_at", held, directory, "hold-retry")
+                    state = await wait_fixture(directory, lambda s: s["frame"] > state["frame"]+4)
+                    assert state["button_down"] and state["press_edges"] == 2 and state["release_edges"] == 1, state
+                    await call(session, "release_ui_pointer", {"capture_id": before["capture_id"], "hand": args.hand}, directory, "hold-end")
+                    state = await wait_fixture(directory, lambda s: s["release_edges"] == 2)
+                    assert not state["button_down"] and state["clicks"] == 2, state
                 if args.negative_tests:
                     await expect_error(session, "click_ui_at", {**target, "x": before["image_size"][0]+1}, "outside")
                     # This fixture binds activation to A/X, so trigger delivery cannot
@@ -178,14 +207,20 @@ async def run(args):
                             break
                         assert time.monotonic() < until, "Queued head movement was never applied"
                         await asyncio.sleep(.02)
-                    await expect_error(session, "click_ui_at", {**target, "button": "primary"}, "changed")
+                    await expect_error(session, "click_ui_at", {**target, "button": args.activation_button}, "changed")
                 (directory/"result.json").write_text(json.dumps({"passed": True, "pixel": [x, y], "eye": args.eye,
                     "hand": args.hand, "layout": args.layout, "backend": args.backend, "source_pixel_error": error,
                     "ui_mode": args.ui_mode, "origin_mode": target.get("origin_mode", "hand"),
                     "app_ray_offset": args.app_ray_offset,
+                    "locked_legacy_status": args.lock_legacy_status,
+                    "activation_button": args.activation_button,
                     "negative_tests": args.negative_tests, "state": state, "target": hovered["target"]}, indent=2))
                 print(f"PASS: screenshot -> hover -> one click -> visible result; {args.ui_mode}/{args.hand}/{args.eye}/{args.layout}\nEvidence: {directory}")
     finally:
+        if status_handle:
+            close_handle = ctypes.windll.kernel32.CloseHandle
+            close_handle.argtypes = [ctypes.c_void_p]
+            close_handle(status_handle)
         (directory/"ui_probe_stop").touch()
         try:
             code = await asyncio.to_thread(proc.wait, 5)
@@ -208,6 +243,9 @@ if __name__ == "__main__":
     parser.add_argument("--ui-mode", choices=["quad", "world"], default="quad")
     parser.add_argument("--origin-mode", choices=["hand", "eye"], default="eye")
     parser.add_argument("--app-ray-offset", action="store_true")
+    parser.add_argument("--lock-legacy-status", action="store_true")
+    parser.add_argument("--hold-tests", action="store_true")
+    parser.add_argument("--activation-button", choices=["primary", "secondary"], default="primary")
     args = parser.parse_args()
     args.probe = args.probe.resolve()
     asyncio.run(run(args))

@@ -68,6 +68,16 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME ui_resolution COMMAND ui_resolution_tests)
 
+    add_executable(ui_pointer_lifecycle_tests tests/ui_pointer_lifecycle_tests.cpp)
+    target_include_directories(ui_pointer_lifecycle_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(ui_pointer_lifecycle_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME ui_pointer_lifecycle COMMAND ui_pointer_lifecycle_tests)
+
+    add_executable(ui_surface_classification_tests tests/ui_surface_classification_tests.cpp)
+    target_include_directories(ui_surface_classification_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(ui_surface_classification_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME ui_surface_classification COMMAND ui_surface_classification_tests)
+
     option(SIMXR_ENABLE_UI_AUTOMATION_TESTS "Run real MCP screenshot/hover/click tests (requires Python dependencies)" OFF)
     if(SIMXR_ENABLE_UI_AUTOMATION_TESTS)
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -105,6 +115,17 @@ if(BUILD_TESTING)
             add_test(NAME ui_e2e_offset_${mode} COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ui_automation_e2e.py
                 --probe $<TARGET_FILE:xr_ui_probe> ${offset_args} --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
             set_tests_properties(ui_e2e_offset_${mode} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        endforeach()
+        add_test(NAME ui_e2e_capture_publication COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ui_automation_e2e.py
+            --probe $<TARGET_FILE:xr_ui_desktop> --backend d3d11 --lock-legacy-status --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
+        set_tests_properties(ui_e2e_capture_publication PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        add_test(NAME ui_e2e_hold COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ui_automation_e2e.py
+            --probe $<TARGET_FILE:xr_ui_probe> --hold-tests --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
+        set_tests_properties(ui_e2e_hold PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        foreach(hand left right)
+            add_test(NAME ui_e2e_secondary_${hand} COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ui_automation_e2e.py
+                --probe $<TARGET_FILE:xr_ui_probe> --hand ${hand} --activation-button secondary --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
+            set_tests_properties(ui_e2e_secondary_${hand} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
         endforeach()
     endif()
 endif()
