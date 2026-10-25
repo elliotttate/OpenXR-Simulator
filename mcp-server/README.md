@@ -447,7 +447,9 @@ python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory>
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --quick-action-copy-only
 # From a menu, dialog or results screen: check actual button size, visual alignment, contrast and ray hover.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --ray-buttons-only
-# From a single-button informational dialog: confirm once and verify dismissal.
+# From any open native message box: check content/action padding and illustrated content visibility.
+python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --popup-spacing-only
+# From a single-button informational dialog: check spacing, hover and confirm once, then verify dismissal.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --single-dialog-only
 # From the top of Statistics: check page arrows, scrolling endpoints, stable row hovers and categories.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --statistics-only
@@ -468,6 +470,15 @@ python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory>
 # From a game-setup screen: reject row, Start, or footer target overlaps.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --setup-layout-only
 ```
+
+The popup spacing check measures the visible bounded dialog, its title, image,
+caption and actual ray targets. It requires consistent inner padding, a separate
+80-pixel action row and breathing room between an illustration and its caption.
+An illustrated popup also checks the composed screenshot for image detail, so a
+misordered dialog plate cannot silently cover the picture. It leaves the popup
+open; `--single-dialog-only` additionally holds and retries a real controller
+click and requires exactly one dismissal. Native bounds alone do not prove
+readability or viewport visibility at every head pose.
 
 The spatial-label sweep requires the current Fox `menu.get_state.spatial_layout`
 and each item's `rendered_position`. It projects the actual text position through
