@@ -22,6 +22,15 @@ ROOT=Path(__file__).resolve().parents[1]
 
 
 class StopTest(RewardTest):
+    async def shop_target(self,label):
+        nodes=(await self.query("hud.rects",{"root":"menu","max_depth":14}))["nodes"]
+        labels=[n for n in nodes if n["visible"] and "WreckRunShopScreen" in n["path"] and n.get("text","").strip()==label]
+        assert len(labels)==1,(label,labels)
+        l,t,r,b=labels[0]["rect"];x,y=(l+r)/2,(t+b)/2
+        targets=[v for v in (await self.query("vr.targets"))["targets"] if v["name"].startswith("run.shop.") and v["rect"][0]<=x<=v["rect"][2] and v["rect"][1]<=y<=v["rect"][3]]
+        assert len(targets)==1,(label,labels,targets)
+        return targets[0]["name"]
+
     async def description_page(self):
         nodes=(await self.query("hud.rects",{"root":"menu","max_depth":14}))["nodes"]
         pages=[n["text"] for n in nodes if n["visible"] and n["path"].endswith("/DescriptionPage") and n.get("text")]
@@ -37,38 +46,58 @@ class StopTest(RewardTest):
         assert ("run.stop.footer.5" in names)==(total>1),(page,total,names)
         return page,total
 
+    async def reading_panel(self):
+        nodes=(await self.query("hud.rects",{"root":"menu","max_depth":14}))["nodes"]
+        descriptions=[n for n in nodes if n["visible"] and "WreckRunEncounterScreen" in n["path"] and n["path"].endswith("/Description")]
+        assert len(descriptions)==1,descriptions
+        rect=descriptions[0]["rect"];l,t,r,b=rect
+        assert r-l>=700 and b-t>=300,("Rules need a readable multiline panel, not a footer strip",rect)
+        assert l>=80 and t>=280 and r<=1040 and b<=960,("Rules panel must stay below status and beside the choices",rect)
+        self.cases.append({"case":"encounter-readable-details-panel","passed":True,"description":descriptions[0]})
+
     async def activity(self):
         initial=await self.query("rogue.state")
         assert initial["phase"]=="service",initial["phase"]
-        await self.layout("activity-footer",{1,3,5},"run.stop.footer.")
+        await self.reading_panel()
+        arrows=[v for v in (await self.query("vr.targets"))["targets"] if v["name"].startswith("run.encounter.picker.")]
+        assert len(arrows)==2 and all(v["rect"][2]-v["rect"][0]>=79.5 and v["rect"][3]-v["rect"][1]>=63.5 for v in arrows),("Picker buttons need comfortable ray targets",arrows)
+        self.cases.append({"case":"activity-large-picker-buttons","passed":True,"targets":arrows})
+        await self.layout("activity-footer",{1,3},"run.stop.footer.")
         await self.exterior("activity","WreckRunEncounterScreen")
         page,total=await self.info_visibility()
-        assert total>1,"Use an activity fixture with multi-page rules"
         original_page=page
-        for _ in range(total):
+        for _ in range(total if total>1 else 0):
             await self.click("run.stop.footer.5")
             page=page%total+1
             assert await self.description_page()==(page,total)
         assert page==original_page
-        self.cases.append({"case":"activity-rules-pages-and-wrap","passed":True,"pages":total})
+        self.cases.append({"case":"activity-rules-pages-and-wrap" if total>1 else "activity-rules-fit-without-paging","passed":True,"pages":total})
         original,index,count=await self.picker()
         assert count>1
-        if page==1:
+        if total>1 and page==1:
             await self.click("run.stop.footer.5")
-        assert (await self.description_page())[0]>1
+        if total>1:
+            assert (await self.description_page())[0]>1
         await self.click("run.encounter.picker.0.next")
         assert (await self.description_page())[0]==1,"New activity retained the previous activity's later rules page"
         await self.click("run.encounter.picker.0.previous")
         assert (await self.picker())[0]==original and (await self.description_page())[0]==1
         self.cases.append({"case":"new-activity-starts-at-first-rules-page","passed":True})
+        rules=[]
         for _ in range(count):
             await self.click("run.encounter.picker.0.next")
             text,actual,choices=await self.picker()
             index=index%count+1
             assert actual==index and choices==count,(text,index,count)
-            await self.info_visibility()
+            page,pages=await self.info_visibility()
+            nodes=(await self.query("hud.rects",{"root":"menu","max_depth":14}))["nodes"]
+            shown=[n["text"] for n in nodes if n["visible"] and "WreckRunEncounterScreen" in n["path"] and n["path"].endswith("/Description")]
+            assert len(shown)==1 and len(shown[0])>20 and not shown[0].endswith("..."),(text,shown)
+            rules.append({"trial":text,"rules":shown[0],"page":page,"pages":pages})
             await self.saved(initial,"activity-picker")
         assert (await self.picker())[0]==original
+        assert len({r["rules"] for r in rules})==count,"Different trials retained stale rules text"
+        self.cases.append({"case":"all-trial-rules-update-without-truncation","passed":True,"rules":rules})
         await self.click("run.encounter.picker.0.previous")
         assert (await self.picker())[1]==(index-2)%count+1
         await self.click("run.encounter.picker.0.next")
@@ -103,6 +132,13 @@ class StopTest(RewardTest):
         await self.build_view("shop-build")
         await self.layout("shop-returned",{1,2,3},"run.stop.footer.")
         await self.saved(initial,"shop-build-and-back")
+        trial=await self.shop_target("STUNT TRIAL")
+        await self.click(trial)
+        assert "run.activity.0" in {t["name"] for t in (await self.query("vr.targets"))["targets"]},"The labeled Stunt Trial button opened another action"
+        await self.saved(initial,"shop-to-activity")
+        await self.click("run.stop.footer.3")
+        assert any(t["name"].startswith("run.shop.") for t in (await self.query("vr.targets"))["targets"])
+        await self.saved(initial,"activity-to-shop")
         if self.args.leave:
             await self.leave_stop(initial)
 
@@ -189,14 +225,21 @@ async def run(args):
                     await test.tool("release_ui_pointer",{"capture_id":test.last_capture["capture_id"],"hand":hand},"baseline-"+hand)
                 await asyncio.sleep(.3)
                 errors=(await test.query("game.errors"))["total"]
+                result["initial_state"]=await test.query("rogue.state")
                 await (test.activity() if args.activity_only else test.shop() if args.shop_only else test.stop())
                 assert (await test.query("game.errors"))["total"]==errors
+                if test.last_capture:
+                    for hand in ("left","right"):
+                        await test.tool("release_ui_pointer",{"capture_id":test.last_capture["capture_id"],"hand":hand},"verify-release-"+hand)
+                if not args.leave:
+                    await test.saved(result["initial_state"],"pointer-release-cleanup")
                 result["passed"]=True
             except BaseException as e:
                 result["error"]=repr(e)
                 raise
             finally:
                 result["cases"]=test.cases
+                result["final_state"]=await test.query("rogue.state")
                 (args.evidence/"result.json").write_text(json.dumps(result,indent=2))
                 if test.last_capture:
                     for hand in ("left","right"):

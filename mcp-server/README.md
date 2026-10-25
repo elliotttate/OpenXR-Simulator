@@ -359,16 +359,22 @@ the oracle accounts for while still rejecting duplicate payouts/upgrades.
 parts. It checks the large arrow buttons, one-step/reverse/wrap behavior, and
 unchanged saved inventory. Picker targets intentionally sit inside their card;
 they must precede the containing card and a picker click must never accept it.
-`--shop-only` instead checks shop hover, View Build and Back without buying.
-`--activity-only` starts on a Stunt Trial picker with multi-page rules. It checks
-More Info page advancement and wrap, all trial choices, arrow priority over the
-Start card, and Back without starting or consuming the visit. The information
-action must disappear when a focused description fits on one page.
+`--shop-only` checks shop hover, View Build and Back, plus a round trip to
+Stunt Trial without buying or starting an activity. It finds that button through
+its visible label and current target rectangle: shop target ordinals change as
+installed parts change.
+`--activity-only` starts on a Stunt Trial picker. It checks the bounded multiline
+details panel, comfortable ray targets for its arrows, every trial's rules,
+arrow priority over the Start card, and Back without consuming the visit.
+Rules that fit should be readable together; longer rules expose More Info for
+page advancement and wrap. The information action disappears on a single page.
 Changing a trial must return its rules to page one. The screen-kit fixture also
 checks that refreshing the same description keeps the current reading position.
 `--leave` then checks one actual Drive On action without purchasing or swapping.
 Both tests accept the same `--pid`, `--data-dir`, fresh `--evidence`, and `--hand`
-arguments. Debug fixture setup stays separate from these input-only regressions.
+arguments. Navigation checks sample ready saved state repeatedly and verify it
+again after releasing both pointers; evidence retains complete initial and final
+state snapshots. Debug fixture setup stays separate from these input-only regressions.
 `hud.rects.text` exposes visible label values without ambiguous ancestor lookup.
 
 The test captures screenshots, hovers and clicks through actual XR actions, and

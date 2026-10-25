@@ -91,6 +91,57 @@ class Frontend:
         self.last_capture = await self.tool("capture_screenshot", {"eye": "left", "max_width": 1280}, label)
         return self.last_capture
 
+    async def popup_spacing(self):
+        modal=await self.query("ui.get_message_box")
+        assert modal["open"],"Open a message box first"
+        layer=max(modal["layers"])
+        prefix="MESSAGEBOX_ROOT/Messagebox Layer "+str(layer)+"/MESSAGEBOX_CONTENTS/"
+        nodes=(await self.query("hud.rects",{"root":"msgbox","max_depth":14}))["nodes"]
+        visible=[n for n in nodes if n["visible"] and n["path"].startswith(prefix)]
+        names={"Center","Left","Right","Top","Bottom","TopLeft","TopRight","BottomLeft","BottomRight","RayDialogFrame"}
+        panels=[n for n in visible if n["kind"]=="panel" and n["path"].removeprefix(prefix) in names and n["color"]["a"]>0]
+        assert panels,"Dialog body is missing"
+        body=[min(n["rect"][0]for n in panels),min(n["rect"][1]for n in panels),max(n["rect"][2]for n in panels),max(n["rect"][3]for n in panels)]
+        assert 0<=body[0]<body[2]<=1920 and 0<=body[1]<body[3]<=1080,("Dialog must fit the visible panel",body)
+        content=[n for n in visible if n["path"].removeprefix(prefix) in ("Title","Content","ContentImage") and (n["kind"]!="text" or n.get("text"))]
+        assert content
+        buttons=[t for t in (await self.query("vr.targets"))["targets"] if t["name"].startswith("msgbox.")]
+        assert buttons
+        assert all(t["rect"][0]-body[0]>=31 and body[2]-t["rect"][2]>=31 for t in buttons),("Actions need horizontal inner padding",body,buttons)
+        capture=await self.capture("popup-spacing")
+        pixels=np.asarray(Image.open(self.last_image_path).convert("RGB")).astype(float)
+        image_checks=[]
+        native=await self.query("vr.targets")
+        for image in (n for n in content if n["path"].endswith("/ContentImage")):
+            l,t,r,b=image["rect"]
+            if capture["geometry"]["surfaces"]:
+                points=[quad_pixel(capture,(x,y,x,y))for x,y in ((l,t),(r,b))]
+            else:
+                state={"vr":{"frame":native["vr_frame"]}}
+                points=[screenshot_pixel(state,capture,x,y)for x,y in ((l,t),(r,b))]
+            x0,y0=np.floor(np.min(points,axis=0)).astype(int)+4
+            x1,y1=np.ceil(np.max(points,axis=0)).astype(int)-4
+            assert 0<=x0<x1<=pixels.shape[1] and 0<=y0<y1<=pixels.shape[0],("Popup illustration must stay visible",points)
+            patch=pixels[y0:y1,x0:x1]
+            deviation=float(np.mean(np.std(patch,axis=(0,1))))
+            image_checks.append({"path":image["path"],"image_rect":[int(x0),int(y0),int(x1),int(y1)],"rgb_deviation":deviation})
+            assert deviation>8,("Dialog plate covered its illustration",image_checks)
+        for n in content:
+            l,t,r,b=n["rect"]
+            assert min(l-body[0],body[2]-r,t-body[1])>=31,("Dialog content needs consistent inner padding",body,n)
+        footer_top=min(t["rect"][1]for t in buttons)
+        assert footer_top-max(n["rect"][3]for n in content)>=31,("Actions need a separate row below the content",body,content,buttons)
+        assert min(body[3]-t["rect"][3]for t in buttons)>=31,("Actions must not touch the dialog edge",body,buttons)
+        assert all(t["rect"][2]-t["rect"][0]>=199.5 and t["rect"][3]-t["rect"][1]>=79.5 for t in buttons),buttons
+        for n in content:
+            if not n["path"].endswith("/ContentImage"):continue
+            for text in content:
+                if not text["path"].endswith("/Content"):continue
+                l,t,r,b=text["rect"];il,it,ir,ib=n["rect"]
+                if min(r,ir)>max(l,il) and t>=it:
+                    assert t-ib>=23,("Image and caption need breathing room",n,text)
+        self.cases.append({"case":"popup-content-padding-and-action-row","passed":True,"body":body,"content":content,"buttons":buttons,"illustrations":image_checks})
+
     async def menu_button(self):
         capture = await self.capture("menu-button-source")
         result = await self.tool("click_ui_at", {"capture_id": capture["capture_id"],
@@ -1659,7 +1710,11 @@ class Frontend:
             return await self.party()
         if self.args.statistics_only:
             return await self.statistics()
+        if self.args.popup_spacing_only:
+            await self.popup_spacing()
+            return
         if self.args.single_dialog_only:
+            await self.popup_spacing()
             assert (await self.query("ui.get_message_box"))["open"], "Open a single-button informational dialog first"
             names = [t["name"] for t in (await self.query("vr.targets"))["targets"]]
             assert names == ["msgbox.validate"], names
@@ -1730,7 +1785,8 @@ async def run(args):
     args.evidence.mkdir(parents=True, exist_ok=False)
     params = StdioServerParameters(command=sys.executable, args=[str(ROOT/"mcp-server/openxr_simulator_mcp.py")],
         env={**os.environ, "SIMXR_DATA_DIR": str(args.data_dir.resolve())})
-    scope = ("Quick Start explicit next-step caption" if args.quick_action_copy_only else
+    scope = ("Popup content and action spacing" if args.popup_spacing_only else
+             "Quick Start explicit next-step caption" if args.quick_action_copy_only else
              "Coming Soon lock diagnostics and inert ray click" if args.spatial_locked_only else
              "Spatial Back visibility, edge misses, both hands and one activation" if args.spatial_back_only else
              "Career unavailable-class warnings, filtered cars and Back" if args.career_wrong_class_only else
@@ -1827,6 +1883,7 @@ if __name__ == "__main__":
     parser.add_argument("--end-results-only", action="store_true", help="From race results: verify no yellow footer, readable actions, and exactly one Continue page with a held trigger")
     parser.add_argument("--party-only", action="store_true", help="From Party Mode's player selector: hover every count and choose eight players exactly once")
     parser.add_argument("--statistics-only", action="store_true", help="From the top of Statistics: scroll both ends with page buttons, check spacing and category navigation")
+    parser.add_argument("--popup-spacing-only", action="store_true", help="From an open popup: verify content padding, caption spacing and the separate ray-button action row")
     parser.add_argument("--single-dialog-only", action="store_true", help="From a single-button informational popup: hover and confirm exactly once, then verify dismissal")
     parser.add_argument("--menu-hover-only", action="store_true", help="Hover every target in the current menu; combine with --audit-only for flat menu spacing")
     parser.add_argument("--footer-contrast-only", action="store_true", help="From Options: check idle action wording independently of its bright icons")
