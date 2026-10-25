@@ -297,12 +297,34 @@ class LiveryTest:
             await self.tool("hover_ui_at", {"capture_id": capture["capture_id"], "x": float(x), "y": float(y),
                 "hand": hand, "origin_mode": "hand", "surface": ui_surface(before)}, "stereo-hover-"+hand)
         state = await self.state()
-        capture = await self.tool("capture_screenshot", {"eye": "both", "max_width": 2048}, "stereo-both-rays")
+        capture = await self.tool("capture_screenshot", {"eye": "both", "max_width": 4096}, "stereo-both-rays")
         self.last_capture = capture
+        ribbons = capture["geometry"]["decorations"]
+        assert len(ribbons) == 2, "Livery rays must use two actual compositor quads"
+        assert not capture["geometry"]["surfaces"], "The livery UI remains a world-space surface"
+        camera = state["vr"]["frame"]["camera"]
+        inverse_camera = np.column_stack([camera[k] for k in ("right", "up", "back")]).T
+        matched_ribbons = []
         observations = []
         for hand, ray in enumerate(state["vr"]["hands"]):
             assert ray["valid"] and ray["ui_hit"] and not ray["grabbed"]
             origin, end = np.array(ray["origin"]), np.array(ray["end"])
+            direction = (end-origin) / np.linalg.norm(end-origin)
+            local_start = inverse_camera @ (origin+direction*.05-camera["origin"])
+            local_end = inverse_camera @ (end-camera["origin"])
+            errors = []
+            for ribbon in ribbons:
+                basis = quaternion_matrix(ribbon["pose"]["orientation"])
+                center = np.array(ribbon["pose"]["position"])
+                extent = basis[:, 1] * ribbon["size"][1] * .5
+                errors.append(float(np.linalg.norm(center-extent-local_start)+np.linalg.norm(center+extent-local_end)))
+                assert abs(np.linalg.det(basis)-1) < 1e-4
+                assert ribbon["visibility"] == 0 and abs(ribbon["size"][0]-.002) < 1e-6
+            index = int(np.argmin(errors))
+            assert errors[index] < .002, ("Livery compositor ray must match its native hand-to-hit segment", hand, errors)
+            matched_ribbons.append(ribbons[index]["id"])
+            self.cases.append({"case": "livery-metric-compositor-ray-"+str(hand), "passed": True,
+                               "endpoint_error_m": errors[index], "ribbon": ribbons[index]})
             for eye in ("left", "right"):
                 a = world_pixel(state, capture, origin+(end-origin)*.15, eye)
                 b = world_pixel(state, capture, origin+(end-origin)*.7, eye)
@@ -316,6 +338,7 @@ class LiveryTest:
                     visible += int(np.any(color))
                 observations.append({"hand": hand, "eye": eye, "visible_samples": visible})
                 assert visible >= 2, ("Controller ray missing from eye image", observations[-1])
+        assert len(set(matched_ribbons)) == 2, "Each controller needs its own ribbon quad"
         self.cases.append({"case": "both-controller-rays-in-both-eyes", "passed": True, "observations": observations})
         print("Both controller rays visible in both eye images PASS", flush=True)
 
