@@ -91,6 +91,125 @@ class Frontend:
         self.last_capture = await self.tool("capture_screenshot", {"eye": "left", "max_width": 1280}, label)
         return self.last_capture
 
+    async def credits_layout(self):
+        assert (await self.query("menu.get_state"))["current_menu"]=="CREDITS"
+        nodes=(await self.query("hud.rects",{"root":"menu","max_depth":14}))["nodes"]
+        full=[n for n in nodes if n["visible"] and n["kind"]=="panel" and n["color"]["a"]>.2 and n["rect"][2]-n["rect"][0]>=1900 and n["rect"][3]-n["rect"][1]>=1070]
+        await self.capture("credits-reader-layout")
+        assert not full,("Credits must keep the live scene visible outside its reading panel",full)
+        panel=next(n for n in nodes if n["path"].endswith("/CreditsReadingPanel") and n["visible"])
+        viewport=next(n for n in nodes if n["path"].endswith("/CreditsViewport") and n["visible"])
+        l,t,r,b=panel["rect"];vl,vt,vr,vb=viewport["rect"]
+        assert 0<l<vl<vr<r<1920 and 0<t<vt<vb<b<1080,(panel,viewport)
+        actions=(await self.query("vr.targets"))["targets"]
+        assert {a["name"] for a in actions}=={"helper.Y.0","helper.LB.1","helper.RB.2","helper.Cancel.3"}
+        assert all(a["rect"][0]>=vl and a["rect"][2]<=vr and a["rect"][1]-b>=24 and a["rect"][3]<=1056 for a in actions),(panel,actions)
+        assert all(a["rect"][2]-a["rect"][0]>=240 and a["rect"][3]-a["rect"][1]>=80 for a in actions),actions
+        widths=[a["rect"][2]-a["rect"][0]for a in actions];assert max(widths)-min(widths)<1,"Credits transport controls need consistent widths"
+        source=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},"credits-reader-both-eyes")
+        assert source["geometry"]["surfaces"],"Credits must use the stable reading surface"
+        w,h=source["image_size"]
+        for eye,index in [("left",0),("right",1)]:
+            for rect in [panel["rect"],*[a["rect"]for a in actions]]:
+                points=[quad_pixel(source,(x,y,x,y),eye)for x,y in [(rect[0],rect[1]),(rect[2],rect[3])]]
+                assert all(index*w/2<=x<(index+1)*w/2 and 0<=y<h for x,y in points),(eye,rect,points)
+        await self.audit("credits-control-spacing")
+        self.cases.append({"case":"credits-bounded-reader-and-separate-controls","passed":True,"panel":panel,"viewport":viewport,"actions":actions})
+
+    async def credits(self):
+        await self.credits_layout()
+        state=(await self.query("menu.get_state"))["credits"]
+        if state["paused"]:await self.click("helper.Y.0")
+        await self.click("helper.Y.0")
+        assert (await self.query("menu.get_state"))["credits"]["paused"],"Pause did not stop playback"
+        labels=(await self.query("hud.rects",{"root":"menu","max_depth":14}))["nodes"]
+        assert any(n.get("text")=="Resume" and n["visible"] and n["path"].endswith("/RayActionLabel")for n in labels),"The paused control must say Resume"
+        async def settle_paused():
+            until=asyncio.get_running_loop().time()+4
+            while True:
+                s=(await self.query("menu.get_state"))["credits"]
+                if abs(s["speed"])<1:return s
+                assert asyncio.get_running_loop().time()<until,("Scrub kept running after releasing the trigger",s)
+                await asyncio.sleep(.1)
+        stopped=await settle_paused();await asyncio.sleep(.3)
+        assert abs((await self.query("menu.get_state"))["credits"]["position"]-stopped["position"])<2,"Paused credits continued moving"
+        for target,direction in [("helper.RB.2",-1),("helper.LB.1",1)]:
+            before=(await self.query("menu.get_state"))["credits"]
+            await self.click(target)
+            after=(await self.query("menu.get_state"))["credits"]
+            assert after["paused"],"Scrubbing changed pause state"
+            assert direction*(after["position"]-before["position"])>50,("Held ray scrub moved in the wrong direction",target,before,after)
+            await settle_paused()
+        await self.click("helper.Y.0")
+        assert not (await self.query("menu.get_state"))["credits"]["paused"],"Resume did not restart playback"
+        await self.click("helper.Cancel.3")
+        assert (await self.query("menu.get_state"))["current_menu"]=="EXTRAS", "Back did not return to Extras"
+        self.cases.append({"case":"credits-pause-resume-and-held-scrub","passed":True,"hand":self.args.hand})
+
+    async def credits_stop(self):
+        assert (await self.query("menu.get_state"))["current_menu"]=="CREDITS"
+        if (await self.query("menu.get_state"))["credits"]["paused"]:await self.click("helper.Y.0")
+        await asyncio.sleep(.4)
+        _,args=await self.point_args("helper.Y.0")
+        assert (await self.tool("hover_ui_at",args,"credits-stop-hover"))["status"]=="input_delivered"
+        args.update(command_id=uuid.uuid4().hex,hold_frames=45,timeout=30)
+        pending=asyncio.create_task(self.tool("click_ui_at",args,"credits-stop-click"));samples=[]
+        try:
+            while not pending.done():
+                samples.append((await self.query("menu.get_state"))["credits"])
+                await asyncio.sleep(.015)
+        finally:assert (await pending)["status"]=="input_delivered"
+        paused=[s for s in samples if s["paused"]]
+        assert paused,"The test did not observe the pause transition"
+        self.cases.append({"case":"credits-pause-stops-immediately","passed":max(abs(s["speed"])for s in paused)<1,"samples":samples})
+        assert max(abs(s["speed"])for s in paused)<1,("Pause must freeze the reading position immediately",paused)
+        assert abs(paused[-1]["position"]-paused[0]["position"])<2,"Paused text coasted"
+
+    async def credits_finish(self):
+        await self.credits_layout()
+        state=(await self.query("menu.get_state"))["credits"]
+        if state["paused"]:await self.click("helper.Y.0")
+        nodes=(await self.query("hud.rects",{"root":"menu","max_depth":5}))["nodes"]
+        text=next(n for n in nodes if n["path"].endswith("/CreditsText"))
+        viewport=next(n for n in nodes if n["path"].endswith("/CreditsViewport"))
+        finish_at=-(text["rect"][3]-text["rect"][1]+viewport["rect"][3]-viewport["rect"][1])
+        before,args=await self.point_args("helper.RB.2")
+        held=await self.tool("hold_ui_at",args,"credits-full-roll-hold")
+        assert held["status"]=="input_delivered",held
+        started=asyncio.get_running_loop().time();refresh=started;trace=[];fades=[]
+        try:
+            while True:
+                current=await self.query("menu.get_state")
+                elapsed=asyncio.get_running_loop().time()-started
+                if current["current_menu"]!="CREDITS":
+                    assert current["current_menu"]=="EXTRAS",current
+                    break
+                assert elapsed<100,"Holding Forward never completed the credit roll"
+                state=current["credits"]
+                panel=await self.query("hud.get_node",{"root":"menu","name":"CreditsReadingPanel"})
+                if panel["color"]["a"]<.99:fades.append({"seconds":elapsed,"alpha":panel["color"]["a"]})
+                remaining=max(0.,(state["position"]-finish_at)/750.)
+                if asyncio.get_running_loop().time()-refresh>=4 and remaining>2.:
+                    trace.append({"seconds":elapsed,**state})
+                    _,args=await self.point_args("helper.RB.2")
+                    receipt=await self.tool("hold_ui_at",args,"credits-full-roll-refresh")
+                    if receipt["status"]!="input_delivered":
+                        assert (await self.query("menu.get_state"))["current_menu"]=="EXTRAS",receipt
+                        break
+                    refresh=asyncio.get_running_loop().time()
+                    print("Credits roll",round(elapsed,1),"s",round(state["position"]),flush=True)
+                await asyncio.sleep(.035 if state["position"]< -30000 else .15)
+        finally:
+            source=await self.capture("credits-finish-release-source")
+            await self.tool("release_ui_pointer",{"capture_id":source["capture_id"],"hand":self.args.hand},"credits-finish-release")
+        after=await self.query("vr.targets")
+        assert after["clicks"]==before["clicks"]+1,("Refreshing a held Forward generated another click",before,after)
+        assert not after["targets"],"Credits transport controls survived on the spatial Extras menu"
+        nodes=(await self.query("hud.rects",{"root":"menu","max_depth":4,"all":True}))["nodes"]
+        assert not any(n["visible"] and n["path"].endswith("/CreditsReadingPanel") for n in nodes),"The reader survived its automatic close"
+        assert any(0<f["alpha"]<.99 for f in fades),"The ending skipped its bounded fade"
+        self.cases.append({"case":"credits-full-roll-held-forward-and-ending-fade","passed":True,"hand":self.args.hand,"seconds":elapsed,"trace":trace,"fade":fades})
+
     async def popup_motion(self):
         """Observe a native popup entrance during an actual spatial-menu ray click."""
         assert not (await self.query("ui.get_message_box"))["open"]
@@ -1821,6 +1940,14 @@ class Frontend:
             return await self.party()
         if self.args.statistics_only:
             return await self.statistics()
+        if self.args.credits_stop_only:
+            return await self.credits_stop()
+        if self.args.credits_finish_only:
+            return await self.credits_finish()
+        if self.args.credits_only:
+            return await self.credits()
+        if self.args.credits_layout_only:
+            return await self.credits_layout()
         if self.args.popup_motion_only:
             return await self.popup_motion()
         if self.args.popup_no_prompts_only:
@@ -1902,7 +2029,10 @@ async def run(args):
     args.evidence.mkdir(parents=True, exist_ok=False)
     params = StdioServerParameters(command=sys.executable, args=[str(ROOT/"mcp-server/openxr_simulator_mcp.py")],
         env={**os.environ, "SIMXR_DATA_DIR": str(args.data_dir.resolve())})
-    scope = ("Native popup entrance fade and interruption-free ray input" if args.popup_motion_only else
+    scope = ("Credits Pause freezes the reading position immediately" if args.credits_stop_only else
+             "Complete Credits playback, continuous ray hold and automatic ending fade" if args.credits_finish_only else
+             "Credits readable viewport, transport controls and live scene" if args.credits_only or args.credits_layout_only else
+             "Native popup entrance fade and interruption-free ray input" if args.popup_motion_only else
              "Modal suppresses legacy soundtrack prompts without hiding its menu" if args.popup_no_prompts_only else
              "Standing popup placement, stable world anchor and ray hover" if args.popup_anchor_only else
              "Popup content and action spacing" if args.popup_spacing_only else
@@ -2003,6 +2133,10 @@ if __name__ == "__main__":
     parser.add_argument("--end-results-only", action="store_true", help="From race results: verify no yellow footer, readable actions, and exactly one Continue page with a held trigger")
     parser.add_argument("--party-only", action="store_true", help="From Party Mode's player selector: hover every count and choose eight players exactly once")
     parser.add_argument("--statistics-only", action="store_true", help="From the top of Statistics: scroll both ends with page buttons, check spacing and category navigation")
+    parser.add_argument("--credits-stop-only", action="store_true", help="From Credits: observe the real ray Pause transition and reject coasting after it")
+    parser.add_argument("--credits-finish-only", action="store_true", help="From Credits: continuously hold Forward through the complete roll, check the ending fade and automatic return to Extras")
+    parser.add_argument("--credits-only", action="store_true", help="From Credits: check the clipped reading panel, pause/resume, held forward/rewind and one Back click")
+    parser.add_argument("--credits-layout-only", action="store_true", help="From Credits: check its bounded panel, separate transport dock and both-eye standing visibility")
     parser.add_argument("--popup-motion-only", action="store_true", help="From the spatial main menu: ray-hover Quit, click it once, observe the native entrance fade, then ray-cancel once")
     parser.add_argument("--popup-no-prompts-only", action="store_true", help="From a cancelable modal: verify soundtrack prompts are hidden, ray Cancel fires once and the same menu returns")
     parser.add_argument("--popup-anchor-only", action="store_true", help="From an open popup at the default standing head pose: check visibility in both eyes, stable placement during head motion and actual ray hover")
