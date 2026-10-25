@@ -1,9 +1,28 @@
 # Real stereo depth for hovered VR buttons
 
-This is an isolated OpenXR experiment and integration proposal. It does not change
-Fox, the simulator runtime, an OpenXR registry selection, or any game save. It
-demonstrates a button physically moving toward the camera, rather than growing or
-casting a shadow at the menu's original distance.
+This directory contains an isolated OpenXR experiment and tests for the first
+native Fox integration. The standalone probe does not change game files or saves.
+Both paths demonstrate a button physically moving toward the camera while
+preserving its physical width and height.
+
+The native slice currently covers shared dialog actions on the HUD composition
+path. It uses the GPU HUD renderer and a separate 1024 x 128 atlas, with at most
+two transient BOTH-eye button layers. Enable the experiment before initialization
+with `Engine.Renderer.VR.ExperimentalHudButtonDepth = true`; it remains off by
+default while integration coverage is completed.
+
+Native tests on RC `00c4999b0` plus the UI changes verify a 30 mm normal lift,
+about 28.1 mm approach toward the camera, unchanged button size, both hands,
+rapid focus changes and return, raised-face top-edge clicks whose rays miss the
+base rectangle, one held-trigger activation, same-ID retry and immediate layer
+cleanup. These are native game checks, separate from the standalone probe.
+
+RenderDoc confirms that the source label disappears from the base HUD while the
+GPU atlas contains the isolated button: the captured source region changes from
+563 bright label pixels to zero, and the atlas contains 370 bright label pixels
+inside the 200 x 80 tile. The guard remains RGBA zero. Both final composed eyes
+have matching button-plate color. This validates rendering as well as submitted
+layer metadata; it does not constitute a headset performance measurement.
 
 ## Result
 
@@ -184,14 +203,14 @@ Adding projection depth metadata alone does not solve per-button extraction or
 quad/scene occlusion. The existing world-space mesh path handles scene occlusion
 more naturally, but must retain the after-post-process crisp-text path.
 
-This is **not yet integrated into Fox**, and there is no physical-headset comfort,
-real-controller jitter, GPU performance, runtime compatibility or RenderDoc
-validation of the proposed Fox renderer. The automated proof is the standalone
-probe using actual OpenXR layer submission, simulator composition, native action
-state and screenshot pixels. The screenshot precision is reported, not presented
-as a submillimeter display measurement. Full production work still needs menu
-teardown, modal, disabled/loading, localized-label, slider-drag, dual-ray handoff,
-world-space path and renderer capture tests before enabling the effect globally.
+The first native integration is experimental; it does not yet promote all menu
+controls or the world-space RTT path. Physical-headset comfort, real-controller
+jitter, GPU performance and runtime compatibility remain unmeasured. The
+screenshot precision is reported, not presented as a submillimeter display
+measurement. Before global enablement, cover dialog replacement, recenter/resize,
+disabled/loading actions, localized labels, slider ownership and the remaining
+menu transports. A production reduced-motion option is still needed: disabling
+the experiment currently restores the legacy flat hover treatment.
 
 ## Primary research
 
@@ -223,3 +242,22 @@ hand, `--reduced-motion` for the intentional flat alternative, or `--flat-contro
 without `--reduced-motion` to reproduce the failing stereo gate. The probe sizes
 only its own preview window offscreen for deterministic pixel precision, never
 takes focus, and exits through normal OpenXR teardown via a private stop marker.
+
+To compile the actual production motion helper rather than only the prototype:
+
+```powershell
+cmake -S experiments/vr_hover_depth -B build-ui-automation/hover-depth-build -DFOX_SOURCE_DIR="$FoxSource"
+cmake --build build-ui-automation/hover-depth-build --config Debug --target vr_hover_depth_production_model_test
+ctest --test-dir build-ui-automation/hover-depth-build -C Debug -R hover_depth_production_model --output-on-failure
+```
+
+With the rebuilt native game running and a cancelable dialog already open:
+
+```powershell
+& ./mcp-server/.venv/Scripts/python.exe tests/flatout_hover_depth_e2e.py `
+  --pid $GamePid --data-dir $SimulatorData --evidence $FreshEvidenceDirectory `
+  --hand right --motion-lifecycle --raised-edge-top
+```
+
+Repeat with `--hand left` and a fresh dialog/evidence directory. Diagnostics are
+read-only; hover and click are delivered through actual XR action input.

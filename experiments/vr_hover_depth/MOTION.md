@@ -7,7 +7,8 @@ Keep the current typography, amber accents and bounded reading plates.
 ## Start with the shared dialog and action buttons
 
 The focal interaction is the button physically approaching the player when
-pointed at. The tested prototype supplies that real stereo movement. Supporting
+pointed at. The prototype and first native HUD-dialog integration supply that
+real stereo movement. Supporting
 dialog fades should establish and release modal attention at a fixed world pose.
 Avoid full-screen fades for ordinary menu changes, staggered settings rows,
 spring effects and simultaneous button scaling.
@@ -85,6 +86,23 @@ Reduced motion should disable depth travel and pulses while retaining clear
 hover/pressed color feedback and a brief opacity change. Fox's existing
 Wreck Run preference has mode-specific semantics; broader VR motion control
 needs an explicitly scoped setting rather than silently reusing it.
+
+The first native dialog slice is behind `ExperimentalHudButtonDepth`. Its GPU
+atlas renderer is created after graphics initialization and released before
+graphics teardown. Native screenshot and ray tests cover both hands, a separate
+BOTH-eye layer 30 mm forward, fixed source geometry, rapid focus changes and
+return, and a raised-face edge that the base rectangle cannot receive. Dismissal
+and same-ID retry produce one click and retire the tile immediately. The actual
+production-header fixture covers the 6 mm press destination and timing; closing
+dialogs deliberately do not wait at that destination before dispatching.
+
+Quick Start, Party's player selector and stunt picker, and Statistics now use
+the same head-height reading surface as Options. Native tests verify fixed world
+placement during head motion and visible controls in both eyes with either hand.
+Quick Start's complete mode/stepper/next-step sweep and Party's complete stunt
+playlist sweep pass after that transport change. Statistics paging now lives in
+the header, with 80 x 72 targets clear of the action dock; the previous Down
+target overlapped Back by 64 x 11 pixels.
 
 Reuse the GPU HUD renderer and bounded atlas tiles. Pose and alpha changes do
 not justify per-frame texture readback, additional blur passes, or one OpenXR

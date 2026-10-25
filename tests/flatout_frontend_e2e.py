@@ -1075,6 +1075,24 @@ class Frontend:
         self.cases.append({"case":"eight-player-choice-committed-once","passed":True,"state":state})
         await self.capture("party-stunt-menu-open")
 
+    async def statistics_header(self):
+        native=await self.query("vr.targets")
+        assert (await self.query("statistics.get_state"))["open"],"Start in Statistics"
+        capture=await self.tool("capture_screenshot",{"eye":"left","max_width":2048},"statistics-page-count")
+        rect=(1300,68,1580,140)
+        frame={"vr":{"frame":native.get("vr_frame")}}
+        corners=[quad_pixel(capture,(x,y,x,y)) if capture["geometry"]["surfaces"] else screenshot_pixel(frame,capture,x,y)
+                 for x,y in ((rect[0],rect[1]),(rect[2],rect[3]))]
+        (x0,y0),(x1,y1)=corners
+        pixels=np.asarray(Image.open(self.last_image_path).convert("RGB")).astype(float)
+        patch=pixels[math.floor(min(y0,y1)):math.ceil(max(y0,y1)),math.floor(min(x0,x1)):math.ceil(max(x0,x1))]
+        bright=(np.min(patch,axis=2)>180)&(np.max(patch,axis=2)-np.min(patch,axis=2)<35)
+        dark=np.max(patch,axis=2)<100
+        count=int(np.sum(bright));backing=float(np.mean(dark))
+        self.cases.append({"case":"statistics-page-count-readable-on-bounded-backing","passed":count>=20 and backing>=.6,
+                           "bright_letter_pixels":count,"dark_backing_fraction":backing})
+        assert count>=20 and backing>=.6,("Statistics page count needs clear white lettering and a stable dark backing",count,backing)
+
     async def statistics(self):
         targets = (await self.query("vr.targets"))["targets"]
         has_page_down = any(t["name"] == "stats.scroll.down" for t in targets)
@@ -1948,6 +1966,8 @@ class Frontend:
         print("Cyan left and amber right beams visible in both eyes PASS",flush=True)
 
     async def run(self):
+        if self.args.statistics_header_only:
+            return await self.statistics_header()
         if self.args.reading_comfort_only:
             menu=await self.query("menu.get_state")
             assert menu["is_open"] and not menu["is_3d"],"Start in a flat reading menu"
@@ -2099,7 +2119,8 @@ async def run(args):
     args.evidence.mkdir(parents=True, exist_ok=False)
     params = StdioServerParameters(command=sys.executable, args=[str(ROOT/"mcp-server/openxr_simulator_mcp.py")],
         env={**os.environ, "SIMXR_DATA_DIR": str(args.data_dir.resolve())})
-    scope = ("Reading-menu head-height placement and world-locked both-eye visibility" if args.reading_comfort_only else
+    scope = ("Statistics page-count legibility" if args.statistics_header_only else
+             "Reading-menu head-height placement and world-locked both-eye visibility" if args.reading_comfort_only else
              "Quick Start head-height placement and world-locked both-eye visibility" if args.quick_comfort_only else
              "Options head-height placement and world-locked both-eye visibility" if args.options_comfort_only else
              "Credits Pause freezes the reading position immediately" if args.credits_stop_only else
@@ -2206,6 +2227,7 @@ if __name__ == "__main__":
     parser.add_argument("--end-results-only", action="store_true", help="From race results: verify no yellow footer, readable actions, and exactly one Continue page with a held trigger")
     parser.add_argument("--party-only", action="store_true", help="From Party Mode's player selector: hover every count and choose eight players exactly once")
     parser.add_argument("--statistics-only", action="store_true", help="From the top of Statistics: scroll both ends with page buttons, check spacing and category navigation")
+    parser.add_argument("--statistics-header-only", action="store_true", help="From Statistics: require a readable page count with bright lettering on a stable dark backing")
     parser.add_argument("--credits-stop-only", action="store_true", help="From Credits: observe the real ray Pause transition and reject coasting after it")
     parser.add_argument("--credits-finish-only", action="store_true", help="From Credits: continuously hold Forward through the complete roll, check the ending fade and automatic return to Extras")
     parser.add_argument("--credits-only", action="store_true", help="From Credits: check the clipped reading panel, pause/resume, held forward/rewind and one Back click")
