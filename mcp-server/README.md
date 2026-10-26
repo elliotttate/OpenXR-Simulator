@@ -674,3 +674,18 @@ restores the original Audio values.
 ### MCP connection issues
 - Ensure the MCP SDK is installed: `pip install mcp`
 - Check the Python version is 3.10 or higher
+
+### Multiplayer UI layout checks
+
+Start in the game's Browse Games screen using the isolated simulator profile:
+
+```powershell
+python tests/flatout_multiplayer_ui_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --surface browser
+```
+
+The test checks neutral-gaze reading position, both-eye visibility after head
+movement, shared action-dock spacing and actual ray hovers. It opens room-code
+entry, verifies its title/Close spacing, types and deletes a local code through
+held/retried ray clicks, rejects disabled keys and background clicks, and closes
+back to the browser. It never joins a room. Use `--surface party-lobby` or
+`--surface race-lobby` to check the corresponding reading surface and action dock.
