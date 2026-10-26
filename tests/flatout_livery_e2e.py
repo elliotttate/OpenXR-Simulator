@@ -391,7 +391,8 @@ class LiveryTest:
             assert ray["valid"] and ray["ui_hit"] and not ray["grabbed"]
             origin, end = np.array(ray["origin"]), np.array(ray["end"])
             direction = (end-origin) / np.linalg.norm(end-origin)
-            local_start = inverse_camera @ (origin+direction*.05-camera["origin"])
+            # Native controller rays already report the model-cleared emitter; DrawBeam adds no further offset.
+            local_start = inverse_camera @ (origin-camera["origin"])
             local_end = inverse_camera @ (end-camera["origin"])
             errors = []
             for ribbon in ribbons:

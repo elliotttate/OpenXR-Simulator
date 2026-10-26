@@ -59,6 +59,12 @@ class LiveryDepth(LiveryTest):
                                'submitted_surfaces': raised['geometry']['surfaces'],
                                'native_hover': hit})
             assert passed, (label, 'No matching 15mm stereo control plane', candidates)
+            if self.args.gpu_capture:
+                queued = await asyncio.to_thread(read_game, self.args.pid, 'renderdoc.capture',
+                    {'frames': 1, 'path': str(self.args.gpu_capture.resolve()) + '-' + label})
+                assert queued['success'], queued
+                (self.args.evidence / ('gpu-' + label + '.json')).write_text(json.dumps(queued, indent=2))
+                await self.capture('gpu-queued-' + label)
             # A hand-origin ray aimed using the old base image intersects the
             # raised face at a different UV. Check the real parallel plane,
             # rather than demanding the obsolete base-plane UV.
@@ -162,6 +168,7 @@ if __name__ == '__main__':
     p.add_argument('--evidence', required=True, type=Path)
     p.add_argument('--target', action='append', required=True)
     p.add_argument('--hand', choices=('left', 'right'), default='right')
+    p.add_argument('--gpu-capture', type=Path, help='Capture the native atlas draw while the control is raised')
     p.add_argument('--raised-edge-top', action='store_true')
     p.add_argument('--drag-off', action='store_true', help='Hold the raised edge, move outside and release; no activation is allowed')
     p.add_argument('--click')

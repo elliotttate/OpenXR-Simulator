@@ -93,6 +93,12 @@ class MenuDepth(Frontend):
                                    'lift_meters': lifts, 'source_rect': target['rect'], 'base': base, 'tiles': tiles})
             assert passed, (name, 'No 15mm physical lift', lifts)
             assert len(tiles) <= 2, ('Unbounded transient layers', tiles)
+            if self.args.gpu_capture:
+                queued = await self.query('renderdoc.capture', {'frames': 1,
+                    'path': str(self.args.gpu_capture.resolve()) + '-' + name.replace('.', '-')})
+                assert queued['success'], queued
+                (self.args.evidence / ('gpu-' + name + '.json')).write_text(json.dumps(queued, indent=2))
+                await self.capture('gpu-queued-' + name)
             self.cases.append({'case': 'physical-hover-' + name, 'passed': True, 'lift_meters': lifts,
                                'source_rect': target['rect'], 'base': base, 'tiles': tiles})
         if self.args.click:
@@ -135,6 +141,7 @@ if __name__ == '__main__':
     p.add_argument('--data-dir', type=Path, required=True)
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--hand', choices=('left', 'right'), default='right')
+    p.add_argument('--gpu-capture', type=Path, help='Capture the native atlas draw while the control is raised')
     p.add_argument('--target', action='append')
     p.add_argument('--legacy-index', action='append', type=int, default=[])
     p.add_argument('--click')
