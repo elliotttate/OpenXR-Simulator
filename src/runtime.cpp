@@ -183,12 +183,9 @@ static void Log(const char* msg) {
     if (g_LogFile) {
         fputs(msg, g_LogFile);
         if (msg[0] && msg[strlen(msg)-1] != '\n') fputc('\n', g_LogFile);
-        static ULONGLONG lastFlushMs = 0;
-        const ULONGLONG nowMs = GetTickCount64();
-        if (lastFlushMs == 0 || nowMs - lastFlushMs >= 1000) {
-            fflush(g_LogFile);
-            lastFlushMs = nowMs;
-        }
+        // Roughly a syscall a second (the frame path uses LogV/LogVf, see above), and the
+        // log survives a crash or a DLL unload with its tail intact.
+        fflush(g_LogFile);
     }
 }
 static void Log(const std::string& msg) { Log(msg.c_str()); }
@@ -199,6 +196,22 @@ static void Logf(const char* fmt, ...) {
     va_end(ap);
     Log(buf);
 }
+// Bounded: this runs on the app's render thread, so a handler that reposts as fast as we
+// drain would wedge the host rather than cost a frame.
+static void PumpMessages(HWND filter) {
+    MSG msg;
+    int drained = 0;
+    while (PeekMessageW(&msg, filter, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        if (++drained >= 2000) {
+            Logf("[SimXR] PUMP RUNAWAY: bailed after %d messages, last=0x%04X hwnd=%p",
+                 drained, msg.message, msg.hwnd);
+            break;
+        }
+    }
+}
+
 static void LogV(const char* msg) { if (g_logVerbose) Log(msg); }
 static void LogVf(const char* fmt, ...) {
     if (!g_logVerbose) return;
@@ -345,12 +358,27 @@ static std::vector<XrEventDataBuffer> g_eventQueue;
 static LUID g_adapterLuid = {};
 static bool g_adapterLuidSet = false;
 // Global persistent window that survives session creation/destruction
+// The preview window needs a thread we own. Only the creating thread can retrieve a
+// window's messages, and hosts differ over which thread calls which entry point; putting
+// it on the app's render thread instead wedged Cemu inside SetWindowText on the first
+// composited frame.
+//
+// The frame path calls in synchronously (SetWindowText, SetWindowPos), so this thread must
+// stay in its message loop: whatever blocks here stalls the application's rendering.
+struct PreviewUi {
+    std::thread       thread;
+    std::atomic<HWND> hwnd{nullptr};
+    std::atomic<bool> finished{false};   // creation attempt is over, successfully or not
+    std::atomic<DWORD> threadId{0};
+};
+static PreviewUi g_previewUi;
+
 static HWND g_persistentWindow = nullptr;
 static std::mutex g_windowMutex;
 static ComPtr<IDXGISwapChain1> g_persistentSwapchain;
 static UINT g_persistentWidth = 1920;
 static UINT g_persistentHeight = 540;
-static bool g_windowClassRegistered = false;
+static std::atomic<bool> g_windowClassRegistered{false};
 
 // Latest XR swapchain (per-eye) source dimensions, populated by presentProjection.
 // Used by menu/keyboard resize callbacks to compute a target window size.
@@ -724,6 +752,29 @@ static float g_poseSweepRollAmp  = 0.3f;   // radians (~17 deg)
 static float g_poseSweepFreq     = 0.25f;  // Hz
 static bool g_mouseCapture = false;
 static POINT g_lastMousePos = {0, 0};
+
+// Mouse look and Home reach the head pose through these rather than writing it: the frame
+// loop integrates WASD into the same fields, and it is the only thread that should.
+static std::atomic<int>  g_lookDeltaX{0};
+static std::atomic<int>  g_lookDeltaY{0};
+static std::atomic<bool> g_resetPoseRequested{false};
+
+// ShowCursor keeps a counter, not a flag, so both ends of look mode have to go through one
+// place -- losing focus mid-drag used to clear g_mouseCapture without the matching show,
+// hiding the cursor for the rest of the session.
+static void SetMouseLook(HWND hwnd, bool active) {
+    if (active == g_mouseCapture) return;
+    g_mouseCapture = active;
+    if (active) {
+        SetCapture(hwnd);
+        GetCursorPos(&g_lastMousePos);
+        ShowCursor(FALSE);
+    } else {
+        ReleaseCapture();
+        ShowCursor(TRUE);
+    }
+    Logf("[SimXR] Mouse look %s", active ? "engaged" : "released");
+}
 
 // Middle-button drag panning the zoomed preview, in client coordinates.
 static bool g_panDrag = false;
@@ -1347,7 +1398,7 @@ static ui::StatsInfo BuildStatsInfo(rt::Session& s) {
 // title says lands immediately instead of at the render loop's next 500ms tick
 // -- which never arrives at all if the app has stopped submitting frames.
 static void RefreshTitleNow(HWND hwnd) {
-    if (!hwnd || hwnd != rt::g_session.hwnd) return;
+    if (!hwnd || hwnd != rt::g_previewUi.hwnd.load()) return;
     ui::StatsInfo si = BuildStatsInfo(rt::g_session);
     ui::UpdateWindowTitle(hwnd, &si);
 }
@@ -1391,8 +1442,9 @@ static void RefreshPreviewGeometry(HWND hWnd) {
 // "Fill Window" gives the entire target; any other zoom is an absolute content scale
 // placed by the pan offset, which the target then clips.
 static FitRect ComputePresentRect(int dstW, int dstH) {
-    RefreshPreviewGeometry(dstW, dstH);
-    const ui::PreviewRect r = ui::ComputePreviewRect();
+    int contentW = 0, contentH = 0;
+    ComputeDisplayDims(contentW, contentH);
+    const ui::PreviewRect r = ui::ComputePreviewRect(ui::PreviewGeometry{ dstW, dstH, contentW, contentH });
     return FitRect{ r.x, r.y, r.w, r.h };
 }
 
@@ -1576,7 +1628,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 ? "[SimXR] WndProc: preview input focused"
                 : "[SimXR] WndProc: preview input unfocused");
             if (effects.releaseMouseCapture) {
-                rt::g_mouseCapture = false;
+                rt::SetMouseLook(hWnd, false);
                 rt::g_panDrag = false;
                 ReleaseCapture();
             }
@@ -1588,19 +1640,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_LBUTTONDOWN:
             Logf("[SimXR] WM_LBUTTONDOWN: focused=%d", rt::g_session.previewInputFocused.load());
             if (rt::g_session.previewInputFocused) {
-                rt::g_mouseCapture = true;
-                SetCapture(hWnd);
-                GetCursorPos(&rt::g_lastMousePos);
-                ShowCursor(FALSE);
-                Log("[SimXR] Mouse captured for look control");
+                rt::SetMouseLook(hWnd, true);
             }
             return 0;
         case WM_LBUTTONUP:
-            if (rt::g_mouseCapture) {
-                rt::g_mouseCapture = false;
-                ReleaseCapture();
-                ShowCursor(TRUE);
-            }
+            rt::SetMouseLook(hWnd, false);
             return 0;
         case WM_MBUTTONDOWN:
             // Middle drag pans the zoomed image. Left is already mouse look, and this
@@ -1720,6 +1764,26 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             return TRUE;
         }
+        case WM_PAINT: {
+            // The frame path owns the client area and never goes through WM_PAINT, so fall
+            // through and leave it alone. Mirror off is the exception: nothing paints then.
+            if (ui::g_uiState.previewFps > 0) break;
+            PAINTSTRUCT ps;
+            if (HDC hdc = BeginPaint(hWnd, &ps)) {
+                FillRect(hdc, &ps.rcPaint, (HBRUSH)GetStockObject(BLACK_BRUSH));
+                RECT rc{};
+                GetClientRect(hWnd, &rc);
+                HGDIOBJ oldFont = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, ui::Colors::TextSecondary);
+                DrawTextW(hdc,
+                          L"Mirror Rate is off \x2014 Tools \x2192 Mirror Rate shows the preview again",
+                          -1, &rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                SelectObject(hdc, oldFont);
+                EndPaint(hWnd, &ps);
+            }
+            return 0;
+        }
         case WM_SIZE: {
             // Capture the new client area. The render path picks this up next
             // frame and resizes the swapchain (D3D11/GL) or recomputes the
@@ -1822,16 +1886,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 int deltaX = currentPos.x - rt::g_lastMousePos.x;
                 int deltaY = currentPos.y - rt::g_lastMousePos.y;
                 
-                // Update yaw and pitch (with sensitivity)
-                const float sensitivity = 0.002f;
-                rt::g_headYaw -= deltaX * sensitivity;
-                rt::g_headPitch -= deltaY * sensitivity;  // Inverted for natural feel
-                
-                // Clamp pitch to avoid gimbal lock
-                const float maxPitch = 1.5f;  // ~85 degrees
-                if (rt::g_headPitch > maxPitch) rt::g_headPitch = maxPitch;
-                if (rt::g_headPitch < -maxPitch) rt::g_headPitch = -maxPitch;
-                
+                rt::g_lookDeltaX.fetch_add(deltaX);
+                rt::g_lookDeltaY.fetch_add(deltaY);
+
                 // Reset cursor to center of window to avoid hitting screen edges
                 RECT rect;
                 GetWindowRect(hWnd, &rect);
@@ -1847,10 +1904,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // geometry to be current even if no frame has been presented since a resize.
             rt::RefreshPreviewGeometry(hWnd);
             if (ui::HandleMenuCommand(hWnd, wParam,
-                []() { rt::ResizeWindowForContent(rt::g_session.hwnd); },
+                [hWnd]() { rt::ResizeWindowForContent(hWnd); },
                 []() { mcp::g_screenshotRequested = true; },
                 []() {
-                    rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0;
+                    rt::g_resetPoseRequested.store(true);
                     ui::SetFitToWindow();
                     ui::SaveSettings();
                 },
@@ -1862,13 +1919,18 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             break;
         case WM_KEYDOWN:
             if (rt::g_automationOnly) return 0;
+            // Ahead of the gate below, which swallows every key while look mode is on.
+            if (wParam == VK_ESCAPE && rt::g_mouseCapture) {
+                rt::SetMouseLook(hWnd, false);
+                return 0;
+            }
             if (!rt::g_mouseCapture) {
                 rt::RefreshPreviewGeometry(hWnd);
                 if (ui::HandleKeyboardShortcut(hWnd, wParam,
-                    []() { rt::ResizeWindowForContent(rt::g_session.hwnd); },
+                    [hWnd]() { rt::ResizeWindowForContent(hWnd); },
                     []() { mcp::g_screenshotRequested = true; },
                     []() {
-                        rt::g_headPos = {0, 1.7f, 0}; rt::g_headYaw = 0; rt::g_headPitch = 0; rt::g_headRoll = 0;
+                        rt::g_resetPoseRequested.store(true);
                         ui::SetFitToWindow();
                         ui::SaveSettings();
                     },
@@ -3145,13 +3207,24 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
         // If the window stays alive, its WndProc points to unloaded code = crash.
         {
             std::lock_guard<std::mutex> lock(rt::g_windowMutex);
-            if (rt::g_persistentWindow) {
-                Log("[SimXR] xrDestroyInstance: Destroying preview window");
-                DestroyWindow(rt::g_persistentWindow);
-                rt::g_persistentWindow = nullptr;
-            }
+            rt::g_persistentWindow = nullptr;
             rt::g_persistentSwapchain.Reset();
         }
+        // DestroyWindow only works from the owning thread. Join before returning: the loader
+        // may unload us immediately, and a WndProc left in freed code takes the host down.
+        if (rt::g_previewUi.thread.joinable()) {
+            // A thread has no message queue until its first message call, and a WM_QUIT
+            // posted before then is discarded -- which would leave the join below waiting
+            // forever. finished means CreateWindowExW has run, one way or the other.
+            for (int i = 0; i < 2000 && !rt::g_previewUi.finished.load(); ++i) Sleep(1);
+            if (const DWORD uiTid = rt::g_previewUi.threadId.load()) {
+                PostThreadMessageW(uiTid, WM_QUIT, 0, 0);
+            }
+            rt::g_previewUi.thread.join();
+            Log("[SimXR] xrDestroyInstance: Preview UI thread joined");
+        }
+        rt::g_previewUi.finished.store(false);
+        rt::g_previewUi.threadId.store(0);
         // Also clear session window reference
         if (rt::g_session.hwnd) {
             rt::g_session.hwnd = nullptr;
@@ -4493,15 +4566,6 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
         rt::g_session.frameLifecycle.Reset();
     }
 
-    // Bring the preview up now instead of waiting for the first projection
-    // layer. An app that boots into a 2D-only screen submits nothing but quad
-    // layers, and quads cannot bootstrap the preview themselves, so the window
-    // would never appear at all - and the FOCUSED check below could never fire.
-    ensurePreviewWithoutProjection(rt::g_session);
-
-    // Pump once so the activation raised by creating the window is handled
-    // before we decide whether the session starts out focused.
-    MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 
     rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
     rt::PushState(s, XR_SESSION_STATE_VISIBLE);
@@ -4561,8 +4625,17 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         const XrResult result = rt::g_session.frameLifecycle.MarkWaited();
         if (XR_FAILED(result)) return result;
     }
-    // Message pump so the preview window stays responsive
-    MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    if (!rt::g_session.hwnd) {
+        ensurePreviewWithoutProjection(rt::g_session);
+        if (rt::g_session.hwnd) {
+            Logf("[SimXR] Preview window on UI thread %lu, frame loop on %lu",
+                 GetWindowThreadProcessId(rt::g_session.hwnd, nullptr), GetCurrentThreadId());
+        }
+    }
+
+    // Not the preview window -- that has its own thread. This drains whatever host windows
+    // happen to live on the render thread, which the runtime has always done from here.
+    PumpMessages(nullptr);
     static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
     static double periodSec = 1.0 / 90.0;
     static long long periodNs = (long long)(periodSec * 1e9);
@@ -4570,34 +4643,33 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     
     // Handle WASD keyboard input for movement (relative to head orientation).
     //
-    // Accept input when the foreground window is our preview window OR ANY window owned by the host
-    // process (the OpenXR app â€” e.g. the game). The simulator runtime lives in-process with the host,
-    // so checking the foreground window's PID against our own lets head WASD/look work whether the user
-    // has focused the small "O" preview or the host's own (often fullscreen) window â€” yet never steals
-    // keystrokes when the user has alt-tabbed to an unrelated app (terminal/browser), since those have a
-    // different PID.
-    //
-    // WHY THIS MATTERS (6DOF translation bug): previously this required `foreground == preview &&
-    // previewInputFocused`. As soon as the game's window took the foreground (which it does on launch /
-    // when fullscreen), the preview went inactive and WASD silently stopped feeding
-    // g_headPos â€” so interactive head translation looked completely dead, even though the underlying
-    // pose pipeline was fine (scripted head_pose_command.json poses are focus-independent, which is
-    // exactly why those worked while WASD didn't). Gating on "any window of our process is foreground"
-    // fixes that. Note: FH5 also binds W/S/A/D to throttle/brake/steer, so while the game window is
-    // focused these keys additionally drive the car â€” park the car when isolating head-only translation.
     std::unique_lock<std::recursive_mutex> controlLock(ui_auto::g_mutex);
-    const HWND foregroundWindow = GetForegroundWindow();
-    bool previewWindowFocused = false;
+    // The PID check is what makes AppForeground the default: the runtime is in-process with
+    // the host, so the game's own window counts as ours. PreviewFocused was once the only
+    // behaviour and left WASD dead in any game that takes the foreground on launch.
+    // Note: a game binding W/S/A/D itself will also act on them while it is focused.
+    if (rt::g_resetPoseRequested.exchange(false)) {
+        rt::g_headPos = {0, 1.7f, 0};
+        rt::g_headYaw = rt::g_headPitch = rt::g_headRoll = 0.0f;
+    }
+    if (const int dx = rt::g_lookDeltaX.exchange(0)) rt::g_headYaw -= dx * 0.002f;
+    if (const int dy = rt::g_lookDeltaY.exchange(0)) rt::g_headPitch -= dy * 0.002f;
+    const float maxPitch = 1.5f;  // ~85 degrees, short of gimbal lock
+    rt::g_headPitch = (std::max)(-maxPitch, (std::min)(maxPitch, rt::g_headPitch));
+
+    const ui::InputPolling inputPolling = ui::g_uiState.inputPolling;
+    bool inputActive = (inputPolling == ui::InputPolling::Background);
+    const HWND foregroundWindow = inputActive ? nullptr : GetForegroundWindow();
     if (foregroundWindow != nullptr) {
         if (foregroundWindow == rt::g_session.hwnd) {
-            previewWindowFocused = rt::g_session.previewInputFocused.load();
-        } else {
+            inputActive = rt::g_session.previewInputFocused.load();
+        } else if (inputPolling == ui::InputPolling::AppForeground) {
             DWORD fgPid = 0;
             GetWindowThreadProcessId(foregroundWindow, &fgPid);
-            previewWindowFocused = (fgPid != 0 && fgPid == GetCurrentProcessId());
+            inputActive = (fgPid != 0 && fgPid == GetCurrentProcessId());
         }
     }
-    if (previewWindowFocused && !rt::g_automationOnly) {
+    if (inputActive && !rt::g_automationOnly) {
         // Shift is the sprint modifier; both it and the base speed are set from
         // Tools > Movement Speed. GetAsyncKeyState rather than the WM_KEYDOWN
         // path because this reads a held state, and the host window may be the
@@ -5006,14 +5078,9 @@ static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession session, const XrFrameB
     return result;
 }
 
-// Ensure the preview window exists (create or adopt the persistent one) and
-// pick a sensible initial outer size if it's brand new. The window size is
-// NOT touched on subsequent calls â€” once it exists, the user (or the menu
-// resize callback) owns its size.
-static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initialClientH) {
-    if (s.hwnd) return;
+static void previewUiThreadMain(UINT initialClientW, UINT initialClientH) {
+    rt::g_previewUi.threadId.store(GetCurrentThreadId());
 
-    // Register window class if not done (use global flag)
     if (!rt::g_windowClassRegistered) {
         WNDCLASSW wc{};
         wc.lpfnWndProc = rt::WndProc;
@@ -5025,17 +5092,79 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
         rt::g_windowClassRegistered = true;
     }
 
-    // Try to adopt a persistent window from a previous DLL load
+    RECT rc = { 0, 0, (LONG)initialClientW, (LONG)initialClientH };
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    HWND hwnd = CreateWindowExW(0, L"OpenXR Simulator", L"OpenXR Simulator (Mouse Look + WASD)",
+                                WS_OVERLAPPEDWINDOW, 100, 100,
+                                rc.right - rc.left, rc.bottom - rc.top,
+                                nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!hwnd) {
+        Log("[SimXR] Failed to create preview window!");
+        rt::g_previewUi.finished.store(true);
+        return;
+    }
+
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+    SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    ui::ApplyDarkTheme(hwnd);
+
+    // The menu ApplyDarkTheme just attached eats into a client area sized without one, and
+    // WM_SIZE saves the shortfall for next launch -- 20px a run, compounding. Measuring
+    // beats AdjustWindowRect's bMenu flag, which cannot see a menu that wrapped to two rows.
+    RECT client{};
+    if (GetClientRect(hwnd, &client)) {
+        const int deficitW = (int)initialClientW - (client.right - client.left);
+        const int deficitH = (int)initialClientH - (client.bottom - client.top);
+        RECT frame{};
+        if ((deficitW || deficitH) && GetWindowRect(hwnd, &frame)) {
+            SetWindowPos(hwnd, nullptr, 0, 0,
+                         (frame.right - frame.left) + deficitW,
+                         (frame.bottom - frame.top) + deficitH,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    Logf("[SimXR] Created preview window on its own UI thread: hwnd=%p clientSize=%ux%u thread=%lu",
+         hwnd, initialClientW, initialClientH, GetCurrentThreadId());
+
+    // Published only once the window is fully set up, so the frame thread never sees a
+    // half-built window.
+    rt::g_previewUi.hwnd.store(hwnd);
+    rt::g_previewUi.finished.store(true);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    rt::g_previewUi.hwnd.store(nullptr);
+    if (IsWindow(hwnd)) DestroyWindow(hwnd);
+    Log("[SimXR] Preview UI thread exited and destroyed its window");
+}
+
+// Ensure the preview window exists (adopt the persistent one, or ask the UI thread for a
+// fresh one). The window size is NOT touched on subsequent calls — once it exists, the
+// user (or the menu resize callback) owns its size.
+static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initialClientH) {
+    if (s.hwnd) return;
+
+    // Try to adopt a persistent window from a previous session
     {
         std::lock_guard<std::mutex> lock(rt::g_windowMutex);
         if (rt::g_persistentWindow && IsWindow(rt::g_persistentWindow)) {
             s.hwnd = rt::g_persistentWindow;
-            // After DLL reload, the old WndProc pointer is invalid
-            SetWindowLongPtrW(s.hwnd, GWLP_WNDPROC, (LONG_PTR)rt::WndProc);
-            Log("[SimXR] Updated window WndProc to new DLL address");
-            ui::ApplyDarkTheme(s.hwnd);
-            ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
-            UpdateWindow(s.hwnd);
+            // Only for a window adopted across a DLL reload; one our UI thread still owns is
+            // already dressed, and this would be reaching into its window from outside.
+            if (rt::g_previewUi.hwnd.load() != s.hwnd) {
+                // After DLL reload, the old WndProc pointer is invalid
+                SetWindowLongPtrW(s.hwnd, GWLP_WNDPROC, (LONG_PTR)rt::WndProc);
+                Log("[SimXR] Updated window WndProc to new DLL address");
+                ui::ApplyDarkTheme(s.hwnd);
+                ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+                UpdateWindow(s.hwnd);
+            }
             // Seed clientWidth/Height from the actual current client area
             RECT cr{};
             if (GetClientRect(s.hwnd, &cr)) {
@@ -5050,27 +5179,16 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
         }
     }
 
-    // No persistent window â€” create a fresh one at the requested initial size
-    RECT rc = { 0, 0, (LONG)initialClientW, (LONG)initialClientH };
-    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    s.hwnd = CreateWindowExW(0, L"OpenXR Simulator", L"OpenXR Simulator (Mouse Look + WASD)", WS_OVERLAPPEDWINDOW,
-                             100, 100, rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!s.hwnd) {
-        Log("[SimXR] Failed to create preview window!");
-        return;
+    // No persistent window — hand creation to the UI thread and wait for it to publish.
+    // Bounded: missing the window costs this frame's preview and is retried on the next.
+    if (!rt::g_previewUi.thread.joinable()) {
+        rt::g_previewUi.thread = std::thread(previewUiThreadMain, initialClientW, initialClientH);
     }
-    // The preview is diagnostic runtime UI. Showing it must not background the
-    // OpenXR application and stall Unity's world rendering.
-    ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
-    UpdateWindow(s.hwnd);
-    SetWindowPos(s.hwnd, HWND_TOP, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
-    Logf("[SimXR] Created new preview window: hwnd=%p clientSize=%ux%u",
-         s.hwnd, initialClientW, initialClientH);
+    for (int i = 0; i < 500 && !rt::g_previewUi.finished.load(); ++i) Sleep(1);
+    s.hwnd = rt::g_previewUi.hwnd.load();
+    if (!s.hwnd) return;
 
-    ui::ApplyDarkTheme(s.hwnd);
-    ui::g_uiState.windowWidth = initialClientW;
-    ui::g_uiState.windowHeight = initialClientH;
+    // windowWidth/Height are left to the WM_SIZE the UI thread has already handled.
     s.clientWidth.store(initialClientW);
     s.clientHeight.store(initialClientH);
 
@@ -5712,7 +5830,9 @@ static void ensurePreviewWithoutProjection(rt::Session& s) {
     // aspect wrong, which the snap on the first WM_SIZE corrects.
     int windowW = ui::g_uiState.windowWidth;
     int windowH = ui::g_uiState.windowHeight;
-    if (windowW <= 0 || windowH <= 0) {
+    // Too small to be a size anyone chose: a file left behind by the menu-bar shrink above.
+    constexpr int kMinRestoredClient = 240;
+    if (windowW < kMinRestoredClient || windowH < kMinRestoredClient) {
         uint32_t panelW = 0, panelH = 0;
         ui::GetHeadsetPanelResolution(panelW, panelH);
         ui::CalculateWindowSize((int)panelW, (int)panelH, windowW, windowH);
@@ -6651,8 +6771,6 @@ static void blitD3D12ToPreview(rt::Session& s,
     // does the single readback once every layer is in.
 
     // Process window messages
-    MSG msg;
-    while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 
     static int blitCount = 0;
     if (g_logVerbose && ++blitCount % 60 == 1) {
@@ -7074,8 +7192,6 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
             // Present (may be deferred if overlays are pending)
             if (!skipPresent) {
-                MSG msg;
-                while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 
                 if (glFrameCount % 60 == 1) {
                     Logf("[SimXR] GL PREVIEW: About to Present - hwnd=%p, swapchain=%p", s.hwnd, s.previewSwapchain.Get());
@@ -7226,8 +7342,6 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 // vblank here would pace the application to the monitor rather than to the
                 // headset it thinks it is driving.
                 if (!skipPresent) {
-                    MSG msg;
-                    while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
                     s.previewSwapchain->Present(0, 0);
                 } else {
                     g_presentPending = true;
@@ -8368,11 +8482,10 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         ui::NotifyScreenshotSaved(std::wstring(shotPath.begin(), shotPath.end()));
     }
 
+
     // Now Present after all layers are rendered (D3D11/GL only; D3D12 uses GDI in blit function)
     if (g_presentPending) {
         auto& s = rt::g_session;
-        MSG msg;
-        while (PeekMessageW(&msg, s.hwnd, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 
         if (s.usesD3D12) {
             // D3D12 GDI-based path: blitD3D12ToPreview already painted via GDI, nothing to do

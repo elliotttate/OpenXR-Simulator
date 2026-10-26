@@ -166,6 +166,12 @@ if(BUILD_TESTING)
     add_executable(api_validation_tests tests/api_validation_tests.cpp)
     target_include_directories(api_validation_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME api_validation COMMAND api_validation_tests)
+    add_executable(ui_input_polling_tests tests/ui_input_polling_tests.cpp)
+    target_include_directories(ui_input_polling_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    if(MSVC)
+        target_compile_options(ui_input_polling_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME ui_input_polling COMMAND ui_input_polling_tests)
 endif()
 
 # Link libraries
