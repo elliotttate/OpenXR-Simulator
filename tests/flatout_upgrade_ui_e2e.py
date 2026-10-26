@@ -25,16 +25,30 @@ class UpgradeUI(Frontend):
             native=await self.query('vr.targets')
             back=next(t for t in native['targets'] if t['name'].startswith('helper.Cancel.'))
             l,t,r,b=back['rect']
-            _,args=await self.point_args(back['name'],((100-l)/(r-l),(500-t)/(b-t)))
+            # Native menu navigation is bound to the left thumbstick.
+            _,args=await self.point_args(back['name'],((100-l)/(r-l),(500-t)/(b-t)),hand='left')
             args.update(stick=[direction,0],dwell_frames=2,hold_frames=3,command_id=uuid.uuid4().hex)
             before=(await self.query('menu.get_state'))['selection_index']
             receipt=await self.tool('scroll_ui_at',args,'upgrade-native-stick-'+str(direction))
             assert receipt['status']=='input_delivered'
             selected=(await self.query('menu.get_state'))['selection_index']
             assert selected!=before,'Native thumbstick did not navigate the upgrade carousel'
-            await self.hover('legacy.'+str(selected))
-            labels=(await self.query('hud.rects',{'root':'menu','max_depth':22}))['nodes']
-            captions=[n['text'] for n in labels if n['visible'] and n['path'].endswith('/RayActionLabel')]
+            # The carousel can slide the new tile into the old ray's exact spot.
+            # Reacquire with deliberate motion, as a user returning from the stick would.
+            targets=(await self.query('vr.targets'))['targets']
+            selected_tile=next(t for t in targets if t['name']=='legacy.'+str(selected))
+            center=lambda t:(t['rect'][0]+t['rect'][2])*.5
+            far_tile=max((t for t in targets if t['name'].startswith('legacy.')),key=lambda t:abs(center(t)-center(selected_tile)))
+            await self.hover(far_tile['name'])
+            await self.hover(selected_tile['name'])
+            # Helpers fade and rebuild when native navigation changes selection.
+            # Wait for that rendered transition, rather than inspecting its empty frame.
+            for _ in range(12):
+                labels=(await self.query('hud.rects',{'root':'menu','max_depth':22}))['nodes']
+                captions=[n['text'] for n in labels if n['visible'] and n['path'].endswith('/RayActionLabel')]
+                if 'Buy' in captions and 'Confirm' not in captions:
+                    break
+                await asyncio.sleep(.1)
             assert 'Buy' in captions and 'Confirm' not in captions,('Ray return lost its specific Buy action',captions)
         assert (await self.query('menu.get_state'))['selection_index']==initial,'Opposite stick steps did not restore selection'
         self.cases.append({'case':'native-thumbstick-to-ray-retains-buy-caption','passed':True})

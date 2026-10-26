@@ -730,6 +730,13 @@ Omit the reference for a standalone world-up check. The test saves `layout.json`
 before asserting, so a failing baseline can supply the reference for the fixed
 build. Use the same scene and menu state when comparing authored placement.
 
+For an independent rendering check, `tests/flatout_spatial_menu_gpu.py` replays a
+RenderDoc capture and verifies every spatial title's actual GPU world basis in
+both eye views. Set `FOX_SPATIAL_GPU_JOB` to a JSON file containing `capture`,
+`native_state` (a diagnostic snapshot with `menu.result`) and `result` paths, then
+run `qrenderdoc --python tests/flatout_spatial_menu_gpu.py`. Read its result JSON;
+a failed check also exits with a nonzero status.
+
 From Career > Garage > Upgrades, check stable hover previews and dialog recovery:
 
 ```powershell

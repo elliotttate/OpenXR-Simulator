@@ -98,4 +98,4 @@ finally:
     if controller:controller.Shutdown()
     if cap:cap.Shutdown()
     Path(job['result']).write_text(json.dumps(report,indent=2))
-os._exit(0)
+os._exit(0 if report['passed'] else 1)
