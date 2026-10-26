@@ -23,7 +23,7 @@ from flatout_livery_e2e import quaternion_matrix
 
 
 def game(pid, method, params=None):
-    assert method in ('vr.controller_overlay', 'vr.get_state', 'menu.get_state', 'game.errors')
+    assert method in ('vr.controller_overlay', 'vr.get_state', 'menu.get_state', 'game.errors', 'renderdoc.capture')
     payload = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params or {}}).encode()
     with open(r'\\.\pipe\FlatoutMCP_'+str(pid), 'r+b', buffering=0) as pipe:
         pipe.write(struct.pack('<I',len(payload))+payload)
@@ -100,6 +100,10 @@ async def run(args):
                     assert status['rendered_eye_mask']==(3 if enabled else 0), status
                     assert status['submitted_layers']==(2 if enabled else 0), status
                     (args.evidence/(tag+'-native.json')).write_text(json.dumps({'vr':native,'overlay':status},indent=2))
+                    if enabled and args.gpu_capture:
+                        result['gpu_capture'] = game(args.pid,'renderdoc.capture',
+                            {'path':str(args.gpu_capture.resolve()),'frames':1})
+                        await asyncio.sleep(1)
                     for eye in ('left','right'):
                         capture,image = await call(session,'capture_screenshot',{'eye':eye,'max_width':1600},args.evidence,tag+'-'+eye)
                         assert len(capture['geometry']['projection_eyes'])==2
@@ -144,4 +148,5 @@ if __name__=='__main__':
     parser.add_argument('--pid',type=int,required=True)
     parser.add_argument('--data-dir',type=Path,required=True)
     parser.add_argument('--evidence',type=Path,required=True)
+    parser.add_argument('--gpu-capture',type=Path,help='Optional RenderDoc capture prefix; launch with injection')
     asyncio.run(run(parser.parse_args()))

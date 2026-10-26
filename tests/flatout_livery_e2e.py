@@ -186,11 +186,44 @@ class LiveryTest:
         self.last_capture = capture
         return self.last_capture
 
-    async def click(self, label, index=0, hold_frames=2, retry=False, hand="right"):
+    async def wait_head_pose(self, yaw_degrees):
+        # set_head_pose queues a command. Wait for the native game to consume it
+        # before associating screenshot pixels with the new viewing direction.
+        angle = math.radians(yaw_degrees)
+        expected = [math.sin(angle), 0, math.cos(angle)]
+        for _ in range(60):
+            state = await self.state()
+            if np.allclose(state['vr']['frame']['left_eye']['back'], expected, atol=1e-4):
+                await asyncio.sleep(.1)  # allow the submitted eye image to follow
+                return
+            await asyncio.sleep(.05)
+        raise AssertionError(('Head pose did not reach the requested yaw', yaw_degrees))
+
+    async def face_control(self, state, control):
+        """Glance at a side column while keeping the same tracked eye position."""
+        frame = state['vr']['frame']
+        if frame['panel_width'] < 4:
+            return
+        camera, panel = frame['camera'], frame['panel']
+        world = (np.array(panel['origin']) + np.array(panel['right'])*
+                 ((control['x']+control['width']/2)/1920-.5)*frame['panel_width'])
+        inverse = np.column_stack([camera[k] for k in ('right','up','back')]).T
+        head = (np.array(frame['left_eye']['origin'])+frame['right_eye']['origin'])/2
+        delta = inverse @ (world-camera['origin']) - head
+        yaw = math.degrees(math.atan2(-delta[0],-delta[2]))
+        result = await self.session.call_tool('set_head_pose', dict(
+            x=float(head[0]), y=float(head[1]), z=float(head[2]),
+            yaw_deg=yaw, pitch_deg=0, roll_deg=0))
+        assert not result.isError, result
+        await self.wait_head_pose(yaw)
+
+    async def click(self, label, index=0, hold_frames=2, retry=False, hand="right", control_window=None):
         before = await self.state()
-        controls = [c for c in before["vr"]["controls"] if c["label"] == label]
+        controls = [c for c in before["vr"]["controls"] if c["label"] == label and
+                    (control_window is None or c['window']==control_window)]
         assert len(controls) > index, (label, before["vr"]["controls"])
         control = controls[index]
+        await self.face_control(before, control)
         hx, hy = control["x"]+control["width"]/2, control["y"]+control["height"]/2
         capture = await self.capture("source")
         x, y = screenshot_pixel(before, capture, hx, hy)

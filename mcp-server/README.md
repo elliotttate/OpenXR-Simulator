@@ -369,19 +369,23 @@ so back up their `Liveries` folder separately. Start with no unsaved edits:
 python tests/flatout_livery_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory>
 ```
 
-For the current side-console layout, start in Livery with an unlocked sticker in
+For the current two-column layout, start in Livery with an unlocked sticker in
 an isolated profile and run:
 
 ```powershell
 python tests/flatout_livery_workspace_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory>
 ```
 
-This turns the simulated head between the car and its left-hand console, checks
-both-eye clearance with the panel level, and uses real ray input for paint,
-tool selection, two-hand sticker manipulation and Roof/Studio views. A captured
+This turns the simulated head between the car and its two side columns, checks
+both-eye clearance and floor margins with the panel level, and uses real ray input for paint,
+tool selection, two-hand sticker manipulation, Roof/Studio views, keyboard,
+Workshop browsing and sharing-preview cancellation. It never publishes. A captured
 drag may cross the car silhouette without losing its grab. A single Undo must
 restore the entire gesture; the successful run leaves the document unchanged.
-It saves both-eye car and console screenshots for visual inspection.
+It saves both-eye car and column screenshots for visual inspection. The shared
+click helper glances toward controls on the wide canvas without moving the eye
+position. The scroll regression measures physical target sizes so denser pixel
+layouts cannot silently shrink their ray targets.
 
 With an unlocked layer available, add `--dual-hands-only` to verify real
 left/right car grabs, scaling, rotation, hand release, continuing movement,

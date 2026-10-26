@@ -1,4 +1,4 @@
-"""Verify a clear car workspace and a separately aimed livery tool console.
+"""Verify a clear car workspace between two livery tool columns.
 
 Start the Release game in Livery with an isolated profile and an unlocked layer.
 All interaction uses captured pixels and real XR input. Edits are undone.
@@ -25,20 +25,35 @@ def clearance(state):
     angles = []
     for name in ('left_eye', 'right_eye'):
         eye = np.array(camera['origin']) + basis @ frame[name]['origin']
-        inner = np.array(panel['origin']) + np.array(panel['right'])*frame['panel_width']/2 - eye
-        angle = math.degrees(math.atan2(inner @ camera['right'], -inner @ camera['back']))
-        assert angle < -35, ('Editor still covers the car-facing workspace', name, angle)
-        angles.append(angle)
+        for side, edge in enumerate((504, 1416)):
+            inner = (np.array(panel['origin']) + np.array(panel['right'])*
+                     (edge/1920-.5)*frame['panel_width'] - eye)
+            angle = math.degrees(math.atan2(inner @ camera['right'], -inner @ camera['back']))
+            assert angle > 30 if side else angle < -30, ('Editor covers the car corridor', name, side, angle)
+            angles.append(angle)
+    foot = np.array(panel['origin'])-np.array(panel['up'])*(960/1080-.5)*frame['panel_height']
+    assert foot[2] >= .199, ('Action row intersects the showroom floor', foot.tolist())
     return angles
 
 
 class WorkspaceTest(LiveryTest):
+    def check_columns(self, state):
+        for control in state['vr']['controls']:
+            x, y, w, h = (control[k] for k in ('x','y','width','height'))
+            assert (24-.5 <= x and x+w <= 504+.5) or (1416-.5 <= x and x+w <= 1896+.5), control
+            assert y >= 120-.5 and y+h <= 960+.5, control
+
+    async def click(self, label, **kwargs):
+        after = await super().click(label, **kwargs)
+        self.check_columns(after)
+        return after
+
     async def look(self, yaw, label):
         result = await self.session.call_tool('set_head_pose', dict(x=0, y=1.7, z=0, yaw_deg=yaw,
                                                                   pitch_deg=0, roll_deg=0))
         assert not result.isError, result
         (self.args.evidence/(label+'-head.json')).write_text(json.dumps({'yaw_degrees':yaw,'result':[c.text for c in result.content if c.type=='text']}))
-        await asyncio.sleep(.35)
+        await self.wait_head_pose(yaw)
 
     async def stereo(self, label):
         for eye in ('left', 'right'):
@@ -78,13 +93,32 @@ class WorkspaceTest(LiveryTest):
         self.cases.append({'case':'car-corridor-clearance', 'inner_edge_degrees':clearance(original), 'passed':True})
         await self.look(0, 'face-car')
         await self.stereo('unobstructed-car')
-        await self.look(65, 'face-console')
-        await self.stereo('console')
+        self.check_columns(original)
+        await self.look(44, 'face-left-column')
+        await self.stereo('left-column')
+        await self.look(-44, 'face-right-column')
+        await self.stereo('right-column')
         await self.click('PAINT', hand='left', hold_frames=45, retry=True)
         paint = await self.state()
         await self.click('Matte')
         restored = await self.click('UNDO', hand='left')
         assert restored['document']==paint['document']
+        lower = await self.click('Tools down')
+        assert any(c['label']=='Metallic' for c in lower['vr']['controls']), 'Lower paint settings are unreachable'
+        for _ in range(12):
+            if not next(c for c in lower['vr']['controls'] if c['label']=='Tools down')['enabled']:
+                break
+            lower = await self.click('Tools down')
+        else:
+            raise AssertionError('Paint tools never reach the bottom')
+        inert = await self.click('Tools down')
+        assert inert['document']==paint['document']
+        for _ in range(12):
+            if not next(c for c in inert['vr']['controls'] if c['label']=='Tools up')['enabled']:
+                break
+            inert = await self.click('Tools up')
+        else:
+            raise AssertionError('Paint tools never return to the top')
         await self.click('STICKERS')
         await self.click('EDIT LAYER', hand='left')
         await self.click('SCALE / SKEW')
@@ -103,7 +137,6 @@ class WorkspaceTest(LiveryTest):
         final = await self.release('right')
         assert final['vr']['grab_mask']==0
         await self.stereo('painted-car')
-        await self.look(65, 'return-console')
         restored = await self.click('UNDO', hand='left')
         assert restored['document']==before['document'], 'One Undo must restore the entire car gesture'
         await self.click('DONE PLACING')
@@ -112,12 +145,35 @@ class WorkspaceTest(LiveryTest):
         roof = await self.state()
         self.cases.append({'case':'roof-console-clearance', 'inner_edge_degrees':clearance(roof), 'passed':True})
         await self.stereo('unobstructed-roof')
-        await self.look(65, 'restore-studio')
         await self.click('STUDIO')
         await self.click('BACK TO LAYERS')
+        await self.click('ADD STICKER')
+        await self.click('Search stickers')
+        await self.stereo('keyboard-right-column')
+        await self.click('q')
+        await self.click('CANCEL')
+        await self.click('MY LIVERIES')
+        await self.click('RENAME')
+        await self.click('CANCEL')
+        await self.click('BROWSE WORKSHOP')
+        await self.stereo('workshop-right-column')
+        await self.click('BACK TO MY LIVERIES')
+        await self.click('SHARE TO WORKSHOP')
+        for _ in range(60):
+            shared = await self.state()
+            if any(c['window']=='Share livery to Workshop' for c in shared['vr']['controls']):
+                break
+            await asyncio.sleep(.25)
+        else:
+            raise AssertionError('The sharing preview did not finish')
+        self.check_columns(shared)
+        await self.look(-44,'sharing-right-column')
+        await self.stereo('sharing-right-column')
+        await self.click('BACK', control_window='Share livery to Workshop')
+        await self.click('STICKERS')
         await self.look(0, 'finished')
         assert (await self.state())['document']==original['document']
-        self.cases.append({'case':'side-console-and-dual-car-ray', 'passed':True})
+        self.cases.append({'case':'two-columns-and-dual-car-ray', 'passed':True})
 
 
 async def run(args):

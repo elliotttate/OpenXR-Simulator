@@ -26,7 +26,9 @@ class LiveryScroll(LiveryTest):
     async def disabled(self,label):
         before=await self.state();control=self.control(before,label)
         assert control['enabled'] is False,(label,control)
-        park=next(c for c in before['vr']['controls'] if c['label'] in ('BACK TO LAYERS','BACK'))
+        await self.face_control(before, control)
+        park=next(c for c in before['vr']['controls'] if c['enabled'] and
+                  c['label'] != label and (c['x'] < 960)==(control['x'] < 960))
         source=await self.capture('park-before-grey')
         px,py=screenshot_pixel(before,source,park['x']+park['width']/2,park['y']+park['height']/2)
         await self.tool('hover_ui_at',dict(capture_id=source['capture_id'],x=float(px),y=float(py),
@@ -45,6 +47,7 @@ class LiveryScroll(LiveryTest):
     async def smooth(self):
         before=await self.state()
         control=next(c for c in before['vr']['controls'] if c['label'].startswith('Sticker ') and c['height']>60)
+        await self.face_control(before, control)
         hx,hy=control['x']+control['width']/2,control['y']+control['height']/2
         capture=await self.capture('stick-scroll-source')
         x,y=screenshot_pixel(before,capture,hx,hy)
@@ -78,8 +81,9 @@ class LiveryScroll(LiveryTest):
         layout=await self.state()
         back=self.control(layout,'BACK TO LAYERS')
         scroll=[self.control(layout,label) for label in ('Categories up','Categories down','Stickers up','Stickers down')]
-        assert all(c['height']>=72 and c['width']>=81 for c in scroll),('Scroll targets are too small',scroll)
-        assert all(c['y']+c['height']+18<=back['y'] for c in scroll),('List navigation must stay with its list, clear of the action dock',scroll,back)
+        metres=layout['vr']['frame']['panel_width']/1920
+        assert all(c['height']*metres>=.08 and c['width']*metres>=.08 for c in scroll),('Scroll targets are too small',scroll)
+        assert all((back['y']-c['y']-c['height'])*metres>=.016 for c in scroll),('List navigation must stay with its list, clear of the action dock',scroll,back)
         assert self.control(layout,'Categories down')['x']<self.control(layout,'Stickers up')['x']
         self.cases.append(dict(case='large-scroll-buttons-grouped-with-lists',passed=True,controls=scroll))
         while self.control(await self.state(),'Categories up')['enabled']:await self.press('Categories up')
