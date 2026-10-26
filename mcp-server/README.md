@@ -537,6 +537,10 @@ python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory>
 python tests/flatout_career_results_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --hand left
 # From the same result pages after the final round: finish the cup once and return to the event browser.
 python tests/flatout_career_results_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --hand left --final-round
+# Stage the native development reward preview with the Fox bridge method ui.preview_reward first.
+# It reuses the existing money-animation preview and does not grant credits. Read the unchanged balance with ui.reward_state.
+# Then verify head-height placement, Continue, clean controls, closing input retirement and one dismissal through real XR input.
+python tests/flatout_reward_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --expected-credits <unchanged-balance>
 # From the Career hub with an active isolated test cup: cancel abandonment, then confirm it.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-cancel-only
 # From class selection with the isolated Derby car: preserve scenery during both class warnings, then open filtered cars after OK.

@@ -30,7 +30,7 @@ RAY_OFFSET = {"position": [.03, 0, 0], "orientation": [0, -.043619387365336, 0, 
 
 def read_game(pid, method, params=None):
     # RenderDoc records the rendered frame; it cannot activate or navigate UI.
-    assert method in {"game.get_state", "game.errors", "menu.get_state", "vr.targets", "vr.get_state", "hud.pause_menu", "ui.get_message_box", "ui.vr_button_map", "options.get_state", "statistics.get_state", "party.get_state", "race.end_screen", "leaderboard.get_state", "hud.rects", "hud.get_node", "rogue.state", "rogue.route_map", "renderdoc.capture", "audio.ui_feedback", "net.get_state"}
+    assert method in {"game.get_state", "game.errors", "menu.get_state", "vr.targets", "vr.get_state", "hud.pause_menu", "ui.get_message_box", "ui.reward_state", "ui.vr_button_map", "options.get_state", "statistics.get_state", "party.get_state", "race.end_screen", "leaderboard.get_state", "hud.rects", "hud.get_node", "rogue.state", "rogue.route_map", "renderdoc.capture", "audio.ui_feedback", "net.get_state"}
     if params is None:
         params = {"action": "list"} if method == "hud.pause_menu" else {}
     request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
@@ -480,13 +480,13 @@ class Frontend:
         assert (await self.query("options.get_state"))["open"],"Start in Options"
         return await self.reading_comfort("options")
 
-    async def reading_comfort(self, label):
+    async def reading_comfort(self, label, hover_target=None):
         before=await self.query("vr.targets")
         capture=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},label+"-head-height")
         self.last_capture=capture
         def surface_for(source,native):
             quads=[s for s in source["geometry"]["surfaces"] if s["visibility"]==0]
-            return quads[0] if quads else ui_surface({"vr":{"frame":native["vr_frame"]}})
+            return max(quads,key=lambda s:s["size"][0]*s["size"][1]) if quads else ui_surface({"vr":{"frame":native["vr_frame"]}})
         surface=surface_for(capture,before)
         head=capture["geometry"]["head"]
         assert np.allclose(head["orientation"],[0,0,0,1]),"Start at a neutral head rotation"
@@ -524,8 +524,8 @@ class Frontend:
         finally:
             await self.session.call_tool("set_head_pose",{"x":head["position"][0],"y":head["position"][1],"z":head["position"][2],"yaw_deg":0,"pitch_deg":0,"roll_deg":0})
             await asyncio.sleep(.3)
-        cancel=next(t["name"] for t in before["targets"] if t["name"].startswith("helper.Cancel."))
-        await self.hover(cancel)
+        action=hover_target or next(t["name"] for t in before["targets"] if t["name"].startswith("helper.Cancel."))
+        await self.hover(action)
         self.cases.append({"case":label+"-world-locked-both-eye-controls-and-ray-hover","passed":True,"hand":self.args.hand})
 
     async def options_redesign_layout(self):
