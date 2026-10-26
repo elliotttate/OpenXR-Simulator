@@ -1570,6 +1570,14 @@ class Frontend:
             assert 0<=px<source["image_size"][0] and 0<=py<source["image_size"][1], (label,[px,py])
             return {"capture_id":source["capture_id"],"x":float(px),"y":float(py),"hand":hand or self.args.hand,
                     "origin_mode":"hand","surface":ui_surface(local_state),"ray_offset":RAY_OFFSET,"dwell_frames":30}
+        # A hand left at a previous menu's world pose can legitimately hover a
+        # different row here. Park it before recording the selection baseline
+        # for the active hand's miss tests; later checks deliberately use both.
+        spare = "left" if self.args.hand=="right" else "right"
+        parked = await aim_at(point(0,-4*half[1]),"spatial-back-initial-spare-away",spare)
+        await self.tool("hover_ui_at",parked,"spatial-back-initial-spare-parked")
+        menu = await self.query("menu.get_state")
+        capture = await self.capture("spatial-back-plate-source")
         # A real secondary button needs an opaque, dark plate around its
         # caption; a floating word over the road is not a visible hit region.
         pixels = np.asarray(Image.open(self.last_image_path).convert("RGB")).astype(float)
