@@ -120,7 +120,8 @@ def runtime_is_live() -> bool:
 
     The status and log files outlive the process that wrote them, so without this
     check a long-dead session still reports FOCUSED. The owning PID comes from the
-    log filename; PID reuse can in principle produce a false positive.
+    log filename, or a recent immutable capture plus this directory's heartbeat
+    when diagnostic logging is unavailable. PID reuse remains a limitation.
     """
     log = current_log_file()
     pid = log_owner_pid(log) if log is not None else None

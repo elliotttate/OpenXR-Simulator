@@ -478,6 +478,7 @@ class Frontend:
         # pose before projecting another ray; a fixed sleep can capture the old view.
         response=await self.session.call_tool("set_head_pose",pose)
         assert not response.isError,response
+        assert any(getattr(c,"text","").startswith("Head pose command queued:") for c in response.content),response
         yaw,pitch,roll=(math.radians(pose.get(k,0)) for k in ("yaw_deg","pitch_deg","roll_deg"))
         cy,sy=math.cos(yaw),math.sin(yaw);cp,sp=math.cos(pitch),math.sin(pitch);cr,sr=math.cos(roll),math.sin(roll)
         expected=np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]])@np.array([[1,0,0],[0,cp,-sp],[0,sp,cp]])@np.array([[cr,-sr,0],[sr,cr,0],[0,0,1]])
