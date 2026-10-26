@@ -93,13 +93,16 @@ static PFNGLBINDFRAMEBUFFERPROC g_glBindFramebuffer = nullptr;
 static PFNGLFRAMEBUFFERTEXTURE2DPROC g_glFramebufferTexture2D = nullptr;
 static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <string>
+#include <array>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <optional>
 #include <cstring>
 #include <cstdlib>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <deque>
 #include <algorithm>
@@ -114,7 +117,17 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <openxr/openxr_platform.h>
 #include <loader_interfaces.h>
 #include "mcp_integration.h"
+#include "action_state.h"
+#include "interaction_query.h"
+#include "api_validation.h"
+#include "enum_strings.h"
+#include "composition_validation.h"
+#include "composition_render.h"
+#include "frame_state.h"
+#include "pose_math.h"
+#include "preview_focus.h"
 #include "projection_timing.h"
+#include "swapchain_state.h"
 #include "ui_enhancements.h"
 
 using Microsoft::WRL::ComPtr;
@@ -309,6 +322,13 @@ static DXGI_FORMAT ToTypeless(DXGI_FORMAT format) {
 // Released from WndProc and instance teardown, both of which run long before the D3D12
 // preview path where it is defined.
 namespace rt { struct Session; }
+
+// QPC-derived time helpers, defined further down. Integer math only - the same
+// conversion xrConvertWin32PerformanceCounterToTimeKHR performs. File-scope statics:
+// unqualified calls inside namespace rt resolve to these through the enclosing scope.
+static XrTime QpcToNs(long long counter, long long freq);
+static XrTime CurrentXrTime();
+
 // Runtime state
 namespace rt {
 
@@ -317,10 +337,13 @@ struct Swapchain;
 // Forward declarations
 void PushState(XrSession s, XrSessionState newState);
 
+// Event queue drained by xrPollEvent. Lives in this early block so functions like
+// xrDestroySession can discard queued events that reference destroyed handles.
+static std::vector<XrEventDataBuffer> g_eventQueue;
+
 // Global adapter LUID that we'll use consistently
 static LUID g_adapterLuid = {};
 static bool g_adapterLuidSet = false;
-
 // Global persistent window that survives session creation/destruction
 static HWND g_persistentWindow = nullptr;
 static std::mutex g_windowMutex;
@@ -335,17 +358,27 @@ static std::atomic<UINT> g_sourceWidth{0};
 static std::atomic<UINT> g_sourceHeight{0};
 
 struct Instance {
-    XrInstance handle{(XrInstance)1};
+    XrInstance handle{XR_NULL_HANDLE};
     std::vector<std::string> enabledExtensions;
+    // Per spec (each graphics-binding extension chapter), xrCreateSession must return
+    // XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING unless the matching requirements
+    // function was already called for this instance (there is only one systemId).
+    bool d3d11RequirementsCalled{false};
+    bool d3d12RequirementsCalled{false};
+    bool openglRequirementsCalled{false};
+    bool vulkanRequirementsCalled{false};
+    // Adapter LUIDs reported by the requirements functions, used to validate the app's
+    // device at xrCreateSession (XR_ERROR_GRAPHICS_DEVICE_INVALID on mismatch).
+    LUID d3d11RequirementsLuid{};
+    LUID d3d12RequirementsLuid{};
 };
 
 // The D3D12 preview back buffer is always BGRA8, whatever the app submits: that is the
 // byte layout of the GDI DIB section it is copied into, so the readback needs no swizzle.
 static constexpr DXGI_FORMAT kPreviewRTFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
-// The eyes are written through kPreviewRTFormat, which passes their already-encoded bytes
-// straight through. Quad layers are blended through this view of the same resource instead,
-// so the hardware decodes the destination to linear, blends, and re-encodes. The resource
-// itself is TYPELESS to allow both views.
+// Composition is rendered through the sRGB view so linear formats are encoded and sRGB
+// formats are decoded before blending. The plain view remains useful for clear/readback
+// descriptions. The resource itself is TYPELESS to allow both views.
 static constexpr DXGI_FORMAT kPreviewRTFormatTypeless = DXGI_FORMAT_B8G8R8A8_TYPELESS;
 static constexpr DXGI_FORMAT kPreviewRTFormatSrgb = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 // Shader-visible SRVs, ringed so a descriptor is not rewritten while a command list that
@@ -361,11 +394,15 @@ static constexpr UINT kQuadConstantCount = 28;
 // calling thread on a fence until the GPU had finished it, so the readback could be
 // mapped in the same call. That thread is the app's render thread, inside xrEndFrame,
 // and the fence sits behind the app's whole frame (the cross-queue wait in
-// presentProjection puts it there) — so the wait did not cost the blit, it cost the
+// presentProjection puts it there) â€” so the wait did not cost the blit, it cost the
 // entire GPU frame, every frame, and CPU/GPU overlap stopped existing. Three slots let
 // the composite be submitted and picked up a frame or two later instead, with the CPU
 // never waiting on the GPU at all.
 static constexpr UINT kPreviewFrames = 3;
+// D3D11 forced captures can queue several consecutive frames before their EVENT queries
+// complete. Eight lazy staging slots preserve cadence without permanently reserving memory;
+// only slots the GPU actually needs are allocated.
+static constexpr UINT kD3D11ReadbackFrames = 8;
 // The desktop window can be maximized on a 4K display, but reading and scanning
 // a full 4K GDI surface on the application's xrEndFrame thread costs more than
 // an entire 90 Hz frame. Keep the mirror's internal surface at a diagnostic-
@@ -373,6 +410,24 @@ static constexpr UINT kPreviewFrames = 3;
 // Eye swapchain resolution is untouched; this affects only the desktop mirror.
 static constexpr UINT kPreviewMaxWidth = 1920;
 static constexpr UINT kPreviewMaxHeight = 1080;
+
+// D3D11 normally presents its composited swapchain backbuffer directly. During a forced
+// detector capture or MCP burst, three staging slots copy that final backbuffer before
+// Present and are mapped only after an EVENT query says the GPU finished. This preserves
+// normal D3D11 performance and avoids changing the temporal behavior being diagnosed.
+struct PreviewFrame11 {
+    ComPtr<ID3D11Texture2D> staging;
+    ComPtr<ID3D11Query> ready;
+    UINT width{0}, height{0};
+    DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+    bool pending{false};
+    uint64_t generation{0};
+    uint32_t frame{0};
+    bool hasProjection{false};
+    float headYaw{0}, headPitch{0}, headRoll{0};
+    float headX{0}, headY{0}, headZ{0};
+    mcp::ProjLogEntry proj{};
+};
 
 struct PreviewFrame12 {
     ComPtr<ID3D12CommandAllocator> alloc;
@@ -423,8 +478,13 @@ struct VulkanSession {
 };
 
 struct Session {
-    XrSession handle{(XrSession)1};
+    XrSession handle{XR_NULL_HANDLE};
     XrSessionState state{XR_SESSION_STATE_IDLE};
+    bool running{false};
+    bool exitRequested{false};
+    frame_state::Lifecycle frameLifecycle;
+    std::mutex frameMutex;
+    std::condition_variable frameCondition;
     ComPtr<ID3D11Device> d3d11Device;
     ComPtr<ID3D11DeviceContext> d3d11Context;
     // DX12 support
@@ -464,17 +524,24 @@ struct Session {
     // not the stereo render's - a 5120x1440 submission mirrored into a 1280x360 fit rect
     // is 30MB a frame off the GPU and a CPU-side resample either way without this.
     ComPtr<ID3D12RootSignature> previewRootSig;
-    ComPtr<ID3D12PipelineState> previewPSO;
+    // Projection layers use the same three OpenXR alpha modes as quad layers.
+    ComPtr<ID3D12PipelineState> previewPSO[3];
     // Quad layers are rasterised into the same RT through an sRGB view; one PSO per
     // rt::LayerBlend mode.
     ComPtr<ID3D12RootSignature> previewQuadRootSig;
     ComPtr<ID3D12PipelineState> previewQuadPSO[3];
     ComPtr<ID3D12DescriptorHeap> previewSrvHeap;
-    // Two RTVs over previewRT12: [0] plain, for the eye pass; [1] sRGB, for quad blending.
+    // Two RTVs over previewRT12: [0] plain for clears/copies; [1] sRGB for composition.
     ComPtr<ID3D12DescriptorHeap> previewRtvHeap;
     UINT previewRtvStride{0};
     UINT previewSrvStride{0};
     UINT previewSrvSlot{0};
+
+    // On-demand D3D11 diagnostic readback. Slots are consumed asynchronously on later
+    // xrEndFrame calls; pending slots are never overwritten or waited on.
+    PreviewFrame11 previewFrames11[kD3D11ReadbackFrames];
+    UINT previewReadback11Slot{0};
+    uint64_t previewReadback11Generation{0};
 
     // Blit resources
     ComPtr<ID3D11VertexShader> blitVS;
@@ -509,19 +576,22 @@ struct Session {
     // instead of being reallocated per frame.
     std::vector<uint8_t> glEyePixels[2];
     std::vector<uint8_t> glQuadPixels;
+    std::vector<uint8_t> glEyeReadback[2];
+    std::vector<uint8_t> glQuadReadback;
     ComPtr<ID3D11Texture2D> glEyeTex[2];
     ComPtr<ID3D11ShaderResourceView> glEyeSrv[2];
     UINT glEyeTexW{0}, glEyeTexH{0};
+    DXGI_FORMAT glEyeSrvFormat[2]{DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
 
     // Desktop preview window (no thread - handled on main thread)
     HWND hwnd{nullptr};
-    std::atomic<bool> isFocused{false};
+    std::atomic<bool> previewInputFocused{false};
     ComPtr<IDXGISwapChain1> previewSwapchain;
     UINT previewWidth{1920};
     UINT previewHeight{540};
     DXGI_FORMAT previewFormat{DXGI_FORMAT_UNKNOWN};  // Track format for matching
     // Current client area of the preview window (updated on WM_SIZE).
-    // 0 means "not yet known" — use an initial sensible size for the first frame.
+    // 0 means "not yet known" â€” use an initial sensible size for the first frame.
     std::atomic<UINT> clientWidth{0};
     std::atomic<UINT> clientHeight{0};
     std::mutex previewMutex;
@@ -530,7 +600,7 @@ struct Session {
 struct Swapchain {
     XrSwapchain handle{(XrSwapchain)1};
     DXGI_FORMAT format{DXGI_FORMAT_R8G8B8A8_UNORM};
-    uint32_t width{0}, height{0}, arraySize{2};
+    uint32_t width{0}, height{0}, arraySize{2}, faceCount{1};
     uint32_t mipCount{1};
     // Backend type and images
     enum class Backend { D3D11, D3D12, OpenGL } backend{Backend::D3D11};
@@ -548,15 +618,18 @@ struct Swapchain {
     std::vector<HANDLE> sharedHandles;
     std::vector<GLuint> imagesGL;                     // OpenGL path
     GLenum glInternalFormat{GL_RGBA8};                // OpenGL internal format
-    uint32_t nextIndex{0};
     uint32_t lastAcquired{UINT32_MAX};  // Initialize to invalid
     uint32_t lastReleased{UINT32_MAX};  // Initialize to invalid
+    uint64_t releaseSerial{0};          // increments on every successful release
+    uint64_t lastProjectionReleaseSerial{0}; // last serial submitted in a projection
     uint32_t imageCount{3};
+    swapchain_state::Lifecycle lifecycle;
 };
 
 static Instance g_instance{};
 static Session g_session{};
 static std::unordered_map<XrSwapchain, Swapchain> g_swapchains;
+static uintptr_t g_nextSwapchainHandle{2};
 
 // Head tracking state for mouse look and WASD movement
 static XrVector3f g_headPos = {0.0f, 1.7f, 0.0f};  // Start at standing eye height
@@ -568,7 +641,7 @@ static const bool g_automationOnly = []() {
     return GetEnvironmentVariableA("SIMXR_AUTOMATION_ONLY",value,sizeof(value))>0 && strcmp(value,"1")==0;
 }();
 static float g_headPitch = 0.0f;  // Rotation around X axis (up/down)
-static float g_headRoll = 0.0f;   // Rotation around forward axis (head tilt). MCP-only — no keyboard binding.
+static float g_headRoll = 0.0f;   // Rotation around forward axis (head tilt). MCP-only â€” no keyboard binding.
 
 // ---------- Diagnostic state: settable IPD and asymmetric per-eye FOV ----------
 //
@@ -640,7 +713,7 @@ static bool g_anaglyphPreview = false;
 
 // Pose sweep: auto-oscillate yaw / pitch / roll on a sine wave so the
 // app sees a continuous range of head orientations. Catches off-axis
-// quaternion bugs in seconds — anything mis-converted from OpenXR's
+// quaternion bugs in seconds â€” anything mis-converted from OpenXR's
 // right-handed frame to a left-handed game frame becomes a "world
 // wobbles wrong direction" symptom that's hard to miss.
 static bool  g_poseSweepEnabled  = false;
@@ -699,9 +772,14 @@ static ControllerState g_rightController = {
     {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f  // Velocity tracking
 };
 
-// Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
-struct ActionSpace { int hand; XrAction action; XrPosef offset; };
+struct ActionSpace {
+    XrAction action{XR_NULL_HANDLE};
+    XrPath subactionPath{XR_NULL_PATH};
+    int sourceMask{0}; // 0 = combined; otherwise one core action source
+    XrPosef poseInActionSpace{pose_math::Identity()};
+};
 static std::unordered_map<XrSpace, ActionSpace> g_controllerSpaces;
+static uintptr_t g_nextSpaceHandle{100};
 
 // Composition layers carry a pose plus the space it is in, and VIEW (head-locked)
 // against STAGE (world) changes where the layer belongs entirely.
@@ -713,28 +791,59 @@ static std::unordered_map<XrSpace, RefSpace> g_referenceSpaces;
 
 // Map XrPath to path string for controller detection
 static std::unordered_map<XrPath, std::string> g_pathStrings;
+static std::unordered_map<std::string, XrPath> g_stringPaths;
+static XrPath g_nextPath{1};
 
 // Interaction profiles the app suggested bindings for, in suggestion order, and
 // the one xrGetCurrentInteractionProfile reports back once action sets attach.
 static std::vector<XrPath> g_suggestedProfiles;
 static XrPath g_activeProfile = XR_NULL_PATH;
 
-// Map XrAction to action name for input mapping
-static std::unordered_map<XrAction, std::string> g_actionNames;
-
-// Map XrAction to which hand it's bound to (0=both/any, 1=left, 2=right)
-static std::unordered_map<XrAction, int> g_actionHand;
-struct ActionInfo { XrActionSet set; XrActionType type; };
-static std::unordered_map<XrAction, ActionInfo> g_actionInfo;
-static std::unordered_map<XrPath, std::vector<XrActionSuggestedBinding>> g_bindings;
-struct ActionSnapshot {
-    bool active = false, changed = false;
-    float value = 0;
-    XrVector2f vector{};
-    XrTime changedAt = 0;
+enum class ActionInput {
+    Unknown,
+    Trigger,
+    Grip,
+    Menu,
+    Primary,
+    Secondary,
+    Thumbstick,
+    Pose,
+    Haptic,
 };
-// Slots: aggregate, left, right. Queries remain stable until the next sync.
-static std::unordered_map<XrAction, std::array<ActionSnapshot, 3>> g_actionSnapshots;
+
+struct ActionBinding {
+    XrPath profile{XR_NULL_PATH};
+    XrPath sourcePath{XR_NULL_PATH};
+    std::string collisionKey;
+    int sourceMask{0};
+    ActionInput input{ActionInput::Unknown};
+};
+
+struct ActionSetRecord {
+    uint32_t priority{0};
+    bool everAttached{false};
+    std::string name;
+    std::string localizedName;
+    std::unordered_set<XrPath> declaredSubactionPaths;
+};
+
+struct ActionRecord {
+    XrActionSet actionSet{XR_NULL_HANDLE};
+    XrActionType type{XR_ACTION_TYPE_BOOLEAN_INPUT};
+    std::string name;
+    std::string localizedName;
+    int declaredSourceMask{interaction_query::kAllActionSources};
+    std::unordered_set<XrPath> declaredSubactionPaths;
+    std::vector<ActionBinding> bindings;
+    // Slot 0 is combined; slots 1-4 are left, right, head, and gamepad.
+    std::array<input::ActionSlot, 5> slots;
+};
+
+static std::unordered_map<XrActionSet, ActionSetRecord> g_actionSets;
+static std::unordered_set<XrActionSet> g_attachedActionSets;
+static std::unordered_map<XrActionSet, int> g_activeActionSetSources;
+static std::unordered_map<XrAction, ActionRecord> g_actions;
+static bool g_sessionActionSetsAttached{false};
 
 // Time tracking for velocity calculation
 static XrTime g_lastFrameTime = 0;
@@ -803,28 +912,16 @@ XrQuaternionf QuatFromYawPitchRoll(float yaw, float pitch, float roll) {
 }
 
 static inline XrQuaternionf MultiplyQuaternions(const XrQuaternionf& a, const XrQuaternionf& b) {
-    return XrQuaternionf{
-        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
-        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
-    };
+    return pose_math::Multiply(a, b);
 }
 
 // Rotate a vector by a quaternion (q * v * q^-1)
 static inline XrVector3f RotateVectorByQuaternion(const XrQuaternionf& q, const XrVector3f& v) {
-    const XrQuaternionf qv{ v.x, v.y, v.z, 0.0f };
-    const XrQuaternionf qinv{ -q.x, -q.y, -q.z, q.w };
-    const XrQuaternionf r = MultiplyQuaternions(MultiplyQuaternions(q, qv), qinv);
-    return XrVector3f{ r.x, r.y, r.z };
+    return pose_math::Rotate(q, v);
 }
 
 static inline XrPosef ComposePose(const XrPosef& parent, const XrPosef& child) {
-    const XrVector3f r = RotateVectorByQuaternion(parent.orientation, child.position);
-    XrPosef out;
-    out.orientation = MultiplyQuaternions(parent.orientation, child.orientation);
-    out.position = { parent.position.x + r.x, parent.position.y + r.y, parent.position.z + r.z };
-    return out;
+    return pose_math::Compose(parent, child);
 }
 
 static void GetEffectiveHeadAngles(float& yaw, float& pitch, float& roll) {
@@ -860,13 +957,8 @@ static XrFovf GetViewFov(uint32_t eye) {
 // BLEND_TEXTURE_SOURCE_ALPHA is set, and is premultiplied into the colour channels unless
 // UNPREMULTIPLIED_ALPHA says otherwise. CORRECT_CHROMATIC_ABERRATION is a legitimate no-op
 // here - the preview draws no distortion mesh to correct.
-enum class LayerBlend { Opaque, Premultiplied, Unpremultiplied };
-
-static inline LayerBlend BlendForLayerFlags(XrCompositionLayerFlags flags) {
-    if (!(flags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT)) return LayerBlend::Opaque;
-    return (flags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) ? LayerBlend::Unpremultiplied
-                                                                    : LayerBlend::Premultiplied;
-}
+using composition_render::LayerBlend;
+using composition_render::BlendForLayerFlags;
 
 // The preview swapchain is created UNORM because FLIP_DISCARD rejects _SRGB, so every render
 // target view over it has to opt back into the gamma encode by hand. Without this the GPU
@@ -1153,7 +1245,7 @@ static void ComputeContentDims(int srcW, int srcH,
     if (contentH <= 0) contentH = 1;
 }
 
-// Largest rect with (contentW : contentH) aspect that fits inside (dstW × dstH),
+// Largest rect with (contentW : contentH) aspect that fits inside (dstW Ã— dstH),
 // centered. Used to letterbox/pillarbox the stereo image into the window.
 struct FitRect { float x, y, w, h; };
 static FitRect ComputeFitRect(int contentW, int contentH, int dstW, int dstH) {
@@ -1162,13 +1254,13 @@ static FitRect ComputeFitRect(int contentW, int contentH, int dstW, int dstH) {
     double ca = (double)contentW / (double)contentH;
     double da = (double)dstW / (double)dstH;
     if (ca > da) {
-        // Content wider than dest → pillar (full width, shorter height)
+        // Content wider than dest â†’ pillar (full width, shorter height)
         r.w = (float)dstW;
         r.h = (float)((double)dstW / ca);
         r.x = 0.0f;
         r.y = ((float)dstH - r.h) * 0.5f;
     } else {
-        // Content taller than dest → letterbox (full height, narrower width)
+        // Content taller than dest â†’ letterbox (full height, narrower width)
         r.h = (float)dstH;
         r.w = (float)((double)dstH * ca);
         r.x = ((float)dstW - r.w) * 0.5f;
@@ -1206,33 +1298,22 @@ static void ComputeDisplayDims(int& contentW, int& contentH) {
 // clamped to the texture. Apps commonly render a 16:9 eye into a larger or square
 // swapchain and describe it with this rect, so everything downstream - the copy, the
 // preview size, the window aspect - has to work from it and not from the texture.
-// A zero or unusable rect means the whole image, and so does the "show full render" toggle.
-struct SubImageRect { uint32_t x, y, w, h; };
+// The "show full render" diagnostic may expand a non-empty subimage, but a legal empty
+// subimage remains empty and therefore contributes no pixels.
+using SubImageRect = composition_render::SubImageRect;
 static SubImageRect ResolveSubImageRect(const XrRect2Di& rect, uint32_t texW, uint32_t texH,
                                         const char* label) {
-    const SubImageRect full{ 0, 0, texW, texH };
-    if (ui::g_uiState.showFullRender) return full;
-    if (rect.extent.width <= 0 || rect.extent.height <= 0) return full;
-
-    int64_t x = rect.offset.x, y = rect.offset.y;
-    int64_t w = rect.extent.width, h = rect.extent.height;
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x >= (int64_t)texW || y >= (int64_t)texH) {
-        w = h = 0;
-    } else {
-        if (x + w > (int64_t)texW) w = (int64_t)texW - x;
-        if (y + h > (int64_t)texH) h = (int64_t)texH - y;
-    }
-    if (w <= 0 || h <= 0) {
+    const SubImageRect resolved = composition_render::ResolveSubImageRect(
+        rect, texW, texH, ui::g_uiState.showFullRender);
+    if ((rect.extent.width > 0 && rect.extent.height > 0) &&
+        (resolved.w == 0 || resolved.h == 0)) {
         static int badRect = 0;
         if (++badRect % 60 == 1) {
-            Logf("[SimXR] %s: unusable imageRect (offset=%d,%d extent=%dx%d, texture %ux%u); using full image",
+            Logf("[SimXR] %s: unusable imageRect (offset=%d,%d extent=%dx%d, texture %ux%u); skipping",
                  label, rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height, texW, texH);
         }
-        return full;
     }
-    return SubImageRect{ (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h };
+    return resolved;
 }
 
 static perf::ProjectionTimingTracker g_projectionTiming;
@@ -1393,23 +1474,6 @@ static void ResizeWindowForContent(HWND hWnd) {
                  SWP_NOMOVE | SWP_NOZORDER);
 }
 
-// View format for sampling a D3D12 swapchain image in the preview's scaling pass. The
-// resource can be typeless (XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT), and sRGB is dropped
-// on purpose: the pass filters the bytes in whatever encoding they are stored in and
-// writes them through unchanged, which is what the GDI stretch it replaced did.
-static DXGI_FORMAT PreviewSrvFormat(DXGI_FORMAT resourceFormat) {
-    switch (resourceFormat) {
-        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:     return DXGI_FORMAT_R8G8B8A8_UNORM;
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:     return DXGI_FORMAT_B8G8R8A8_UNORM;
-        case DXGI_FORMAT_R16G16B16A16_TYPELESS:   return DXGI_FORMAT_R16G16B16A16_FLOAT;
-        case DXGI_FORMAT_R32G32B32A32_TYPELESS:   return DXGI_FORMAT_R32G32B32A32_FLOAT;
-        case DXGI_FORMAT_R10G10B10A2_TYPELESS:    return DXGI_FORMAT_R10G10B10A2_UNORM;
-        default:                                  return resourceFormat;
-    }
-}
-
 // Block until the last composite handed to the preview queue has run. Leaves the pending
 // slots alone, so whatever is waiting to be painted still gets painted.
 static void WaitForPreviewFence(rt::Session& s) {
@@ -1465,7 +1529,7 @@ static void ResetD3D12PreviewResources(rt::Session& s) {
     // Device-owned, so they cannot outlive the session that created them.
     s.previewRtvHeap.Reset();
     s.previewSrvHeap.Reset();
-    s.previewPSO.Reset();
+    for (auto& pso : s.previewPSO) pso.Reset();
     s.previewRootSig.Reset();
     s.previewSrvSlot = 0;
     s.crossQueueFence.Reset();
@@ -1486,7 +1550,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
         case WM_CLOSE:
             if (rt::g_session.handle != XR_NULL_HANDLE) {
-                rt::PushState(rt::g_session.handle, XR_SESSION_STATE_EXITING);
+                bool running = false;
+                {
+                    std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+                    running = rt::g_session.running;
+                    if (running) rt::g_session.exitRequested = true;
+                }
+                if (running) rt::PushState(rt::g_session.handle, XR_SESSION_STATE_STOPPING);
             }
             Log("[SimXR] WndProc: WM_CLOSE received");
             DestroyWindow(hWnd);
@@ -1496,30 +1566,28 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // PostQuitMessage would tell the host application to exit.
             Log("[SimXR] WndProc: WM_DESTROY received");
             return 0;
-        case WM_ACTIVATE:
+        case WM_ACTIVATE: {
             if (rt::g_automationOnly) return 0;
-            if (LOWORD(wParam) != WA_INACTIVE) {
-                rt::g_session.isFocused = true;
-                Log("[SimXR] WndProc: WM_ACTIVATE -> focused");
-                // Push FOCUSED state if we were VISIBLE
-                if (rt::g_session.state == XR_SESSION_STATE_VISIBLE) {
-                    rt::PushState(rt::g_session.handle, XR_SESSION_STATE_FOCUSED);
-                }
-            } else {
-                rt::g_session.isFocused = false;
-                Log("[SimXR] WndProc: WM_ACTIVATE -> unfocused");
-                rt::g_mouseCapture = false;  // Release mouse capture when window loses focus
+            const bool active = LOWORD(wParam) != WA_INACTIVE;
+            const preview_focus::ActivationEffects effects =
+                preview_focus::OnActivation(active, rt::g_session.state);
+            rt::g_session.previewInputFocused = effects.inputFocused;
+            Log(active
+                ? "[SimXR] WndProc: preview input focused"
+                : "[SimXR] WndProc: preview input unfocused");
+            if (effects.releaseMouseCapture) {
+                rt::g_mouseCapture = false;
                 rt::g_panDrag = false;
                 ReleaseCapture();
-                // Push VISIBLE state if we were FOCUSED
-                if (rt::g_session.state == XR_SESSION_STATE_FOCUSED) {
-                    rt::PushState(rt::g_session.handle, XR_SESSION_STATE_VISIBLE);
-                }
+            }
+            if (effects.sessionState != rt::g_session.state) {
+                rt::PushState(rt::g_session.handle, effects.sessionState);
             }
             return 0;
+        }
         case WM_LBUTTONDOWN:
-            Logf("[SimXR] WM_LBUTTONDOWN: focused=%d", rt::g_session.isFocused.load());
-            if (rt::g_session.isFocused) {
+            Logf("[SimXR] WM_LBUTTONDOWN: focused=%d", rt::g_session.previewInputFocused.load());
+            if (rt::g_session.previewInputFocused) {
                 rt::g_mouseCapture = true;
                 SetCapture(hWnd);
                 GetCursorPos(&rt::g_lastMousePos);
@@ -1584,9 +1652,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             UINT edge = (UINT)wParam;
             // Decide which axis drives the constraint:
-            //   left/right edge → width is canonical
-            //   top/bottom edge → height is canonical
-            //   corner → use whichever side the user pulled "further" so
+            //   left/right edge â†’ width is canonical
+            //   top/bottom edge â†’ height is canonical
+            //   corner â†’ use whichever side the user pulled "further" so
             //            dragging outward grows the window in both axes
             bool widthCanonical;
             switch (edge) {
@@ -1655,7 +1723,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_SIZE: {
             // Capture the new client area. The render path picks this up next
             // frame and resizes the swapchain (D3D11/GL) or recomputes the
-            // letterbox destination (D3D12 GDI). Ignore minimize (0×0).
+            // letterbox destination (D3D12 GDI). Ignore minimize (0Ã—0).
             UINT cw = LOWORD(lParam);
             UINT ch = HIWORD(lParam);
             if (cw == 0 || ch == 0) return 0;
@@ -1830,21 +1898,21 @@ static void ensurePreview(Session& s) {
     if (s.hwnd) return;
     WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"OpenXR Simulator";
     RegisterClassW(&wc);
-    s.hwnd = CreateWindowExW(0, wc.lpszClassName, L"OpenXR Simulator", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    s.hwnd = CreateWindowExW(0, wc.lpszClassName, L"OpenXR Simulator", WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT, (int)s.previewWidth, (int)s.previewHeight, nullptr, nullptr, wc.hInstance, nullptr);
     Logf("[SimXR] ensurePreview: hwnd=%p size=%ux%u usesD3D12=%d", s.hwnd, s.previewWidth, s.previewHeight, s.usesD3D12);
 
     // Make sure window is shown and updated
     if (s.hwnd) {
-        ShowWindow(s.hwnd, SW_SHOW);
+        ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
         UpdateWindow(s.hwnd);
 
         // Check if window has focus
         if (GetForegroundWindow() == s.hwnd) {
-            s.isFocused = true;
+            s.previewInputFocused = true;
             Log("[SimXR] Window created with focus");
         } else {
-            s.isFocused = false;
+            s.previewInputFocused = false;
             Log("[SimXR] Window created without focus");
         }
     }
@@ -1912,6 +1980,10 @@ static PFN_vkGetInstanceProcAddr g_appGipa = nullptr;
 // VkInstance only resolves the four global entry points. xrCreateVulkanDeviceKHR is not
 // handed an instance, so remember the one the app created or asked about.
 static VkInstance g_lastInstance = VK_NULL_HANDLE;
+
+// Physical device last reported through xrGetVulkanGraphicsDeviceKHR/2KHR, against which
+// xrCreateVulkanDeviceKHR validates the app's chosen vulkanPhysicalDevice.
+static VkPhysicalDevice g_reportedPhysicalDevice = VK_NULL_HANDLE;
 
 static PFN_vkGetInstanceProcAddr Gipa() {
     if (g_appGipa) return g_appGipa;
@@ -1992,10 +2064,10 @@ static bool LoadDeviceLevel(VkDevice dev) {
 }
 
 // --- formats ------------------------------------------------------------------------------
-// The pairing is the DXGI format the shared resource is created with. Colour keeps the
-// typed sRGB/UNORM format (PreviewSrvFormat casts it to a UNORM view for the eye pass, so
-// the encoded bytes pass through unchanged); depth goes typeless, which is both what a DSV
-// wants and what BetterVR's own shared depth textures use.
+// The pairing is the DXGI format the shared resource is created with. Color keeps the
+// typed sRGB/UNORM format so composition samples it with the declared transfer function;
+// depth goes typeless, which is both what a DSV wants and what BetterVR's own shared depth
+// textures use.
 struct FormatPair { int64_t vk; DXGI_FORMAT typed; DXGI_FORMAT resource; bool depth; };
 
 static const FormatPair kFormats[] = {
@@ -2342,7 +2414,6 @@ static XrResult CreateSwapchainImages(rt::Session& s, rt::Swapchain& chain, cons
     chain.format = fp->typed;
     chain.backend = rt::Swapchain::Backend::D3D12;
     chain.mipCount = mips;
-    chain.imageCount = 3;
 
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2373,6 +2444,7 @@ static XrResult CreateSwapchainImages(rt::Session& s, rt::Swapchain& chain, cons
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_SAMPLED_BIT) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (ci.usageFlags & XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     if (!(usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) {
@@ -2543,6 +2615,16 @@ static void FrameSyncEnd(rt::Session& s) {
 
 // ----------------- OpenXR runtime exports -----------------
 
+static constexpr XrVersion kRuntimeApiVersion = XR_MAKE_VERSION(1, 0, 34);
+
+static bool IsValidInstance(XrInstance instance) {
+    return instance != XR_NULL_HANDLE && instance == rt::g_instance.handle;
+}
+
+static bool IsValidSystem(XrSystemId systemId) {
+    return systemId == (XrSystemId)1;
+}
+
 static XrResult XRAPI_PTR xrGetInstanceProcAddr_runtime(XrInstance, const char* name, PFN_xrVoidFunction* fn);
 
 extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInterface(const XrNegotiateLoaderInfo* loaderInfo,
@@ -2552,6 +2634,32 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInt
         Log("\n[SimXR] ========== OpenXR Simulator Runtime Starting ==========\n");
         if (!loaderInfo || !runtimeRequest) {
             Log("[SimXR] xrNegotiateLoaderRuntimeInterface: ERROR - null parameters");
+            return XR_ERROR_INITIALIZATION_FAILED;
+        }
+        if (loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO ||
+            loaderInfo->structVersion != XR_LOADER_INFO_STRUCT_VERSION ||
+            loaderInfo->structSize != sizeof(XrNegotiateLoaderInfo) ||
+            runtimeRequest->structType != XR_LOADER_INTERFACE_STRUCT_RUNTIME_REQUEST ||
+            runtimeRequest->structVersion != XR_RUNTIME_INFO_STRUCT_VERSION ||
+            runtimeRequest->structSize != sizeof(XrNegotiateRuntimeRequest) ||
+            loaderInfo->minInterfaceVersion > XR_CURRENT_LOADER_RUNTIME_VERSION ||
+            loaderInfo->maxInterfaceVersion < XR_CURRENT_LOADER_RUNTIME_VERSION) {
+            return XR_ERROR_INITIALIZATION_FAILED;
+        }
+        const uint32_t runtimeMajor = XR_VERSION_MAJOR(kRuntimeApiVersion);
+        const uint32_t runtimeMinor = XR_VERSION_MINOR(kRuntimeApiVersion);
+        const auto beforeRuntime = [&](XrVersion version) {
+            return XR_VERSION_MAJOR(version) < runtimeMajor ||
+                   (XR_VERSION_MAJOR(version) == runtimeMajor &&
+                    XR_VERSION_MINOR(version) <= runtimeMinor);
+        };
+        const auto afterRuntime = [&](XrVersion version) {
+            return XR_VERSION_MAJOR(version) > runtimeMajor ||
+                   (XR_VERSION_MAJOR(version) == runtimeMajor &&
+                    XR_VERSION_MINOR(version) >= runtimeMinor);
+        };
+        if (!beforeRuntime(loaderInfo->minApiVersion) ||
+            !afterRuntime(loaderInfo->maxApiVersion)) {
             return XR_ERROR_INITIALIZATION_FAILED;
         }
         
@@ -2567,16 +2675,17 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInt
         }
 
         Logf("[SimXR] xrNegotiateLoaderRuntimeInterface: loaderInfo=%p, runtimeRequest=%p", loaderInfo, runtimeRequest);
-        Logf("[SimXR]   Loader minInterfaceVersion=%u, maxInterfaceVersion=%u, minApiVersion=0x%X, maxApiVersion=0x%X",
+        Logf("[SimXR]   Loader minInterfaceVersion=%u, maxInterfaceVersion=%u, minApiVersion=0x%llX, maxApiVersion=0x%llX",
              loaderInfo->minInterfaceVersion, loaderInfo->maxInterfaceVersion,
-             loaderInfo->minApiVersion, loaderInfo->maxApiVersion);
+             (unsigned long long)loaderInfo->minApiVersion,
+             (unsigned long long)loaderInfo->maxApiVersion);
         
         runtimeRequest->runtimeInterfaceVersion = XR_CURRENT_LOADER_RUNTIME_VERSION;
         runtimeRequest->getInstanceProcAddr = xrGetInstanceProcAddr_runtime;
-        runtimeRequest->runtimeApiVersion = XR_CURRENT_API_VERSION;
+        runtimeRequest->runtimeApiVersion = kRuntimeApiVersion;
         
-        Logf("[SimXR] xrNegotiateLoaderRuntimeInterface: SUCCESS - runtimeApiVersion=0x%X (%u)", 
-             runtimeRequest->runtimeApiVersion, runtimeRequest->runtimeApiVersion);
+        Logf("[SimXR] xrNegotiateLoaderRuntimeInterface: SUCCESS - runtimeApiVersion=0x%llX",
+             (unsigned long long)runtimeRequest->runtimeApiVersion);
         return XR_SUCCESS;
     } catch (...) {
         Log("[SimXR] xrNegotiateLoaderRuntimeInterface: EXCEPTION caught!");
@@ -2589,11 +2698,11 @@ static XrResult XRAPI_PTR xrGetD3D12GraphicsRequirementsKHR_runtime(
     XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsD3D12KHR* req) {
     Logf("[SimXR] xrGetD3D12GraphicsRequirementsKHR called: instance=%p, systemId=%llu, req=%p",
          instance, (unsigned long long)systemId, req);
-    if (!req) return XR_ERROR_VALIDATION_FAILURE;
-
-    memset(req, 0, sizeof(*req));
-    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR;
-    req->next = nullptr;
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!req || req->type != XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
 
     Microsoft::WRL::ComPtr<IDXGIFactory1> f;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(f.GetAddressOf()));
@@ -2607,7 +2716,9 @@ static XrResult XRAPI_PTR xrGetD3D12GraphicsRequirementsKHR_runtime(
         req->adapterLuid = d.AdapterLuid;
         break;
     }
+    rt::g_instance.d3d12RequirementsLuid = req->adapterLuid;
     req->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+    rt::g_instance.d3d12RequirementsCalled = true;
     Log("[SimXR] xrGetD3D12GraphicsRequirementsKHR: SUCCESS");
     return XR_SUCCESS;
 }
@@ -2616,7 +2727,9 @@ static XrResult XRAPI_PTR xrGetD3D11GraphicsRequirementsKHR_runtime(
     XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsD3D11KHR* req) {
     Logf("[SimXR] xrGetD3D11GraphicsRequirementsKHR called: instance=%p, systemId=%llu, req=%p",
          instance, (unsigned long long)systemId, req);
-    if (!req) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!req || req->type != XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR) {
         Log("[SimXR] xrGetD3D11GraphicsRequirementsKHR: ERROR - null req");
         return XR_ERROR_VALIDATION_FAILURE;
     }
@@ -2628,11 +2741,6 @@ static XrResult XRAPI_PTR xrGetD3D11GraphicsRequirementsKHR_runtime(
     if (req->type != 0) {
         Logf("[SimXR] xrGetD3D11GraphicsRequirementsKHR: req->type already set to %d", req->type);
     }
-    
-    // Zero initialize the entire structure first
-    memset(req, 0, sizeof(XrGraphicsRequirementsD3D11KHR));
-    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR;
-    req->next = nullptr;
     
     Microsoft::WRL::ComPtr<IDXGIFactory1> f;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(f.GetAddressOf()));
@@ -2684,6 +2792,7 @@ static XrResult XRAPI_PTR xrGetD3D11GraphicsRequirementsKHR_runtime(
         // Save this LUID for later validation
         rt::g_adapterLuid = bestDesc.AdapterLuid;
         rt::g_adapterLuidSet = true;
+        rt::g_instance.d3d11RequirementsLuid = bestDesc.AdapterLuid;
         
         Logf("[SimXR] xrGetD3D11GraphicsRequirementsKHR: Returning:");
         Logf("[SimXR]   type = %d (expected %d)", req->type, XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR);
@@ -2695,6 +2804,7 @@ static XrResult XRAPI_PTR xrGetD3D11GraphicsRequirementsKHR_runtime(
         Logf("[SimXR]   minFeatureLevel = 0x%X (D3D_FEATURE_LEVEL_11_0 = 0x%X)", 
              req->minFeatureLevel, D3D_FEATURE_LEVEL_11_0);
         
+        rt::g_instance.d3d11RequirementsCalled = true;
         Log("[SimXR] xrGetD3D11GraphicsRequirementsKHR: SUCCESS - Returning XR_SUCCESS");
         return XR_SUCCESS;
     }
@@ -2709,15 +2819,12 @@ static XrResult XRAPI_PTR xrGetOpenGLGraphicsRequirementsKHR_runtime(
     XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsOpenGLKHR* req) {
     Logf("[SimXR] xrGetOpenGLGraphicsRequirementsKHR called: instance=%p, systemId=%llu, req=%p",
          instance, (unsigned long long)systemId, req);
-    if (!req) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!req || req->type != XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR) {
         Log("[SimXR] xrGetOpenGLGraphicsRequirementsKHR: ERROR - null req");
         return XR_ERROR_VALIDATION_FAILURE;
     }
-
-    // Zero initialize the structure
-    memset(req, 0, sizeof(XrGraphicsRequirementsOpenGLKHR));
-    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR;
-    req->next = nullptr;
 
     // Minimum OpenGL version: 4.0.0 (good compatibility)
     // Maximum: 4.6.0 (latest)
@@ -2732,6 +2839,7 @@ static XrResult XRAPI_PTR xrGetOpenGLGraphicsRequirementsKHR_runtime(
          XR_VERSION_MINOR(req->maxApiVersionSupported),
          XR_VERSION_PATCH(req->maxApiVersionSupported));
 
+    rt::g_instance.openglRequirementsCalled = true;
     Log("[SimXR] xrGetOpenGLGraphicsRequirementsKHR: SUCCESS");
     return XR_SUCCESS;
 }
@@ -2741,21 +2849,25 @@ static XrResult XRAPI_PTR xrGetOpenGLGraphicsRequirementsKHR_runtime(
 // XrGraphicsRequirementsVulkan2KHR is a typedef of the v1 struct, so one implementation
 // serves both extensions.
 static XrResult XRAPI_PTR xrGetVulkanGraphicsRequirementsKHR_runtime(
-    XrInstance, XrSystemId, XrGraphicsRequirementsVulkanKHR* req) {
-    if (!req) return XR_ERROR_VALIDATION_FAILURE;
-    memset(req, 0, sizeof(*req));
-    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
+    XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsVulkanKHR* req) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!req || req->type != XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
     req->minApiVersionSupported = XR_MAKE_VERSION(1, 0, 0);
     req->maxApiVersionSupported = XR_MAKE_VERSION(1, 4, 0);
+    // Serves both XR_KHR_vulkan_enable and XR_KHR_vulkan_enable2.
+    rt::g_instance.vulkanRequirementsCalled = true;
     Log("[SimXR] xrGetVulkanGraphicsRequirementsKHR: Vulkan 1.0 - 1.4");
     return XR_SUCCESS;
 }
 
 static XrResult CopyExtensionString(const std::string& s, uint32_t capacity, uint32_t* countOutput, char* buffer) {
     const uint32_t needed = (uint32_t)s.size() + 1;
-    if (countOutput) *countOutput = needed;
-    if (capacity == 0) return XR_SUCCESS;
-    if (capacity < needed || !buffer) return XR_ERROR_SIZE_INSUFFICIENT;
+    const XrResult validation =
+        api_validation::ValidateEnumeration(capacity, countOutput, buffer, needed);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
     memcpy(buffer, s.c_str(), needed);
     return XR_SUCCESS;
 }
@@ -2776,13 +2888,17 @@ static XrResult XRAPI_PTR xrGetVulkanDeviceExtensionsKHR_runtime(
 
 static XrResult XRAPI_PTR xrGetVulkanGraphicsDeviceKHR_runtime(
     XrInstance, XrSystemId, VkInstance vkInstance, VkPhysicalDevice* out) {
-    return vkrt::PickPhysicalDevice(vkInstance, out);
+    const XrResult result = vkrt::PickPhysicalDevice(vkInstance, out);
+    if (XR_SUCCEEDED(result)) vkrt::g_reportedPhysicalDevice = *out;
+    return result;
 }
 
 static XrResult XRAPI_PTR xrGetVulkanGraphicsDevice2KHR_runtime(
     XrInstance, const XrVulkanGraphicsDeviceGetInfoKHR* getInfo, VkPhysicalDevice* out) {
     if (!getInfo) return XR_ERROR_VALIDATION_FAILURE;
-    return vkrt::PickPhysicalDevice(getInfo->vulkanInstance, out);
+    const XrResult result = vkrt::PickPhysicalDevice(getInfo->vulkanInstance, out);
+    if (XR_SUCCEEDED(result)) vkrt::g_reportedPhysicalDevice = *out;
+    return result;
 }
 
 // Thin passthrough: the app's own vkCreateInstance runs, with the interop extensions the
@@ -2828,7 +2944,14 @@ static XrResult XRAPI_PTR xrCreateVulkanDeviceKHR_runtime(
     XrInstance, const XrVulkanDeviceCreateInfoKHR* createInfo, VkDevice* vulkanDevice, VkResult* vulkanResult) {
     if (!createInfo || !createInfo->pfnGetInstanceProcAddr || !createInfo->vulkanCreateInfo ||
         !createInfo->vulkanPhysicalDevice || !vulkanDevice || !vulkanResult) return XR_ERROR_VALIDATION_FAILURE;
-
+    // khr_vulkan_enable2.adoc: a physical device other than the one reported through
+    // xrGetVulkanGraphicsDeviceKHR is invalid. Only enforced once that function has
+    // actually been called, so apps that pick their own device still work.
+    if (vkrt::g_reportedPhysicalDevice != VK_NULL_HANDLE &&
+        createInfo->vulkanPhysicalDevice != vkrt::g_reportedPhysicalDevice) {
+        Log("[SimXR] xrCreateVulkanDeviceKHR: ERROR - vulkanPhysicalDevice does not match xrGetVulkanGraphicsDeviceKHR");
+        return XR_ERROR_HANDLE_INVALID;
+    }
     vkrt::g_appGipa = createInfo->pfnGetInstanceProcAddr;
     // Both are instance-level, and the only VkInstance in reach is the one the app made
     // through xrCreateVulkanInstanceKHR or named in xrGetVulkanGraphicsDevice2KHR.
@@ -2865,15 +2988,23 @@ static XrResult XRAPI_PTR xrCreateVulkanDeviceKHR_runtime(
 
 // --- Minimal implementations ---
 
-static const char* kSupportedExtensions[] = {
-    XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
-    XR_KHR_D3D12_ENABLE_EXTENSION_NAME,
-    XR_KHR_OPENGL_ENABLE_EXTENSION_NAME,  // OpenGL support
-    XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
-    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
-    XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
-    XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,  // UEVR uses this for UI layers
-    "XR_KHR_win32_convert_performance_counter_time"    // Unity often requires this
+struct SupportedExtension {
+    const char* name;
+    uint32_t version;
+};
+
+static const SupportedExtension kSupportedExtensions[] = {
+    {XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_KHR_D3D11_enable_SPEC_VERSION},
+    {XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_KHR_D3D12_enable_SPEC_VERSION},
+    {XR_KHR_OPENGL_ENABLE_EXTENSION_NAME, XR_KHR_opengl_enable_SPEC_VERSION},
+    {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_vulkan_enable_SPEC_VERSION},
+    {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_KHR_vulkan_enable2_SPEC_VERSION},
+    {XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
+     XR_KHR_composition_layer_depth_SPEC_VERSION},
+    {XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,
+     XR_KHR_composition_layer_cylinder_SPEC_VERSION},
+    {XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
+     XR_KHR_win32_convert_performance_counter_time_SPEC_VERSION},
 };
 
 static XrResult XRAPI_PTR xrEnumerateApiLayerProperties_runtime(uint32_t propertyCapacityInput,
@@ -2881,38 +3012,53 @@ static XrResult XRAPI_PTR xrEnumerateApiLayerProperties_runtime(uint32_t propert
                                                                 XrApiLayerProperties* properties) {
     Log("[SimXR] xrEnumerateApiLayerProperties called");
     // Runtime doesn't provide API layers, only extensions
-    if (propertyCountOutput) *propertyCountOutput = 0;
-    return XR_SUCCESS;
+    return api_validation::ValidateEnumeration(
+        propertyCapacityInput, propertyCountOutput, properties, 0);
 }
 static XrResult XRAPI_PTR xrEnumerateInstanceExtensionProperties_runtime(const char* layerName, uint32_t propertyCapacityInput,
                                                                          uint32_t* propertyCountOutput,
                                                                          XrExtensionProperties* properties) {
-    if (layerName && layerName[0] != '\0') return XR_ERROR_LAYER_INVALID;
+    if (layerName) return XR_ERROR_API_LAYER_NOT_PRESENT;
     const uint32_t count = (uint32_t)(sizeof(kSupportedExtensions)/sizeof(kSupportedExtensions[0]));
-    if (propertyCountOutput) *propertyCountOutput = count;
-    if (properties && propertyCapacityInput) {
-        for (uint32_t i = 0; i < propertyCapacityInput && i < count; ++i) {
-            properties[i].type = XR_TYPE_EXTENSION_PROPERTIES;
-            properties[i].next = nullptr;
-            std::strncpy(properties[i].extensionName, kSupportedExtensions[i], XR_MAX_EXTENSION_NAME_SIZE - 1);
-            properties[i].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
-            properties[i].extensionVersion = 1;
-            Logf("[SimXR] ext[%u]=%s", i, properties[i].extensionName);
-        }
+    const XrResult validation = api_validation::ValidateEnumeration(
+        propertyCapacityInput, propertyCountOutput, properties, count);
+    if (XR_FAILED(validation) || propertyCapacityInput == 0) return validation;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (properties[i].type != XR_TYPE_EXTENSION_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        std::strncpy(properties[i].extensionName, kSupportedExtensions[i].name,
+                     XR_MAX_EXTENSION_NAME_SIZE - 1);
+        properties[i].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
+        properties[i].extensionVersion = kSupportedExtensions[i].version;
+        Logf("[SimXR] ext[%u]=%s", i, properties[i].extensionName);
     }
     return XR_SUCCESS;
 }
 
+static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession session);
+static void resetD3D11PreviewReadbacks(rt::Session& session);
+
 static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* createInfo, XrInstance* instance) {
-    if (!createInfo || !instance) return XR_ERROR_VALIDATION_FAILURE;
-    // applicationName may not be null-terminated
+    if (!createInfo || !instance || createInfo->type != XR_TYPE_INSTANCE_CREATE_INFO ||
+        createInfo->createFlags != 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (rt::g_instance.handle != XR_NULL_HANDLE) return XR_ERROR_LIMIT_REACHED;
+    const XrResult versionValidation = api_validation::ValidateApiVersion(
+        createInfo->applicationInfo.apiVersion, kRuntimeApiVersion);
+    if (XR_FAILED(versionValidation)) return versionValidation;
+    if ((createInfo->enabledApiLayerCount && !createInfo->enabledApiLayerNames) ||
+        (createInfo->enabledExtensionCount && !createInfo->enabledExtensionNames)) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (createInfo->enabledApiLayerCount != 0) return XR_ERROR_API_LAYER_NOT_PRESENT;
+
     char appName[XR_MAX_APPLICATION_NAME_SIZE + 1] = {0};
     memcpy(appName, createInfo->applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE);
     Logf("[SimXR] xrCreateInstance: app=%s version=%u", 
          appName,
          createInfo->applicationInfo.applicationVersion);
-    rt::g_instance = {};
-    rt::g_instance.enabledExtensions.clear();
 
     // Restore the saved UI settings here rather than at window creation: apps ask
     // for view configurations, whose panel resolution and FOV both come from the
@@ -2932,22 +3078,38 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
 
     // Validate that all requested extensions are supported
     const uint32_t supportedCount = (uint32_t)(sizeof(kSupportedExtensions)/sizeof(kSupportedExtensions[0]));
+    std::vector<std::string> enabledExtensions;
+    enabledExtensions.reserve(createInfo->enabledExtensionCount);
     for (uint32_t i = 0; i < createInfo->enabledExtensionCount; ++i) {
+        const char* requested = createInfo->enabledExtensionNames[i];
+        if (!requested || strnlen(requested, XR_MAX_EXTENSION_NAME_SIZE) == XR_MAX_EXTENSION_NAME_SIZE) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
         bool supported = false;
         for (uint32_t j = 0; j < supportedCount; ++j) {
-            if (strcmp(createInfo->enabledExtensionNames[i], kSupportedExtensions[j]) == 0) {
+            if (strcmp(requested, kSupportedExtensions[j].name) == 0) {
                 supported = true;
                 break;
             }
         }
         if (!supported) {
-            Logf("[SimXR] xrCreateInstance: ERROR - Unsupported extension %s", createInfo->enabledExtensionNames[i]);
+            Logf("[SimXR] xrCreateInstance: ERROR - Unsupported extension %s", requested);
             return XR_ERROR_EXTENSION_NOT_PRESENT;
         }
-        rt::g_instance.enabledExtensions.emplace_back(createInfo->enabledExtensionNames[i]);
-        Logf("[SimXR]   enabledExt[%u]=%s", i, createInfo->enabledExtensionNames[i]);
+        if (std::find(enabledExtensions.begin(), enabledExtensions.end(), requested) !=
+            enabledExtensions.end()) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+        enabledExtensions.emplace_back(requested);
+        Logf("[SimXR]   enabledExt[%u]=%s", i, requested);
     }
-    rt::g_instance.handle = (XrInstance)1;  // Set a valid handle
+    rt::g_instance.enabledExtensions = std::move(enabledExtensions);
+    // A new instance starts with no requirements calls on record.
+    rt::g_instance.d3d11RequirementsCalled = false;
+    rt::g_instance.d3d12RequirementsCalled = false;
+    rt::g_instance.openglRequirementsCalled = false;
+    rt::g_instance.vulkanRequirementsCalled = false;
+    rt::g_instance.handle = (XrInstance)1;
     *instance = rt::g_instance.handle;
     Log("[SimXR] xrCreateInstance: SUCCESS");
     return XR_SUCCESS;
@@ -2956,14 +3118,27 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
 static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
     Logf("[SimXR] xrDestroyInstance called: instance=%p", instance);
 
+    if (instance == XR_NULL_HANDLE || instance != rt::g_instance.handle) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+
     // Clear the global instance
-    if (instance == rt::g_instance.handle) {
+    {
         Log("[SimXR] xrDestroyInstance: Clearing global instance");
+        if (rt::g_session.handle != XR_NULL_HANDLE) {
+            xrDestroySession_runtime(rt::g_session.handle);
+        }
         rt::g_instance = {};
-        rt::g_bindings.clear(); rt::g_actionInfo.clear(); rt::g_actionSnapshots.clear();
-        rt::g_actionNames.clear(); rt::g_actionHand.clear(); rt::g_controllerSpaces.clear();
-        rt::g_referenceSpaces.clear(); rt::g_suggestedProfiles.clear(); rt::g_pathStrings.clear();
-        rt::g_activeProfile=XR_NULL_PATH;
+        rt::g_actionSets.clear();
+        rt::g_attachedActionSets.clear();
+        rt::g_activeActionSetSources.clear();
+        rt::g_actions.clear();
+        rt::g_sessionActionSetsAttached = false;
+        rt::g_suggestedProfiles.clear();
+        rt::g_activeProfile = XR_NULL_PATH;
+        rt::g_pathStrings.clear();
+        rt::g_stringPaths.clear();
+        rt::g_nextPath = 1;
 
         // MUST destroy the window before DLL unloads!
         // The OpenXR loader may unload our DLL after this call.
@@ -2996,19 +3171,19 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetInstanceProperties_runtime(XrInstance, XrInstanceProperties* props) {
-    if (!props) return XR_ERROR_VALIDATION_FAILURE;
-    props->type = XR_TYPE_INSTANCE_PROPERTIES;
-    props->next = nullptr;
-    props->runtimeVersion = XR_MAKE_VERSION(1, 0, 27);
+static XrResult XRAPI_PTR xrGetInstanceProperties_runtime(XrInstance instance, XrInstanceProperties* props) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!props || props->type != XR_TYPE_INSTANCE_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
+    props->runtimeVersion = kRuntimeApiVersion;
     strncpy(props->runtimeName, "OpenXR Simulator Runtime", XR_MAX_RUNTIME_NAME_SIZE - 1);
     props->runtimeName[XR_MAX_RUNTIME_NAME_SIZE - 1] = '\0';
     Log("[SimXR] xrGetInstanceProperties: returning OpenXR Simulator Runtime");
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetSystem_runtime(XrInstance, const XrSystemGetInfo* info, XrSystemId* systemId) {
-    if (!info || !systemId) return XR_ERROR_VALIDATION_FAILURE;
+static XrResult XRAPI_PTR xrGetSystem_runtime(XrInstance instance, const XrSystemGetInfo* info, XrSystemId* systemId) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_SYSTEM_GET_INFO || !systemId) return XR_ERROR_VALIDATION_FAILURE;
     Logf("[SimXR] xrGetSystem: formFactor=%d", info->formFactor);
     if (info->formFactor != XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY) {
         Log("[SimXR] xrGetSystem: ERROR - form factor not HMD");
@@ -3019,10 +3194,10 @@ static XrResult XRAPI_PTR xrGetSystem_runtime(XrInstance, const XrSystemGetInfo*
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetSystemProperties_runtime(XrInstance, XrSystemId, XrSystemProperties* props) {
-    if (!props) return XR_ERROR_VALIDATION_FAILURE;
-    props->type = XR_TYPE_SYSTEM_PROPERTIES;
-    props->next = nullptr;
+static XrResult XRAPI_PTR xrGetSystemProperties_runtime(XrInstance instance, XrSystemId systemId, XrSystemProperties* props) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!props || props->type != XR_TYPE_SYSTEM_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
     strncpy(props->systemName, "OpenXR Simulator", XR_MAX_SYSTEM_NAME_SIZE - 1);
     props->systemName[XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
     props->systemId = 1;
@@ -3036,41 +3211,56 @@ static XrResult XRAPI_PTR xrGetSystemProperties_runtime(XrInstance, XrSystemId, 
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrEnumerateViewConfigurations_runtime(XrInstance, XrSystemId, uint32_t capacity, uint32_t* count, XrViewConfigurationType* types) {
+static XrResult XRAPI_PTR xrEnumerateViewConfigurations_runtime(XrInstance instance, XrSystemId systemId, uint32_t capacity, uint32_t* count, XrViewConfigurationType* types) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
     Logf("[SimXR] xrEnumerateViewConfigurations called: capacity=%u", capacity);
-    if (count) *count = 1;
-    if (capacity >= 1 && types) {
-        types[0] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-        Log("[SimXR] xrEnumerateViewConfigurations: Returning PRIMARY_STEREO");
-    }
+    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, types, 1);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
+    types[0] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    Log("[SimXR] xrEnumerateViewConfigurations: Returning PRIMARY_STEREO");
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance, XrSystemId, XrViewConfigurationType viewType, uint32_t capacity, uint32_t* count, XrViewConfigurationView* views) {
+static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance instance, XrSystemId systemId, XrViewConfigurationType viewType, uint32_t capacity, uint32_t* count, XrViewConfigurationView* views) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
     Logf("[SimXR] xrEnumerateViewConfigurationViews called: viewType=%d, capacity=%u", (int)viewType, capacity);
-    if (count) *count = 2;
-    if (capacity >= 2 && views) {
-        for (uint32_t i = 0; i < 2; ++i) {
-            views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
-            views[i].next = nullptr;
-            uint32_t renderW = 0, renderH = 0;
-            ui::GetRenderResolution(renderW, renderH);
-            views[i].recommendedImageRectWidth = renderW;
-            views[i].recommendedImageRectHeight = renderH;
-            views[i].recommendedSwapchainSampleCount = 1;
-            views[i].maxImageRectWidth = 4096; views[i].maxImageRectHeight = 4096; views[i].maxSwapchainSampleCount = 1;
-        }
-        Logf("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (%ux%u recommended; headset geometry %s)",
-             views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight,
-             ui::HeadsetProfileName(ui::g_uiState.headsetProfile));
+    if (viewType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     }
+    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, views, 2);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (views[i].type != XR_TYPE_VIEW_CONFIGURATION_VIEW) return XR_ERROR_VALIDATION_FAILURE;
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        uint32_t renderW = 0, renderH = 0;
+        ui::GetRenderResolution(renderW, renderH);
+        views[i].recommendedImageRectWidth = renderW;
+        views[i].recommendedImageRectHeight = renderH;
+        views[i].recommendedSwapchainSampleCount = 1;
+        views[i].maxImageRectWidth = 4096;
+        views[i].maxImageRectHeight = 4096;
+        views[i].maxSwapchainSampleCount = 1;
+    }
+    Logf("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (%ux%u recommended; headset geometry %s)",
+         views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight,
+         ui::HeadsetProfileName(ui::g_uiState.headsetProfile));
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrEnumerateEnvironmentBlendModes_runtime(
-    XrInstance, XrSystemId, XrViewConfigurationType, uint32_t capacity, uint32_t* count, XrEnvironmentBlendMode* modes) {
-    if (count) *count = 1;
-    if (capacity >= 1 && modes) modes[0] = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    XrInstance instance, XrSystemId systemId, XrViewConfigurationType viewType, uint32_t capacity,
+    uint32_t* count, XrEnvironmentBlendMode* modes) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (viewType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    }
+    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, modes, 1);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
+    modes[0] = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     return XR_SUCCESS;
 }
 
@@ -3083,34 +3273,50 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
     Log("[SimXR] ============================================");
     Logf("[SimXR] xrCreateSession called (call #%d, instance=%llu)", sessionCount, (unsigned long long)instance);
     Log("[SimXR] ============================================");
-    if (!info || !session) return XR_ERROR_VALIDATION_FAILURE;
-    ResetUiAutomation();
-    
-    // Check if we already have an active session
-    if (rt::g_session.handle != XR_NULL_HANDLE && rt::g_session.state != XR_SESSION_STATE_IDLE) {
-        Logf("[SimXR] xrCreateSession: ERROR - Session already exists (handle=%llu, state=%d)",
-            (unsigned long long)rt::g_session.handle, rt::g_session.state);
-        // For now, reset the existing session to allow the new one
-        // Reset session manually
-        rt::g_session.handle = XR_NULL_HANDLE;
-        rt::g_session.state = XR_SESSION_STATE_IDLE;
-        rt::g_session.d3d11Device.Reset();
-        rt::g_session.d3d11Context.Reset();
-        rt::g_session.previewSwapchain.Reset();
-        rt::g_session.usesD3D12 = false;
-        rt::g_session.d3d12Device.Reset();
-        rt::g_session.d3d12Queue.Reset();
-        rt::ResetD3D12PreviewResources(rt::g_session);
-        rt::g_session.previewWidth = 1920;
-        rt::g_session.previewHeight = 540;
-        rt::g_session.isFocused = false;
+    if (instance == XR_NULL_HANDLE || instance != rt::g_instance.handle) {
+        return XR_ERROR_HANDLE_INVALID;
     }
-    if (rt::g_session.usesVulkan) vkrt::ShutdownSession(rt::g_session);
+    if (!info || !session || info->type != XR_TYPE_SESSION_CREATE_INFO ||
+        info->createFlags != 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (info->systemId != 1) return XR_ERROR_SYSTEM_INVALID;
+    if (rt::g_session.handle != XR_NULL_HANDLE) {
+        Logf("[SimXR] xrCreateSession: session limit reached (handle=%llu)",
+             (unsigned long long)rt::g_session.handle);
+        return XR_ERROR_LIMIT_REACHED;
+    }
+
+    ResetUiAutomation();
+    const auto extensionEnabled = [](const char* name) {
+        return std::find(rt::g_instance.enabledExtensions.begin(),
+                         rt::g_instance.enabledExtensions.end(), name) !=
+               rt::g_instance.enabledExtensions.end();
+    };
+    static uintptr_t nextSessionHandle = 0x1001;
+    const XrSession newHandle = (XrSession)nextSessionHandle++;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        rt::g_session.running = false;
+        rt::g_session.exitRequested = false;
+        rt::g_session.frameLifecycle.Reset();
+    }
+    rt::g_session.frameCondition.notify_all();
     // Accept D3D11 and D3D12
     const XrBaseInStructure* entry = reinterpret_cast<const XrBaseInStructure*>(info->next);
     while (entry) {
         if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
             const auto* b = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(entry);
+            if (!extensionEnabled(XR_KHR_D3D11_ENABLE_EXTENSION_NAME)) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+            if (!b->device) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+            if (!rt::g_instance.d3d11RequirementsCalled) {
+                // Spec says to fail with XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING
+                // here, but some engines skip the requirements call; warn instead so
+                // those apps keep working.
+                Log("[SimXR] xrCreateSession: WARNING - app did not call xrGetD3D11GraphicsRequirementsKHR first; continuing anyway");
+            }
             
             // Log the device details
             ComPtr<IDXGIDevice> dxgiDevice;
@@ -3122,11 +3328,19 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
                     Logf("[SimXR] xrCreateSession: App D3D11 device LUID=%llu/%llu", 
                          (unsigned long long)desc.AdapterLuid.HighPart,
                          (unsigned long long)desc.AdapterLuid.LowPart);
+                    const LUID& req = rt::g_instance.d3d11RequirementsLuid;
+                    // Only enforce when the requirements call actually happened; a
+                    // zero req LUID here would otherwise defeat the compat warning above.
+                    if (rt::g_instance.d3d11RequirementsCalled &&
+                        (desc.AdapterLuid.HighPart != req.HighPart ||
+                         desc.AdapterLuid.LowPart != req.LowPart)) {
+                        Log("[SimXR] xrCreateSession: ERROR - app device is not on the adapter named by xrGetD3D11GraphicsRequirementsKHR");
+                        return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+                    }
                 }
             }
             
-            // Use sessionCount to generate unique handles
-            rt::g_session.handle = (XrSession)(uintptr_t)(0x1000 + sessionCount);
+            rt::g_session.handle = newHandle;
             rt::g_session.d3d11Device = b->device;
             rt::g_session.usesD3D12 = false;
             rt::g_session.d3d12Device.Reset();
@@ -3137,26 +3351,55 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             // Window will be created lazily on first frame
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (D3D11, handle=%llu)", (unsigned long long)rt::g_session.handle);
+            // Spec (session.adoc): the first state-changed event for a new session
+            // must be one reporting XR_SESSION_STATE_IDLE.
+            rt::PushState(rt::g_session.handle, XR_SESSION_STATE_IDLE);
             // Push READY event into queue
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
         } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
             const auto* b12 = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(entry);
+            if (!extensionEnabled(XR_KHR_D3D12_ENABLE_EXTENSION_NAME)) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+            if (!b12->device || !b12->queue) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+            if (!rt::g_instance.d3d12RequirementsCalled) {
+                Log("[SimXR] xrCreateSession: WARNING - app did not call xrGetD3D12GraphicsRequirementsKHR first; continuing anyway");
+            }
+            {
+                const LUID deviceLuid = b12->device->GetAdapterLuid();
+                const LUID& req = rt::g_instance.d3d12RequirementsLuid;
+                if (rt::g_instance.d3d12RequirementsCalled &&
+                    (deviceLuid.HighPart != req.HighPart || deviceLuid.LowPart != req.LowPart)) {
+                    Log("[SimXR] xrCreateSession: ERROR - app device is not on the adapter named by xrGetD3D12GraphicsRequirementsKHR");
+                    return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+                }
+            }
             rt::g_session.usesD3D12 = true;
             rt::g_session.d3d12Device = b12->device;
             rt::g_session.d3d12Queue = b12->queue;
             rt::g_session.d3d11Device.Reset();
             rt::g_session.d3d11Context.Reset();
             rt::g_session.previewSwapchain.Reset();
-            rt::g_session.handle = (XrSession)(uintptr_t)(0x1000 + sessionCount);
+            rt::g_session.handle = newHandle;
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (D3D12, handle=%llu)", (unsigned long long)rt::g_session.handle);
+            // Spec (session.adoc): the first state-changed event for a new session
+            // must be one reporting XR_SESSION_STATE_IDLE.
+            rt::PushState(rt::g_session.handle, XR_SESSION_STATE_IDLE);
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
         } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) {
             // XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR is an alias of this, so one branch serves
             // XR_KHR_vulkan_enable and XR_KHR_vulkan_enable2 alike.
             const auto* bVk = reinterpret_cast<const XrGraphicsBindingVulkanKHR*>(entry);
+            if (!extensionEnabled(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) &&
+                !extensionEnabled(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+            if (!rt::g_instance.vulkanRequirementsCalled) {
+                Log("[SimXR] xrCreateSession: WARNING - app did not call xrGetVulkanGraphicsRequirementsKHR(2) first; continuing anyway");
+            }
             rt::g_session.d3d11Device.Reset();
             rt::g_session.d3d11Context.Reset();
             rt::g_session.previewSwapchain.Reset();
@@ -3173,13 +3416,23 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             // app is handed and how the two queues are ordered.
             rt::g_session.usesVulkan = true;
             rt::g_session.usesD3D12 = true;
-            rt::g_session.handle = (XrSession)(uintptr_t)(0x1000 + sessionCount);
+            rt::g_session.handle = newHandle;
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (Vulkan, handle=%llu)", (unsigned long long)rt::g_session.handle);
+            // Spec (session.adoc): the first state-changed event for a new session
+            // must be one reporting XR_SESSION_STATE_IDLE.
+            rt::PushState(rt::g_session.handle, XR_SESSION_STATE_IDLE);
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
         } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR) {
             const auto* bGL = reinterpret_cast<const XrGraphicsBindingOpenGLWin32KHR*>(entry);
+            if (!extensionEnabled(XR_KHR_OPENGL_ENABLE_EXTENSION_NAME)) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+            if (!bGL->hDC || !bGL->hGLRC) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+            if (!rt::g_instance.openglRequirementsCalled) {
+                Log("[SimXR] xrCreateSession: WARNING - app did not call xrGetOpenGLGraphicsRequirementsKHR first; continuing anyway");
+            }
             rt::g_session.usesOpenGL = true;
             rt::g_session.usesD3D12 = false;
             rt::g_session.glDC = bGL->hDC;
@@ -3189,10 +3442,13 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             rt::g_session.d3d12Device.Reset();
             rt::g_session.d3d12Queue.Reset();
             rt::g_session.previewSwapchain.Reset();
-            rt::g_session.handle = (XrSession)(uintptr_t)(0x1000 + sessionCount);
+            rt::g_session.handle = newHandle;
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (OpenGL, handle=%llu, hDC=%p, hGLRC=%p)",
                  (unsigned long long)rt::g_session.handle, bGL->hDC, bGL->hGLRC);
+            // Spec (session.adoc): the first state-changed event for a new session
+            // must be one reporting XR_SESSION_STATE_IDLE.
+            rt::PushState(rt::g_session.handle, XR_SESSION_STATE_IDLE);
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
         }
@@ -3212,6 +3468,16 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
         return XR_ERROR_HANDLE_INVALID;
     }
     ReleaseUiPointers("Session ended");
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        rt::g_session.running = false;
+        rt::g_session.exitRequested = false;
+        rt::g_session.frameLifecycle.Reset();
+    }
+    rt::g_session.frameCondition.notify_all();
+    // fundamentals.adoc: queued events containing destroyed handles must be discarded.
+    // Every queued event in this runtime references the (single) session.
+    rt::g_eventQueue.clear();
     
     // Transfer window and swapchain to global persistent storage
     // Unity likes to create/destroy sessions rapidly for compatibility checks
@@ -3232,21 +3498,36 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
         }
     }
     
+    // Destroy all child swapchains while their graphics devices/contexts are still valid.
+    // Destroying the parent session implicitly destroys these handles.
+    if (rt::g_session.usesD3D12) rt::WaitForPreviewIdle(rt::g_session);
+    if (rt::g_session.usesOpenGL) {
+        HGLRC previousRC = wglGetCurrentContext();
+        HDC previousDC = wglGetCurrentDC();
+        if (rt::g_session.glDC && rt::g_session.glRC) {
+            wglMakeCurrent(rt::g_session.glDC, rt::g_session.glRC);
+        }
+        for (auto& entry : rt::g_swapchains) {
+            for (GLuint texture : entry.second.imagesGL) glDeleteTextures(1, &texture);
+        }
+        if (previousRC) wglMakeCurrent(previousDC, previousRC);
+    }
+    if (rt::g_session.usesVulkan) {
+        for (auto& entry : rt::g_swapchains) {
+            if (entry.second.isVulkan) vkrt::DestroySwapchainImages(rt::g_session, entry.second);
+        }
+        vkrt::ShutdownSession(rt::g_session);
+    }
+    rt::g_swapchains.clear();
+
     // Reset session but don't destroy the window
     rt::g_session.handle = XR_NULL_HANDLE;
     rt::g_session.state = XR_SESSION_STATE_IDLE;
+    resetD3D11PreviewReadbacks(rt::g_session);
     rt::g_session.d3d11Device.Reset();
     rt::g_session.d3d11Context.Reset();
     rt::g_session.usesD3D12 = false;
     rt::ResetD3D12PreviewResources(rt::g_session);
-    if (rt::g_session.usesVulkan) {
-        // The images live on the app's VkDevice, which goes away right after this call, so
-        // they cannot wait for an xrDestroySwapchain the app may never make.
-        for (auto& sc : rt::g_swapchains) {
-            if (sc.second.isVulkan) vkrt::DestroySwapchainImages(rt::g_session, sc.second);
-        }
-        vkrt::ShutdownSession(rt::g_session);
-    }
     rt::g_session.d3d12Device.Reset();
     rt::g_session.d3d12Queue.Reset();
     // Reset OpenGL state
@@ -3256,23 +3537,30 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     rt::g_session.hwnd = nullptr;  // Clear from session but window still exists
     rt::g_session.previewWidth = 1920;
     rt::g_session.previewHeight = 540;
-    rt::g_session.isFocused = false;
+    rt::g_session.previewInputFocused = false;
     rt::g_activeProfile = XR_NULL_PATH;  // re-bound by the next xrAttachSessionActionSets
+    rt::g_attachedActionSets.clear();
+    rt::g_activeActionSetSources.clear();
+    rt::g_sessionActionSetsAttached = false;
+    rt::g_referenceSpaces.clear();
+    rt::g_controllerSpaces.clear();
     Log("[SimXR] xrDestroySession: SUCCESS");
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrEnumerateSwapchainFormats_runtime(XrSession, uint32_t capacity, uint32_t* count, int64_t* formats) {
+static XrResult XRAPI_PTR xrEnumerateSwapchainFormats_runtime(XrSession session, uint32_t capacity, uint32_t* count, int64_t* formats) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!count) return XR_ERROR_VALIDATION_FAILURE;
     // Vulkan path - VkFormat values, in the order an app should prefer them
     if (rt::g_session.usesVulkan) {
         const uint32_t formatCount = (uint32_t)std::size(vkrt::kFormats);
-        if (count) *count = formatCount;
-        if (capacity > 0 && formats) {
-            const uint32_t copyCount = (capacity < formatCount) ? capacity : formatCount;
-            for (uint32_t i = 0; i < copyCount; ++i) formats[i] = vkrt::kFormats[i].vk;
+        *count = formatCount;
+        if (capacity == 0) return XR_SUCCESS;
+        if (!formats) return XR_ERROR_VALIDATION_FAILURE;
+        if (capacity < formatCount) return XR_ERROR_SIZE_INSUFFICIENT;
+        for (uint32_t i = 0; i < formatCount; ++i) formats[i] = vkrt::kFormats[i].vk;
             Logf("[SimXR] xrEnumerateSwapchainFormats(Vulkan): %u formats (first: VkFormat %lld)",
-                 copyCount, (long long)formats[0]);
-        }
+                 formatCount, (long long)formats[0]);
         return XR_SUCCESS;
     }
 
@@ -3290,14 +3578,14 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainFormats_runtime(XrSession, uint32_
         };
         const uint32_t formatCount = sizeof(supportedFormats) / sizeof(supportedFormats[0]);
 
-        if (count) *count = formatCount;
-        if (capacity > 0 && formats) {
-            uint32_t copyCount = (capacity < formatCount) ? capacity : formatCount;
-            for (uint32_t i = 0; i < copyCount; ++i) {
-                formats[i] = supportedFormats[i];
-            }
-            Logf("[SimXR] xrEnumerateSwapchainFormats(OpenGL): Returned %u formats (first: 0x%X)", copyCount, (int)formats[0]);
+        *count = formatCount;
+        if (capacity == 0) return XR_SUCCESS;
+        if (!formats) return XR_ERROR_VALIDATION_FAILURE;
+        if (capacity < formatCount) return XR_ERROR_SIZE_INSUFFICIENT;
+        for (uint32_t i = 0; i < formatCount; ++i) {
+            formats[i] = supportedFormats[i];
         }
+        Logf("[SimXR] xrEnumerateSwapchainFormats(OpenGL): Returned %u formats (first: 0x%X)", formatCount, (int)formats[0]);
         return XR_SUCCESS;
     }
 
@@ -3317,18 +3605,18 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainFormats_runtime(XrSession, uint32_
     };
     const uint32_t formatCount = sizeof(supportedFormats) / sizeof(supportedFormats[0]);
 
-    if (count) *count = formatCount;
-    if (capacity > 0 && formats) {
-        uint32_t copyCount = (capacity < formatCount) ? capacity : formatCount;
-        for (uint32_t i = 0; i < copyCount; ++i) {
-            formats[i] = supportedFormats[i];
-        }
-        Logf("[SimXR] xrEnumerateSwapchainFormats: Returned %u formats (first: %d)", copyCount, (int)formats[0]);
+    *count = formatCount;
+    if (capacity == 0) return XR_SUCCESS;
+    if (!formats) return XR_ERROR_VALIDATION_FAILURE;
+    if (capacity < formatCount) return XR_ERROR_SIZE_INSUFFICIENT;
+    for (uint32_t i = 0; i < formatCount; ++i) {
+        formats[i] = supportedFormats[i];
     }
+    Logf("[SimXR] xrEnumerateSwapchainFormats: Returned %u formats (first: %d)", formatCount, (int)formats[0]);
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchainCreateInfo* ci, XrSwapchain* sc) {
+static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession session, const XrSwapchainCreateInfo* ci, XrSwapchain* sc) {
     Log("[SimXR] ============================================");
     Logf("[SimXR] xrCreateSwapchain called: format=%d, size=%ux%u, arraySize=%u, mipCount=%u, sampleCount=%u, usageFlags=0x%X",
          ci ? (int)ci->format : -1, 
@@ -3358,13 +3646,90 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
     }
     
     Log("[SimXR] ============================================");
-    if (!ci || !sc) return XR_ERROR_VALIDATION_FAILURE;
-    rt::Swapchain chain{}; 
-    chain.handle = (XrSwapchain)(uintptr_t)(rt::g_swapchains.size() + 2);
+    if (!ci || !sc || ci->type != XR_TYPE_SWAPCHAIN_CREATE_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (ci->width == 0 || ci->height == 0 || ci->arraySize == 0 || ci->mipCount == 0 ||
+        ci->sampleCount == 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (ci->faceCount != 1) {
+        if (ci->faceCount == 6) {
+            // Cubemap swapchains are only composable through cube-layer extensions this
+            // runtime does not advertise; accepting them would create an uncompositable
+            // swapchain (it would then be rejected at xrEndFrame).
+            Log("[SimXR] xrCreateSwapchain: ERROR - cubemap swapchains (faceCount=6) are not supported");
+            return XR_ERROR_FEATURE_UNSUPPORTED;
+        }
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (ci->width > 4096 || ci->height > 4096) return XR_ERROR_VALIDATION_FAILURE;
+    constexpr XrSwapchainCreateFlags supportedCreateFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
+    if (ci->createFlags & ~supportedCreateFlags) return XR_ERROR_FEATURE_UNSUPPORTED;
+
+    // rendering.adoc: unsupported usage bits must fail with XR_ERROR_FEATURE_UNSUPPORTED.
+    constexpr XrSwapchainUsageFlags supportedUsageFlags =
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+        XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT |
+        XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+        XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT |
+        XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
+    if (ci->usageFlags & ~supportedUsageFlags) {
+        Logf("[SimXR] xrCreateSwapchain: ERROR - unsupported usageFlags=0x%X", ci->usageFlags);
+        return XR_ERROR_FEATURE_UNSUPPORTED;
+    }
+
+    const auto formatSupported = [&]() {
+        if (rt::g_session.usesVulkan) return vkrt::FindFormat(ci->format) != nullptr;
+        if (rt::g_session.usesOpenGL) {
+            switch (ci->format) {
+                case GL_SRGB8_ALPHA8:
+                case GL_RGBA8:
+                case GL_RGBA16F:
+                case GL_RGBA32F:
+                case GL_RGB10_A2:
+                case GL_DEPTH_COMPONENT32F:
+                case GL_DEPTH24_STENCIL8:
+                case GL_DEPTH_COMPONENT16:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        switch (static_cast<DXGI_FORMAT>(ci->format)) {
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            case DXGI_FORMAT_B8G8R8A8_UNORM:
+            case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            case DXGI_FORMAT_R32G32B32A32_FLOAT:
+            case DXGI_FORMAT_R10G10B10A2_UNORM:
+            case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            case DXGI_FORMAT_D32_FLOAT:
+            case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            case DXGI_FORMAT_D16_UNORM:
+                return true;
+            default:
+                return false;
+        }
+    };
+    if (!formatSupported()) return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+
+    rt::Swapchain chain{};
+#if XR_PTR_SIZE == 8
+    chain.handle = reinterpret_cast<XrSwapchain>(rt::g_nextSwapchainHandle++);
+#else
+    chain.handle = static_cast<XrSwapchain>(rt::g_nextSwapchainHandle++);
+#endif
     chain.format = (DXGI_FORMAT)ci->format;  // Store the original requested format
     chain.width = ci->width; 
     chain.height = ci->height; 
-    chain.arraySize = ci->arraySize ? ci->arraySize : 1;
+    chain.arraySize = ci->arraySize;
+    chain.faceCount = ci->faceCount;
+    chain.imageCount = (ci->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) ? 1u : 3u;
+    chain.lifecycle.Reset(chain.imageCount,
+        (ci->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) != 0);
     chain.lastAcquired = UINT32_MAX;  // No image acquired yet
     chain.lastReleased = UINT32_MAX;  // No image released yet
     // Create textures on appropriate backend
@@ -3382,7 +3747,6 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
     }
     if (rt::g_session.usesD3D12) {
         chain.backend = rt::Swapchain::Backend::D3D12;
-        chain.imageCount = 3;
         for (uint32_t i = 0; i < chain.imageCount; ++i) {
             D3D12_RESOURCE_DESC rd = {};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -3463,7 +3827,6 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
     // OpenGL path
     if (rt::g_session.usesOpenGL) {
         chain.backend = rt::Swapchain::Backend::OpenGL;
-        chain.imageCount = 3;
 
         // Check the current GL context state
         HGLRC currentRC = wglGetCurrentContext();
@@ -3681,7 +4044,6 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
     // Log the texture description for debugging
     Logf("[SimXR] Creating swapchain textures: Format=%d, %ux%u, Array=%u, Mips=%u, Samples=%u",
          td.Format, td.Width, td.Height, td.ArraySize, td.MipLevels, td.SampleDesc.Count);
-    chain.imageCount = 3;
     for (uint32_t i = 0; i < chain.imageCount; ++i) {
         ComPtr<ID3D11Texture2D> tex; 
         HRESULT hr = rt::g_session.d3d11Device->CreateTexture2D(&td, nullptr, tex.GetAddressOf());
@@ -3711,39 +4073,53 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
 
 static XrResult XRAPI_PTR xrEnumerateSwapchainImages_runtime(XrSwapchain sc, uint32_t capacity, uint32_t* count, XrSwapchainImageBaseHeader* images) {
     auto it = rt::g_swapchains.find(sc); if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
+    if (!count) return XR_ERROR_VALIDATION_FAILURE;
+    const uint32_t n = it->second.isVulkan
+        ? static_cast<uint32_t>(it->second.imagesVk.size())
+        : it->second.backend == rt::Swapchain::Backend::D3D12
+            ? static_cast<uint32_t>(it->second.images12.size())
+            : it->second.backend == rt::Swapchain::Backend::OpenGL
+                ? static_cast<uint32_t>(it->second.imagesGL.size())
+                : static_cast<uint32_t>(it->second.images.size());
+    *count = n;
+    if (capacity == 0) return XR_SUCCESS;
+    if (!images) return XR_ERROR_VALIDATION_FAILURE;
+    if (capacity < n) return XR_ERROR_SIZE_INSUFFICIENT;
+
     if (it->second.isVulkan) {
         // XrSwapchainImageVulkan2KHR is a typedef of XrSwapchainImageVulkanKHR, so this is
         // the right shape for both extensions.
-        const uint32_t n = (uint32_t)it->second.imagesVk.size();
-        if (count) *count = n;
-        if (capacity >= n && images) {
-            auto* arr = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
-            for (uint32_t i = 0; i < n; ++i) { arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR; arr[i].image = it->second.imagesVk[i]; }
+        auto* arr = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            // Tolerate zero-initialized arrays the way shipping runtimes do - engines
+            // commonly pass them and expect the runtime to fill in type. A WRONG
+            // non-zero type is still a genuine error.
+            if (arr[i].type == 0) arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+            else if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            arr[i].image = it->second.imagesVk[i];
         }
         Logf("[SimXR] xrEnumerateSwapchainImages(Vulkan): sc=%p count=%u", sc, n);
         return XR_SUCCESS;
     }
     if (it->second.backend == rt::Swapchain::Backend::D3D12) {
-        const uint32_t n = (uint32_t)it->second.images12.size();
-        if (count) *count = n;
-        if (capacity >= n && images) {
-            auto* arr = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
-            for (uint32_t i = 0; i < n; ++i) { arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR; arr[i].texture = it->second.images12[i].Get(); }
+        auto* arr = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (arr[i].type == 0) arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+            else if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            arr[i].texture = it->second.images12[i].Get();
         }
         Logf("[SimXR] xrEnumerateSwapchainImages(D3D12): sc=%p count=%u", sc, n);
         return XR_SUCCESS;
     } else if (it->second.backend == rt::Swapchain::Backend::OpenGL) {
-        const uint32_t n = (uint32_t)it->second.imagesGL.size();
-        if (count) *count = n;
-        if (capacity >= n && images) {
-            auto* arr = reinterpret_cast<XrSwapchainImageOpenGLKHR*>(images);
-            for (uint32_t i = 0; i < n; ++i) {
-                arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
-                arr[i].image = it->second.imagesGL[i];
-            }
+        auto* arr = reinterpret_cast<XrSwapchainImageOpenGLKHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (arr[i].type == 0) arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+            else if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            arr[i].image = it->second.imagesGL[i];
+        }
             // DEBUG: Log the texture IDs being returned AND verify content still matches
             Logf("[SimXR] xrEnumerateSwapchainImages(OpenGL): sc=%p texIDs=[%u,%u,%u]",
-                 sc, n > 0 ? arr[0].image : 0, n > 1 ? arr[1].image : 0, n > 2 ? arr[2].image : 0);
+                  sc, n > 0 ? arr[0].image : 0, n > 1 ? arr[1].image : 0, n > 2 ? arr[2].image : 0);
 
             // DEBUG: Read first texture to verify it still has content
             if (n > 0 && EnsureGLFramebufferFuncs()) {
@@ -3761,29 +4137,30 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainImages_runtime(XrSwapchain sc, uin
                 g_glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 g_glDeleteFramebuffers(1, &checkFBO);
             }
-        } else {
-            Logf("[SimXR] xrEnumerateSwapchainImages(OpenGL): sc=%p count=%u (query only)", sc, n);
-        }
         return XR_SUCCESS;
     } else {
-        const uint32_t n = (uint32_t)it->second.images.size();
-        if (count) *count = n;
-        if (capacity >= n && images) {
-            auto* arr = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
-            for (uint32_t i = 0; i < n; ++i) { arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR; arr[i].texture = it->second.images[i].Get(); }
+        auto* arr = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (arr[i].type == 0) arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+            else if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            arr[i].texture = it->second.images[i].Get();
         }
         Logf("[SimXR] xrEnumerateSwapchainImages(D3D11): sc=%p count=%u", sc, n);
         return XR_SUCCESS;
     }
 }
 
-static XrResult XRAPI_PTR xrAcquireSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageAcquireInfo*, uint32_t* index) {
+static XrResult XRAPI_PTR xrAcquireSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageAcquireInfo* info, uint32_t* index) {
+    if (!index || (info && info->type != XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO)) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
     auto it = rt::g_swapchains.find(sc); if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
     auto& ch = it->second;
-    uint32_t i = ch.nextIndex;
-    ch.nextIndex = (ch.nextIndex + 1) % ch.imageCount;
+    uint32_t i = UINT32_MAX;
+    const XrResult result = ch.lifecycle.Acquire(i);
+    if (XR_FAILED(result)) return result;
     ch.lastAcquired = i;  // Track what we just gave to the app
-    if (index) *index = i; 
+    *index = i;
     
     static int acquireCount = 0;
     ++acquireCount;
@@ -3795,13 +4172,23 @@ static XrResult XRAPI_PTR xrAcquireSwapchainImage_runtime(XrSwapchain sc, const 
     }
     return XR_SUCCESS;
 }
-static XrResult XRAPI_PTR xrWaitSwapchainImage_runtime(XrSwapchain, const XrSwapchainImageWaitInfo*) { return XR_SUCCESS; }
-static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageReleaseInfo*) {
+static XrResult XRAPI_PTR xrWaitSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageWaitInfo* info) {
+    if (!info || info->type != XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    auto it = rt::g_swapchains.find(sc);
+    if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
+    uint32_t waited = UINT32_MAX;
+    return it->second.lifecycle.Wait(waited);
+}
+static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageReleaseInfo* info) {
+    if (info && info->type != XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO) return XR_ERROR_VALIDATION_FAILURE;
     auto it = rt::g_swapchains.find(sc);
     if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
     auto& ch = it->second;
-    // The app just released the image it acquired earlier
-    ch.lastReleased = ch.lastAcquired;
+    uint32_t released = UINT32_MAX;
+    const XrResult result = ch.lifecycle.Release(released);
+    if (XR_FAILED(result)) return result;
+    ch.lastReleased = released;
+    ++ch.releaseSerial;
 
     // For D3D12: the app has finished using this image, reset our tracked state to COMMON.
     // D3D12 implicit state promotion/decay means COMMON is always safe after a GPU sync point.
@@ -4017,7 +4404,6 @@ private:
 
 namespace rt {
     static XrSessionState g_state = XR_SESSION_STATE_IDLE;
-    static std::vector<XrEventDataBuffer> g_eventQueue;
     void PushState(XrSession s, XrSessionState ns) {
         g_state = ns;
         g_session.state = ns;
@@ -4035,7 +4421,7 @@ namespace rt {
         Logf("[SimXR] PushState: Session %llu -> %s", (unsigned long long)s, stateName);
         
         XrEventDataSessionStateChanged e{XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED};
-        e.session = s; e.state = ns; e.time = 0;
+        e.session = s; e.state = ns; e.time = CurrentXrTime();
         
         XrEventDataBuffer buf{};
         buf.type = XR_TYPE_EVENT_DATA_BUFFER;  // Set the base type
@@ -4087,11 +4473,25 @@ static XrResult XRAPI_PTR xrPollEvent_runtime(XrInstance, XrEventDataBuffer* b) 
 // Defined further down, with the rest of the preview plumbing.
 static void ensurePreviewWithoutProjection(rt::Session& s);
 
-static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeginInfo*) { 
+static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeginInfo* info) {
     Log("[SimXR] ============================================");
     Logf("[SimXR] xrBeginSession called (session=%llu)", (unsigned long long)s);
     Log("[SimXR] Session started - moving to SYNCHRONIZED/VISIBLE states");
     Log("[SimXR] ============================================");
+
+    if (s != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_SESSION_BEGIN_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    if (info->primaryViewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    }
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (rt::g_session.running) return XR_ERROR_SESSION_RUNNING;
+        if (rt::g_session.state != XR_SESSION_STATE_READY) return XR_ERROR_SESSION_NOT_READY;
+        rt::g_session.running = true;
+        rt::g_session.exitRequested = false;
+        rt::g_session.frameLifecycle.Reset();
+    }
 
     // Bring the preview up now instead of waiting for the first projection
     // layer. An app that boots into a 2D-only screen submits nothing but quad
@@ -4105,19 +4505,62 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
 
     rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
     rt::PushState(s, XR_SESSION_STATE_VISIBLE);
-    // A simulator has no physical HMD focus hand-off. The preview window is created
-    // lazily by xrWaitFrame, while several clients (including BetterVR) wait for
-    // FOCUSED before entering their frame loop. Conditioning FOCUSED on that not-yet-
-    // created window deadlocks a clean launch. Report input focus immediately; the
-    // window activation handler may still move between VISIBLE/FOCUSED later.
-    rt::g_session.isFocused = true;
+    // A simulator has no physical HMD focus hand-off. Keep the OpenXR application
+    // focused for the running session; activation of the runtime-owned diagnostic
+    // preview controls only its mouse/keyboard input and must not perturb the app's
+    // lifecycle or make its renderer behave as a background window.
     rt::PushState(s, XR_SESSION_STATE_FOCUSED);
     return XR_SUCCESS; 
 }
-static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) { Log("[SimXR] xrEndSession"); ReleaseUiPointers("Session ended"); rt::PushState(s, XR_SESSION_STATE_STOPPING); rt::PushState(s, XR_SESSION_STATE_IDLE); return XR_SUCCESS; }
-static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) { rt::PushState(s, XR_SESSION_STATE_EXITING); return XR_SUCCESS; }
-static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*, XrFrameState* s) {
-    if (!s) return XR_ERROR_VALIDATION_FAILURE;
+static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) {
+    Log("[SimXR] xrEndSession");
+    if (s != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    bool exitRequested = false;
+    bool wasStopping = false;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        wasStopping = rt::g_session.state == XR_SESSION_STATE_STOPPING;
+        rt::g_session.running = false;
+        exitRequested = rt::g_session.exitRequested;
+        rt::g_session.exitRequested = false;
+        rt::g_session.frameLifecycle.Reset();
+    }
+    rt::g_session.frameCondition.notify_all();
+    if (!wasStopping) return XR_ERROR_SESSION_NOT_STOPPING;
+    ReleaseUiPointers("Session ended");
+    rt::PushState(s, XR_SESSION_STATE_IDLE);
+    if (exitRequested) rt::PushState(s, XR_SESSION_STATE_EXITING);
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) {
+    if (s != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    bool alreadyStopping = false;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        alreadyStopping = rt::g_session.state == XR_SESSION_STATE_STOPPING;
+        rt::g_session.exitRequested = true;
+    }
+    // Re-requesting exit while already STOPPING must not re-deliver an
+    // unchanged state-changed event.
+    if (!alreadyStopping) rt::PushState(s, XR_SESSION_STATE_STOPPING);
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWaitInfo* info, XrFrameState* s) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!s || s->type != XR_TYPE_FRAME_STATE ||
+        (info && info->type != XR_TYPE_FRAME_WAIT_INFO)) return XR_ERROR_VALIDATION_FAILURE;
+    {
+        std::unique_lock<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        rt::g_session.frameCondition.wait(lock, [] {
+            return !rt::g_session.running || rt::g_session.frameLifecycle.CanWait();
+        });
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        const XrResult result = rt::g_session.frameLifecycle.MarkWaited();
+        if (XR_FAILED(result)) return result;
+    }
     // Message pump so the preview window stays responsive
     MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
@@ -4128,26 +4571,26 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
     // Handle WASD keyboard input for movement (relative to head orientation).
     //
     // Accept input when the foreground window is our preview window OR ANY window owned by the host
-    // process (the OpenXR app — e.g. the game). The simulator runtime lives in-process with the host,
+    // process (the OpenXR app â€” e.g. the game). The simulator runtime lives in-process with the host,
     // so checking the foreground window's PID against our own lets head WASD/look work whether the user
-    // has focused the small "O" preview or the host's own (often fullscreen) window — yet never steals
+    // has focused the small "O" preview or the host's own (often fullscreen) window â€” yet never steals
     // keystrokes when the user has alt-tabbed to an unrelated app (terminal/browser), since those have a
     // different PID.
     //
     // WHY THIS MATTERS (6DOF translation bug): previously this required `foreground == preview &&
-    // isFocused`. As soon as the game's window took the foreground (which it does on launch / when
-    // fullscreen), the preview went inactive (isFocused=false) and WASD silently stopped feeding
-    // g_headPos — so interactive head translation looked completely dead, even though the underlying
+    // previewInputFocused`. As soon as the game's window took the foreground (which it does on launch /
+    // when fullscreen), the preview went inactive and WASD silently stopped feeding
+    // g_headPos â€” so interactive head translation looked completely dead, even though the underlying
     // pose pipeline was fine (scripted head_pose_command.json poses are focus-independent, which is
     // exactly why those worked while WASD didn't). Gating on "any window of our process is foreground"
     // fixes that. Note: FH5 also binds W/S/A/D to throttle/brake/steer, so while the game window is
-    // focused these keys additionally drive the car — park the car when isolating head-only translation.
+    // focused these keys additionally drive the car â€” park the car when isolating head-only translation.
     std::unique_lock<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     const HWND foregroundWindow = GetForegroundWindow();
     bool previewWindowFocused = false;
     if (foregroundWindow != nullptr) {
         if (foregroundWindow == rt::g_session.hwnd) {
-            previewWindowFocused = rt::g_session.isFocused.load();
+            previewWindowFocused = rt::g_session.previewInputFocused.load();
         } else {
             DWORD fgPid = 0;
             GetWindowThreadProcessId(foregroundWindow, &fgPid);
@@ -4512,7 +4955,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
     controlLock.unlock();
 
     // Pace on a high-resolution waitable timer. Plain Sleep() rounds up to the
-    // system timer interval — as much as 15.6ms when the host never raised it —
+    // system timer interval â€” as much as 15.6ms when the host never raised it â€”
     // which quietly turned this 90 Hz cap into a ~60 Hz one. The timer is exact
     // to a fraction of a millisecond regardless of the global timer resolution,
     // and a short yield loop closes the remainder.
@@ -4544,16 +4987,28 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
     if ((double)now.QuadPart - nextTick > periodSec * (double)freq.QuadPart) {
         nextTick = (double)now.QuadPart;
     }
-    // Convert QPC to nanoseconds using double to avoid overflow on MSVC
-    XrTime nowTime = (XrTime)((double)now.QuadPart * 1000000000.0 / (double)freq.QuadPart);
-    s->type = XR_TYPE_FRAME_STATE; s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
+    // Exact integer conversion - the same math xrConvertWin32PerformanceCounterToTimeKHR
+    // performs, so predicted display times and converted times agree for one instant.
+    const XrTime nowTime = QpcToNs(now.QuadPart, freq.QuadPart);
+    s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
     return XR_SUCCESS;
 }
-static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession, const XrFrameBeginInfo*) { return XR_SUCCESS; }
+static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession session, const XrFrameBeginInfo* info) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (info && info->type != XR_TYPE_FRAME_BEGIN_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    XrResult result;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        result = rt::g_session.frameLifecycle.Begin();
+    }
+    if (XR_SUCCEEDED(result)) rt::g_session.frameCondition.notify_all();
+    return result;
+}
 
 // Ensure the preview window exists (create or adopt the persistent one) and
 // pick a sensible initial outer size if it's brand new. The window size is
-// NOT touched on subsequent calls — once it exists, the user (or the menu
+// NOT touched on subsequent calls â€” once it exists, the user (or the menu
 // resize callback) owns its size.
 static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initialClientH) {
     if (s.hwnd) return;
@@ -4579,7 +5034,7 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
             SetWindowLongPtrW(s.hwnd, GWLP_WNDPROC, (LONG_PTR)rt::WndProc);
             Log("[SimXR] Updated window WndProc to new DLL address");
             ui::ApplyDarkTheme(s.hwnd);
-            ShowWindow(s.hwnd, rt::g_automationOnly ? SW_SHOWNOACTIVATE:SW_SHOW);
+            ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
             UpdateWindow(s.hwnd);
             // Seed clientWidth/Height from the actual current client area
             RECT cr{};
@@ -4595,7 +5050,7 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
         }
     }
 
-    // No persistent window — create a fresh one at the requested initial size
+    // No persistent window â€” create a fresh one at the requested initial size
     RECT rc = { 0, 0, (LONG)initialClientW, (LONG)initialClientH };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
     s.hwnd = CreateWindowExW(0, L"OpenXR Simulator", L"OpenXR Simulator (Mouse Look + WASD)", WS_OVERLAPPEDWINDOW,
@@ -4604,11 +5059,12 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
         Log("[SimXR] Failed to create preview window!");
         return;
     }
-    ShowWindow(s.hwnd, rt::g_automationOnly ? SW_SHOWNOACTIVATE:SW_SHOW);
+    // The preview is diagnostic runtime UI. Showing it must not background the
+    // OpenXR application and stall Unity's world rendering.
+    ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(s.hwnd);
-    if (!rt::g_automationOnly) SetForegroundWindow(s.hwnd);
-    SetWindowPos(s.hwnd, rt::g_automationOnly ? HWND_BOTTOM:HWND_TOP, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | (rt::g_automationOnly ? SWP_NOACTIVATE:0));
+    SetWindowPos(s.hwnd, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
     Logf("[SimXR] Created new preview window: hwnd=%p clientSize=%ux%u",
          s.hwnd, initialClientW, initialClientH);
 
@@ -4730,13 +5186,17 @@ float4 PSMain(VSOut i) : SV_Target {
 }
 )HLSL";
 
-// SRV format for sampling a quad layer. Unlike the eye pass - which filters the stored bytes
-// in whatever encoding they are in and writes them straight through - the quad is blended, so
-// the sample has to come back as linear light. Keeping the sRGB view is what does that.
-static DXGI_FORMAT PreviewQuadSrvFormat(DXGI_FORMAT resourceFormat) {
+// SRV format for composition. An sRGB declaration selects a decoding view; all other
+// color formats are sampled as linear, as required by OpenXR's composition color rules.
+static DXGI_FORMAT PreviewLinearSrvFormat(DXGI_FORMAT resourceFormat,
+                                          DXGI_FORMAT declaredFormat) {
     switch (resourceFormat) {
-        case DXGI_FORMAT_R8G8B8A8_TYPELESS:       return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS:       return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+            return declaredFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                 ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            return declaredFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                 ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM;
         case DXGI_FORMAT_R16G16B16A16_TYPELESS:   return DXGI_FORMAT_R16G16B16A16_FLOAT;
         case DXGI_FORMAT_R32G32B32A32_TYPELESS:   return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case DXGI_FORMAT_R10G10B10A2_TYPELESS:    return DXGI_FORMAT_R10G10B10A2_UNORM;
@@ -4837,7 +5297,7 @@ static bool ensurePreviewQuadPipeline(rt::Session& s) {
         pso.RasterizerState.DepthClipEnable = TRUE;
         pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pso.NumRenderTargets = 1;
-        // sRGB view over the same bytes the eye pass wrote, so the blend runs in linear light.
+        // All composition targets the sRGB view, so the blend runs in linear light.
         pso.RTVFormats[0] = rt::kPreviewRTFormatSrgb;
         pso.SampleDesc.Count = 1;
         hr = s.d3d12Device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(s.previewQuadPSO[mode].GetAddressOf()));
@@ -4852,7 +5312,8 @@ static bool ensurePreviewQuadPipeline(rt::Session& s) {
 }
 
 static bool ensurePreviewBlitPipeline(rt::Session& s) {
-    if (s.previewPSO && s.previewRootSig && s.previewSrvHeap) return true;
+    if (s.previewPSO[0] && s.previewPSO[1] && s.previewPSO[2] &&
+        s.previewRootSig && s.previewSrvHeap) return true;
     if (!s.d3d12Device) return false;
 
     D3D12_DESCRIPTOR_RANGE srvRange = {};
@@ -4920,23 +5381,38 @@ static bool ensurePreviewBlitPipeline(rt::Session& s) {
         return false;
     }
 
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
-    pso.pRootSignature = s.previewRootSig.Get();
-    pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-    pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
-    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pso.SampleMask = UINT_MAX;
-    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pso.RasterizerState.DepthClipEnable = TRUE;
-    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso.NumRenderTargets = 1;
-    pso.RTVFormats[0] = rt::kPreviewRTFormat;
-    pso.SampleDesc.Count = 1;
-    hr = s.d3d12Device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(s.previewPSO.GetAddressOf()));
-    if (FAILED(hr)) {
-        Logf("[SimXR] DX12 preview: CreateGraphicsPipelineState failed 0x%08X", (unsigned)hr);
-        return false;
+    for (int mode = 0; mode < 3; ++mode) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = s.previewRootSig.Get();
+        pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        D3D12_RENDER_TARGET_BLEND_DESC& target = pso.BlendState.RenderTarget[0];
+        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        if (mode != (int)rt::LayerBlend::Opaque) {
+            target.BlendEnable = TRUE;
+            target.SrcBlend = (mode == (int)rt::LayerBlend::Premultiplied)
+                            ? D3D12_BLEND_ONE : D3D12_BLEND_SRC_ALPHA;
+            target.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            target.BlendOp = D3D12_BLEND_OP_ADD;
+            target.SrcBlendAlpha = D3D12_BLEND_ONE;
+            target.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
+        pso.SampleMask = UINT_MAX;
+        pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso.RasterizerState.DepthClipEnable = TRUE;
+        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.NumRenderTargets = 1;
+        pso.RTVFormats[0] = rt::kPreviewRTFormatSrgb;
+        pso.SampleDesc.Count = 1;
+        hr = s.d3d12Device->CreateGraphicsPipelineState(
+            &pso, IID_PPV_ARGS(s.previewPSO[mode].GetAddressOf()));
+        if (FAILED(hr)) {
+            Logf("[SimXR] DX12 preview: CreateGraphicsPipelineState(%d) failed 0x%08X",
+                 mode, (unsigned)hr);
+            return false;
+        }
     }
 
     // See kPreviewSrvSlots for how the ring is sized against the frames in flight.
@@ -4957,7 +5433,7 @@ static bool ensurePreviewBlitPipeline(rt::Session& s) {
 }
 
 // Make sure the preview backing store (D3D11 swapchain or D3D12 offscreen RT)
-// is sized to `width × height` and uses `format`. For D3D11 this means
+// is sized to `width Ã— height` and uses `format`. For D3D11 this means
 // ResizeBuffers (or recreate) so the backbuffer matches the window client area;
 // for D3D12 it means resizing the offscreen RT/readback to the natural canvas
 // size chosen by the caller. The window itself is NOT touched here.
@@ -4970,7 +5446,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
     if (!s.hwnd) return;
 
     // After a DLL reload the Session is fresh but a previous swapchain may
-    // still be cached against the persistent HWND — adopt it so we don't try
+    // still be cached against the persistent HWND â€” adopt it so we don't try
     // to create a second swapchain for the same window (which DXGI forbids).
     if (!s.usesD3D12 && !s.previewSwapchain) {
         std::lock_guard<std::mutex> lock(rt::g_windowMutex);
@@ -5057,7 +5533,7 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
         s.previewFormat = rt::kPreviewRTFormat;
         // DX12 preview: GDI-based rendering to avoid DXGI Present hook conflicts.
         // Steam overlay (gameoverlayrenderer64) and UEVR both hook IDXGISwapChain::Present,
-        // creating infinite recursion → EXCEPTION_STACK_OVERFLOW. Instead, we scale the
+        // creating infinite recursion â†’ EXCEPTION_STACK_OVERFLOW. Instead, we scale the
         // eyes into an offscreen RT the size of the window, read that back, and copy it
         // into the window's DIB section.
         if (!ensurePreviewBlitPipeline(s)) return;
@@ -5108,8 +5584,8 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
             return;
         }
         s.previewRtvStride = s.d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        // [0] plain view: the eye pass writes already-encoded bytes through unchanged.
-        // [1] sRGB view: quad blending decodes/re-encodes so the blend is in linear light.
+        // [0] plain view for clearing/copy descriptions. [1] sRGB view for every layer,
+        // so both opaque writes and alpha composition leave consistently encoded bytes.
         D3D12_CPU_DESCRIPTOR_HANDLE rtvBase = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
         D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
         rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
@@ -5355,9 +5831,40 @@ static ID3D11Texture2D* acquireTempTexture(rt::Session& s, rt::Session::TempTexE
     return entry.texture.Get();
 }
 
+// glGetTexImage always returns the complete mip level (and every layer of a texture array).
+// Read into a correctly-sized reusable scratch buffer first, then extract only the OpenXR
+// subimage. Writing it directly into a crop-sized destination corrupts memory whenever an
+// application submits less than the full swapchain image.
+static bool readGLSubImage(GLuint texture, const rt::Swapchain& chain, uint32_t arrayIndex,
+                           const rt::SubImageRect& rect, std::vector<uint8_t>& scratch,
+                           std::vector<uint8_t>& output, uint32_t outputWidth,
+                           uint32_t outputHeight, bool reuseReadback = false) {
+    const uint32_t layers = chain.arraySize ? chain.arraySize : 1;
+    const uint64_t layerBytes64 = (uint64_t)chain.width * chain.height * 4;
+    if (!texture || layerBytes64 == 0 || layerBytes64 > SIZE_MAX) return false;
+    const size_t layerBytes = (size_t)layerBytes64;
+    if (layers > SIZE_MAX / layerBytes) return false;
+    const size_t readbackBytes = layerBytes * layers;
+    if (!reuseReadback || scratch.size() != readbackBytes) {
+        scratch.resize(readbackBytes);
+        const GLenum target = layers > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+        glBindTexture(target, texture);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glGetTexImage(target, 0, GL_RGBA, GL_UNSIGNED_BYTE, scratch.data());
+    }
+
+    return composition_render::CopyRgbaSubImage(
+        scratch.data(), scratch.size(), chain.width, chain.height, layers, arrayIndex,
+        rect, outputWidth, outputHeight, output);
+}
+
 static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcIndex, uint32_t arraySlice,
                            const XrRect2Di& rect, ID3D11RenderTargetView* rtv,
                            const D3D11_VIEWPORT& vp, ID3D11BlendState* blendState) {
+    // OpenXR permits empty image rectangles. They contribute no pixels; treating one as
+    // an invalid crop and copying the whole texture would expose content the app did not
+    // submit.
+    if (rect.extent.width == 0 || rect.extent.height == 0) return;
     if (!rtv) {
         Log("[SimXR] blitViewToHalf: rtv is null!");
         return;
@@ -5563,12 +6070,179 @@ static void saveD3D12Screenshot(const uint8_t* pixels, UINT width, UINT height, 
 // the readback on D3D12 and OpenGL, and the composite and Present on all three.
 static bool g_previewDueThisFrame = true;
 
+// --- On-demand D3D11 preview readback ---------------------------------------------------------
+
+static void resetD3D11PreviewReadbacks(rt::Session& s) {
+    for (auto& frame : s.previewFrames11) frame = rt::PreviewFrame11{};
+    s.previewReadback11Slot = 0;
+    s.previewReadback11Generation = 0;
+}
+
+static bool ensureD3D11PreviewReadbackSlot(rt::Session& s, rt::PreviewFrame11& frame,
+                                           ID3D11Texture2D* source) {
+    if (!s.d3d11Device || !source || frame.pending) return false;
+    D3D11_TEXTURE2D_DESC sourceDesc{};
+    source->GetDesc(&sourceDesc);
+    if (sourceDesc.Width == 0 || sourceDesc.Height == 0 || sourceDesc.SampleDesc.Count != 1) {
+        return false;
+    }
+    if (frame.staging && frame.ready && frame.width == sourceDesc.Width &&
+        frame.height == sourceDesc.Height && frame.format == sourceDesc.Format) {
+        return true;
+    }
+
+    frame.staging.Reset();
+    frame.ready.Reset();
+    D3D11_TEXTURE2D_DESC stagingDesc = sourceDesc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    if (FAILED(s.d3d11Device->CreateTexture2D(
+            &stagingDesc, nullptr, frame.staging.GetAddressOf()))) {
+        Log("[SimXR] D3D11 detector: failed to create staging texture");
+        return false;
+    }
+    D3D11_QUERY_DESC queryDesc{};
+    queryDesc.Query = D3D11_QUERY_EVENT;
+    if (FAILED(s.d3d11Device->CreateQuery(&queryDesc, frame.ready.GetAddressOf()))) {
+        frame.staging.Reset();
+        Log("[SimXR] D3D11 detector: failed to create completion query");
+        return false;
+    }
+    frame.width = sourceDesc.Width;
+    frame.height = sourceDesc.Height;
+    frame.format = sourceDesc.Format;
+    return true;
+}
+
+static flicker::PreviewFrameInfo previewInfoFromProjection(const mcp::ProjLogEntry& projection) {
+    flicker::PreviewFrameInfo info;
+    for (int eye = 0; eye < 2; ++eye) {
+        info.imageIndex[eye] = projection.imageIndex[eye];
+        info.releaseSerial[eye] = projection.releaseSerial[eye];
+        info.fresh[eye] = projection.fresh[eye];
+    }
+    return info;
+}
+
+static void consumeD3D11PreviewReadbacks(rt::Session& s) {
+    if (!s.d3d11Context) return;
+    for (UINT consumed = 0; consumed < rt::kD3D11ReadbackFrames; ++consumed) {
+        rt::PreviewFrame11* oldest = nullptr;
+        for (auto& candidate : s.previewFrames11) {
+            if (!candidate.pending || !candidate.staging || !candidate.ready) continue;
+            if (!oldest || candidate.generation < oldest->generation) oldest = &candidate;
+        }
+        if (!oldest) return;
+        rt::PreviewFrame11& frame = *oldest;
+        const HRESULT ready = s.d3d11Context->GetData(
+            frame.ready.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        // Commands on one immediate context complete in order. If the oldest copy is not
+        // ready, no later frame is safe to map either; preserve strict frame ordering.
+        if (ready == S_FALSE) return;
+        if (FAILED(ready)) {
+            frame.pending = false;
+            continue;
+        }
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        const HRESULT mappedResult = s.d3d11Context->Map(
+            frame.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (mappedResult == DXGI_ERROR_WAS_STILL_DRAWING) return;
+        if (FAILED(mappedResult) || !mapped.pData) {
+            frame.pending = false;
+            continue;
+        }
+
+        const uint8_t* pixels = static_cast<const uint8_t*>(mapped.pData);
+        uint32_t pitch = mapped.RowPitch;
+        std::vector<uint8_t> normalized;
+        const bool rgba = frame.format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                          frame.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        const bool bgra = frame.format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                          frame.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        if (rgba) {
+            // The detector and burst files use BGRA. Normalize only on the diagnostic
+            // path; no extra full-frame copy exists during normal D3D11 rendering.
+            normalized.resize((size_t)frame.width * frame.height * 4);
+            for (UINT y = 0; y < frame.height; ++y) {
+                const uint8_t* src = pixels + (size_t)y * mapped.RowPitch;
+                uint8_t* dst = normalized.data() + (size_t)y * frame.width * 4;
+                for (UINT x = 0; x < frame.width; ++x) {
+                    dst[x * 4 + 0] = src[x * 4 + 2];
+                    dst[x * 4 + 1] = src[x * 4 + 1];
+                    dst[x * 4 + 2] = src[x * 4 + 0];
+                    dst[x * 4 + 3] = src[x * 4 + 3];
+                }
+            }
+            pixels = normalized.data();
+            pitch = frame.width * 4;
+        } else if (!bgra) {
+            static bool loggedUnsupported = false;
+            if (!loggedUnsupported) {
+                loggedUnsupported = true;
+                Logf("[SimXR] D3D11 detector: unsupported backbuffer format %d", (int)frame.format);
+            }
+            s.d3d11Context->Unmap(frame.staging.Get(), 0);
+            frame.pending = false;
+            continue;
+        }
+
+        if (frame.hasProjection) {
+            const flicker::PreviewFrameInfo previewInfo = previewInfoFromProjection(frame.proj);
+            flicker::ObservePreview(pixels, frame.width, frame.height, pitch,
+                                    frame.generation, frame.frame, &previewInfo);
+            if (mcp::g_burstActive) {
+                mcp::BurstOnFrame(pixels, (int)frame.width, (int)frame.height, (int)pitch,
+                                  frame.frame, frame.headYaw, frame.headPitch, frame.headRoll,
+                                  frame.headX, frame.headY, frame.headZ, frame.proj);
+            }
+        }
+        s.d3d11Context->Unmap(frame.staging.Get(), 0);
+        frame.pending = false;
+    }
+}
+
+static void queueD3D11PreviewReadback(rt::Session& s, ID3D11Texture2D* backbuffer,
+                                      uint32_t frameCount) {
+    if (!s.d3d11Context || !backbuffer) return;
+    if (!flicker::WantsPreviewReadback() && !mcp::g_burstActive) return;
+
+    UINT selected = rt::kD3D11ReadbackFrames;
+    for (UINT offset = 0; offset < rt::kD3D11ReadbackFrames; ++offset) {
+        const UINT index = (s.previewReadback11Slot + offset) % rt::kD3D11ReadbackFrames;
+        if (!s.previewFrames11[index].pending) {
+            selected = index;
+            break;
+        }
+    }
+    if (selected == rt::kD3D11ReadbackFrames) {
+        // Diagnostic readback must never make xrEndFrame wait. A full ring means the GPU
+        // is more than eight previews behind; drop this sample and try again next frame.
+        return;
+    }
+
+    rt::PreviewFrame11& frame = s.previewFrames11[selected];
+    if (!ensureD3D11PreviewReadbackSlot(s, frame, backbuffer)) return;
+    s.d3d11Context->CopyResource(frame.staging.Get(), backbuffer);
+    s.d3d11Context->End(frame.ready.Get());
+    frame.pending = true;
+    frame.generation = ++s.previewReadback11Generation;
+    frame.frame = frameCount;
+    frame.hasProjection = true;
+    frame.headYaw = rt::g_headYaw; frame.headPitch = rt::g_headPitch; frame.headRoll = rt::g_headRoll;
+    frame.headX = rt::g_headPos.x; frame.headY = rt::g_headPos.y; frame.headZ = rt::g_headPos.z;
+    frame.proj = mcp::g_lastProjEntry;
+    s.previewReadback11Slot = (selected + 1) % rt::kD3D11ReadbackFrames;
+}
+
 // --- Preview frame slots (D3D12) --------------------------------------------------------------
 
 // Open this frame's slot, or nullptr if all of them are still on the GPU. The eye composite
 // and every quad layer of a frame share one slot and one allocator: whichever pass runs first
 // resets the allocator, later passes only reset the command list, and xrEndFrame closes the
-// slot. Returning nullptr drops the frame from the preview, which is the whole point — the
+// slot. Returning nullptr drops the frame from the preview, which is the whole point â€” the
 // caller is the app's render thread and must never wait for the GPU here.
 static rt::PreviewFrame12* beginPreviewSlot(rt::Session& s) {
     if (!s.previewFence || !s.previewCmdList || !s.previewQueue12) return nullptr;
@@ -5752,10 +6426,10 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
     // The burst records the frame that was just shown, described by the metadata that
     // frame was recorded with rather than by whatever the head is doing now.
     if (mcp::g_burstActive && f.hasProjection) {
-        mcp::g_lastProjEntry = f.proj;
         mcp::BurstOnFrame((const uint8_t*)mapped, (int)f.rtWidth, (int)f.rtHeight,
                           (int)s.previewReadbackPitch, f.frame,
-                          f.headYaw, f.headPitch, f.headRoll, f.headX, f.headY, f.headZ);
+                          f.headYaw, f.headPitch, f.headRoll, f.headX, f.headY, f.headZ,
+                          f.proj);
     }
 
     // The detector samples the aligned readback rows in place; no repack. Before it
@@ -5763,8 +6437,9 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
     // not a 64-pixel multiple cost a full-frame memcpy here on every painted frame.
     const uint8_t* detectorPixels = (const uint8_t*)mapped;
     if (f.hasProjection) {
+        const flicker::PreviewFrameInfo previewInfo = previewInfoFromProjection(f.proj);
         flicker::ObservePreview(detectorPixels, f.rtWidth, f.rtHeight,
-                                s.previewReadbackPitch, f.fenceValue, f.frame);
+                                s.previewReadbackPitch, f.fenceValue, f.frame, &previewInfo);
     }
     flicker::UiFrameInfo uiInfo;
     uiInfo.quadLayers = f.quadLayers;
@@ -5791,9 +6466,11 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
 static void blitD3D12ToPreview(rt::Session& s,
                                 rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice, const rt::SubImageRect& rectL,
                                 rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice, const rt::SubImageRect& rectR,
-                                ui::DisplayLayout layout, ui::ViewMode viewMode) {
+                                ui::DisplayLayout layout, ui::ViewMode viewMode,
+                                rt::LayerBlend blendMode) {
     if (!s.previewRT12 || !s.previewCmdList ||
-        !s.previewRtvHeap || !s.previewSrvHeap || !s.previewRootSig || !s.previewPSO) {
+        !s.previewRtvHeap || !s.previewSrvHeap || !s.previewRootSig ||
+        !s.previewPSO[(int)blendMode]) {
         Log("[SimXR] blitD3D12ToPreview: Missing D3D12 preview resources");
         return;
     }
@@ -5833,11 +6510,10 @@ static void blitD3D12ToPreview(rt::Session& s,
     UINT rtWidth = (UINT)rtDesc.Width;
     UINT rtHeight = rtDesc.Height;
 
-    // Plain (non-sRGB) view: the eye pass writes the source bytes through in the encoding
-    // they are stored in, so nothing must convert them on the way out.
-    const D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtvHandle.ptr += s.previewRtvStride;
     s.previewCmdList->SetGraphicsRootSignature(s.previewRootSig.Get());
-    s.previewCmdList->SetPipelineState(s.previewPSO.Get());
+    s.previewCmdList->SetPipelineState(s.previewPSO[(int)blendMode].Get());
     s.previewCmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     auto drawEye = [&](rt::Swapchain& chain, uint32_t idx, uint32_t slice, const rt::SubImageRect& rect,
@@ -5870,7 +6546,7 @@ static void blitD3D12ToPreview(rt::Session& s,
         }
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = rt::PreviewSrvFormat(sd.Format);
+        srvDesc.Format = PreviewLinearSrvFormat(sd.Format, (DXGI_FORMAT)chain.format);
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         if (sd.DepthOrArraySize > 1) {
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -6029,8 +6705,10 @@ static void updatePreviewTitle(rt::Session& s) {
     ui::UpdateWindowTitle(s.hwnd, &si);
 }
 
-static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj, bool skipPresent = false) {
+static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj,
+                              bool skipPresent = false, bool clearTarget = true) {
     LogV("[SimXR] ============================================");
+    const rt::LayerBlend blendMode = rt::BlendForLayerFlags(proj.layerFlags);
     LogVf("[SimXR] presentProjection called: viewCount=%u, skipPresent=%d", proj.viewCount, (int)skipPresent);
     LogV("[SimXR] RENDERING FRAME TO PREVIEW WINDOW");
     LogV("[SimXR] ============================================");
@@ -6060,6 +6738,9 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             if (rectR.w > width) width = rectR.w;
             if (rectR.h > height) height = rectR.h;
         }
+    }
+    if ((rectL.w == 0 || rectL.h == 0) && (rectR.w == 0 || rectR.h == 0)) {
+        return;
     }
     // Publish the source per-eye size so menu/keyboard zoom callbacks can
     // compute a window target without having to walk the swapchain map.
@@ -6113,12 +6794,12 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // Read pixel data from GL textures into CPU buffers
             std::vector<uint8_t>& leftPixels = s.glEyePixels[0];    // reused across frames
             std::vector<uint8_t>& rightPixels = s.glEyePixels[1];
-            leftPixels.resize((size_t)width * height * 4);
-            rightPixels.resize((size_t)width * height * 4);
+            leftPixels.assign((size_t)width * height * 4, 0);
+            rightPixels.assign((size_t)width * height * 4, 0);
 
             // Get left eye texture
             GLuint leftTex = 0;
-            if (chL.imagesGL.size() > 0) {
+            if (rectL.w > 0 && rectL.h > 0 && chL.imagesGL.size() > 0) {
                 uint32_t idx = chL.lastReleased;
                 if (idx == UINT32_MAX || idx >= chL.imageCount) idx = chL.lastAcquired;
                 if (idx != UINT32_MAX && idx < chL.imagesGL.size()) {
@@ -6128,7 +6809,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
             // Get right eye texture
             GLuint rightTex = 0;
-            if (chRPtr && chRPtr->imagesGL.size() > 0) {
+            if (proj.viewCount > 1 && rectR.w > 0 && rectR.h > 0 &&
+                chRPtr && chRPtr->imagesGL.size() > 0) {
                 uint32_t idx = chRPtr->lastReleased;
                 if (idx == UINT32_MAX || idx >= chRPtr->imageCount) idx = chRPtr->lastAcquired;
                 if (idx != UINT32_MAX && idx < chRPtr->imagesGL.size()) {
@@ -6221,30 +6903,43 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 return;
             }
 
-            // Upload GL pixel data into cached textures; the pair is recreated only
-            // when the eye size changes rather than on every mirrored frame.
-            if (s.glEyeTexW != width || s.glEyeTexH != height || !s.glEyeTex[0]) {
+            // glGetTexImage returns the encoded bytes of GL_SRGB8_ALPHA8. Give those
+            // bytes an sRGB SRV so sampling decodes them before either an opaque copy or
+            // an alpha blend writes through the sRGB preview RTV. Other color formats
+            // are read back as linear RGBA8 and keep a UNORM SRV.
+            const DXGI_FORMAT eyeFormats[2] = {
+                chL.glInternalFormat == GL_SRGB8_ALPHA8
+                    ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM,
+                chRPtr && chRPtr->glInternalFormat == GL_SRGB8_ALPHA8
+                    ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM,
+            };
+            const bool eyeSizeChanged = s.glEyeTexW != width || s.glEyeTexH != height;
+            for (int eye = 0; eye < 2; ++eye) {
+                if (!eyeSizeChanged && s.glEyeTex[eye] &&
+                    s.glEyeSrvFormat[eye] == eyeFormats[eye]) {
+                    continue;
+                }
                 D3D11_TEXTURE2D_DESC texDesc = {};
                 texDesc.Width = width;
                 texDesc.Height = height;
                 texDesc.MipLevels = 1;
                 texDesc.ArraySize = 1;
-                texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                texDesc.Format = eyeFormats[eye];
                 texDesc.SampleDesc.Count = 1;
                 texDesc.Usage = D3D11_USAGE_DEFAULT;
                 texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                for (int eye = 0; eye < 2; ++eye) {
-                    s.glEyeTex[eye].Reset();
-                    s.glEyeSrv[eye].Reset();
-                    if (SUCCEEDED(s.d3d11Device->CreateTexture2D(&texDesc, nullptr,
-                                                                 s.glEyeTex[eye].GetAddressOf()))) {
-                        s.d3d11Device->CreateShaderResourceView(s.glEyeTex[eye].Get(), nullptr,
-                                                                s.glEyeSrv[eye].GetAddressOf());
-                    }
+                s.glEyeTex[eye].Reset();
+                s.glEyeSrv[eye].Reset();
+                s.glEyeSrvFormat[eye] = DXGI_FORMAT_UNKNOWN;
+                if (SUCCEEDED(s.d3d11Device->CreateTexture2D(
+                        &texDesc, nullptr, s.glEyeTex[eye].GetAddressOf())) &&
+                    SUCCEEDED(s.d3d11Device->CreateShaderResourceView(
+                        s.glEyeTex[eye].Get(), nullptr, s.glEyeSrv[eye].GetAddressOf()))) {
+                    s.glEyeSrvFormat[eye] = eyeFormats[eye];
                 }
-                s.glEyeTexW = width;
-                s.glEyeTexH = height;
             }
+            s.glEyeTexW = width;
+            s.glEyeTexH = height;
             if (leftTex != 0 && s.glEyeTex[0]) {
                 s.d3d11Context->UpdateSubresource(s.glEyeTex[0].Get(), 0, nullptr,
                                                   leftPixels.data(), width * 4, 0);
@@ -6267,7 +6962,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
             // Create render target view for the backbuffer
             ComPtr<ID3D11RenderTargetView> rtv;
-            if (FAILED(s.d3d11Device->CreateRenderTargetView(bb.Get(), nullptr, rtv.GetAddressOf()))) {
+            if (!rt::CreatePreviewRtv(s, bb.Get(), rtv)) {
                 Log("[SimXR] OpenGL preview: Failed to create RTV");
                 return;
             }
@@ -6281,11 +6976,11 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                      s.glEyeTex[0].Get(), s.glEyeTex[1].Get(), leftSRV, rightSRV);
             }
 
-            // Clear the render target (full backbuffer → black borders for letterbox)
+            // Clear the render target (full backbuffer â†’ black borders for letterbox)
             ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
             s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
             const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
+            if (clearTarget) s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
 
             // Where the eyes land in the backbuffer (= client area). "Fit to Window"
             // scales the whole stereo image into it rather than cropping; any other
@@ -6308,7 +7003,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             }
 
             // Helper lambda to blit a texture to a viewport
-            auto blitTexture = [&](ID3D11ShaderResourceView* srv, const D3D11_VIEWPORT& vp) {
+            auto blitTexture = [&](ID3D11ShaderResourceView* srv, const D3D11_VIEWPORT& vp,
+                                   ID3D11BlendState* blend) {
                 if (!srv) {
                     if (glFrameCount % 60 == 1) Log("[SimXR] GL PREVIEW: blitTexture - SRV is null!");
                     return;
@@ -6334,7 +7030,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
                 s.d3d11Context->IASetInputLayout(nullptr);
                 s.d3d11Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                s.d3d11Context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+                s.d3d11Context->OMSetBlendState(blend, nullptr, 0xFFFFFFFF);
                 s.d3d11Context->OMSetDepthStencilState(nullptr, 0);
                 s.d3d11Context->RSSetState(s.noCullRS.Get());
 
@@ -6345,23 +7041,34 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 s.d3d11Context->PSSetShaderResources(0, 1, nullSRV);
             };
 
+            const UINT8 rgbMask = D3D11_COLOR_WRITE_ENABLE_RED |
+                                  D3D11_COLOR_WRITE_ENABLE_GREEN |
+                                  D3D11_COLOR_WRITE_ENABLE_BLUE;
+            ID3D11BlendState* leftBlend = rt::GetLayerBlendState(s, blendMode, rgbMask);
+            ID3D11BlendState* rightBlend = leftBlend;
+            if (!singleEye && layout == ui::DisplayLayout::Anaglyph) {
+                leftBlend = rt::GetLayerBlendState(s, blendMode, D3D11_COLOR_WRITE_ENABLE_RED);
+                rightBlend = rt::GetLayerBlendState(
+                    s, blendMode, D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE);
+            }
+
             // Render the eyes
             if (singleEye) {
                 if (showLeft && leftSRV) {
-                    blitTexture(leftSRV, fullVp);
+                    blitTexture(leftSRV, fullVp, leftBlend);
                 } else if (showRight && rightSRV) {
-                    blitTexture(rightSRV, fullVp);
+                    blitTexture(rightSRV, fullVp, rightBlend);
                 }
             } else {
                 // Side by side (or over/under)
                 if (showLeft && leftSRV) {
-                    blitTexture(leftSRV, leftVp);
+                    blitTexture(leftSRV, leftVp, leftBlend);
                 }
                 if (showRight && rightSRV) {
-                    blitTexture(rightSRV, rightVp);
+                    blitTexture(rightSRV, rightVp, rightBlend);
                 } else if (showRight && leftSRV) {
                     // Mirror left eye if no right eye available
-                    blitTexture(leftSRV, rightVp);
+                    blitTexture(leftSRV, rightVp, rightBlend);
                 }
             }
 
@@ -6456,7 +7163,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
                 s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
                 const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-                s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
+                if (clearTarget) s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
 
                 // Where the eyes land in the backbuffer (= client area), after zoom and pan.
                 // Single eye uses the rect whole; SBS / OverUnder split it; Anaglyph
@@ -6478,11 +7185,17 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                     }
                 }
 
-                ID3D11BlendState* leftBlend = nullptr;
-                ID3D11BlendState* rightBlend = nullptr;
+                const UINT8 rgbMask = D3D11_COLOR_WRITE_ENABLE_RED |
+                                      D3D11_COLOR_WRITE_ENABLE_GREEN |
+                                      D3D11_COLOR_WRITE_ENABLE_BLUE;
+                ID3D11BlendState* leftBlend = rt::GetLayerBlendState(s, blendMode, rgbMask);
+                ID3D11BlendState* rightBlend = leftBlend;
                 if (!singleEye && layout == ui::DisplayLayout::Anaglyph) {
-                    leftBlend = s.anaglyphRedBS.Get();
-                    rightBlend = s.anaglyphCyanBS.Get();
+                    leftBlend = rt::GetLayerBlendState(
+                        s, blendMode, D3D11_COLOR_WRITE_ENABLE_RED);
+                    rightBlend = rt::GetLayerBlendState(
+                        s, blendMode,
+                        D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE);
                 }
 
                 if (showLeft) {
@@ -6530,7 +7243,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // The cross-queue sync that orders this read after the app's own frame work
             // is raised once for the whole frame, in closePreviewSlot.
 
-            // Blit using D3D12 copy commands → readback → GDI (no DXGI Present, no hook conflicts)
+            // Blit using D3D12 copy commands â†’ readback â†’ GDI (no DXGI Present, no hook conflicts)
             if (proj.viewCount > 1) {
                 const auto& vR = proj.views[1];
                 auto& chR = const_cast<rt::Swapchain&>(*chRPtr);
@@ -6542,10 +7255,10 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 }
                 blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex, rectL,
                                    &chR, rightIdx, vR.subImage.imageArrayIndex, rectR,
-                                   layout, viewMode);
+                                   layout, viewMode, blendMode);
             } else {
                 blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex, rectL,
-                                   nullptr, 0, 0, rectL, layout, viewMode);
+                                   nullptr, 0, 0, rectL, layout, viewMode, blendMode);
             }
 
             // No Present call needed: the composite is shown by paintPreviewComposite once
@@ -6555,7 +7268,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
     }
 }
 
-static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) {
+static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad,
+                            bool reuseGLReadback = false, bool countAsLayer = true) {
     if (!quad) return;
     // D3D12 sessions use previewRT12, not previewSwapchain
     if (!s.previewSwapchain && !s.previewRT12) return;
@@ -6568,11 +7282,13 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
 
     auto& chain = it->second;
 
-    // Get texture dimensions from the quad subImage
-    uint32_t texWidth = quad->subImage.imageRect.extent.width;
-    uint32_t texHeight = quad->subImage.imageRect.extent.height;
-    if (texWidth == 0) texWidth = chain.width;
-    if (texHeight == 0) texHeight = chain.height;
+    // A legal empty rectangle is a no-op. Resolve once so every graphics backend samples
+    // the same region rather than interpreting zero as a request for the full texture.
+    const rt::SubImageRect qrect = rt::ResolveSubImageRect(
+        quad->subImage.imageRect, chain.width, chain.height, "quad");
+    if (qrect.w == 0 || qrect.h == 0) return;
+    const uint32_t texWidth = qrect.w;
+    const uint32_t texHeight = qrect.h;
 
     // Get texture index
     uint32_t texIdx = (chain.lastReleased != UINT32_MAX) ? chain.lastReleased :
@@ -6610,20 +7326,19 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         rt::PreviewFrame12* slot = beginPreviewSlot(s);
         if (!slot) return;
         if (!beginPreviewRT(s, *slot)) return;
-        ++slot->quadLayers;
+        if (countAsLayer) ++slot->quadLayers;
 
         const D3D12_RESOURCE_DESC rtDesc = s.previewRT12->GetDesc();
         const int rtWidth = (int)rtDesc.Width, rtHeight = (int)rtDesc.Height;
 
         // Only the region the app declared valid is sampled.
-        const rt::SubImageRect qrect = rt::ResolveSubImageRect(quad->subImage.imageRect, chain.width, chain.height, "quad");
         const float texW = (float)qd.Width, texH = (float)qd.Height;
         if (texW <= 0.0f || texH <= 0.0f) return;
         const float uvRect[4] = { (float)qrect.x / texW, (float)qrect.y / texH,
                                   (float)(qrect.x + qrect.w) / texW, (float)(qrect.y + qrect.h) / texH };
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = PreviewQuadSrvFormat(qd.Format);
+        srvDesc.Format = PreviewLinearSrvFormat(qd.Format, (DXGI_FORMAT)chain.format);
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         if (qd.DepthOrArraySize > 1) {
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -6822,7 +7537,6 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
 
         std::vector<uint8_t>& pixels=s.glQuadPixels;
         const auto rect=rt::ResolveSubImageRect(quad->subImage.imageRect,chain.width,chain.height,"GL quad");
-        texWidth=rect.w; texHeight=rect.h;
         if (!ReadGLSubImage(chain,glTex,quad->subImage.imageArrayIndex,rect,pixels)) return;
 
         // Store quad layer pixels only when a screenshot actually asked for them;
@@ -6910,8 +7624,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         // Clamp the app's rect the way the eye path does, and size the temp texture to the
         // rect rather than the whole image - the copy lands at (0,0), so a full-size temp
         // would leave the sub-rect shrunk into the corner of the sampled UV range.
-        const rt::SubImageRect rect = rt::ResolveSubImageRect(quad->subImage.imageRect,
-                                                              srcDesc.Width, srcDesc.Height, "quad");
+        const rt::SubImageRect rect = qrect;
 
         // One slice at the rect's size, from the cache: a full-size temp would leave
         // the sub-rect shrunk into the corner of the sampled UV range.
@@ -7104,6 +7817,68 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     s.d3d11Context->PSSetShaderResources(0, 1, nullSRV);
 }
 
+static bool renderCylinderLayer(rt::Session& session,
+                                const XrCompositionLayerCylinderKHR* cylinder) {
+    if (!cylinder) return false;
+    const std::vector<composition_render::CylinderSegment> segments =
+        composition_render::BuildCylinderSegments(*cylinder);
+    if (segments.empty()) return false;
+
+    // Approximate the curved surface with chord quads. Adjacent chords share exact
+    // endpoints, their source rectangles partition the submitted image without overlap,
+    // and each local +Z normal points inward toward the cylinder origin.
+    float yaw, pitch, roll;
+    rt::GetEffectiveHeadAngles(yaw, pitch, roll);
+    bool texturePrepared = false;
+    bool layerCounted = false;
+    for (size_t index = 0; index < segments.size(); ++index) {
+        const composition_render::CylinderSegment& segment = segments[index];
+        const float halfYaw = -segment.centerAngle * 0.5f;
+        XrPosef local{};
+        local.orientation = {0.0f, std::sin(halfYaw), 0.0f, std::cos(halfYaw)};
+        local.position = segment.position;
+
+        XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        quad.layerFlags = cylinder->layerFlags;
+        quad.space = cylinder->space;
+        quad.eyeVisibility = cylinder->eyeVisibility;
+        quad.subImage = cylinder->subImage;
+        quad.subImage.imageRect = segment.imageRect;
+        quad.pose = pose_math::Compose(cylinder->pose, local);
+        quad.size = {segment.width, segment.height};
+
+        // The extension explicitly exposes only the inside surface. Cull each eye against
+        // the inward-facing chord normal before handing the segment to the two-sided quad
+        // renderer.
+        const XrPosef world = rt::QuadWorldPose(quad, yaw, pitch, roll);
+        const XrVector3f normal = pose_math::Rotate(world.orientation, {0.0f, 0.0f, 1.0f});
+        bool visible[2] = {};
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            if (!rt::QuadVisibleInEye(cylinder->eyeVisibility, eye)) continue;
+            const XrPosef view = rt::ViewPoseFromAngles(eye, yaw, pitch, roll);
+            const XrVector3f toEye{view.position.x - world.position.x,
+                                   view.position.y - world.position.y,
+                                   view.position.z - world.position.z};
+            visible[eye] = normal.x * toEye.x + normal.y * toEye.y +
+                           normal.z * toEye.z > 0.0f;
+        }
+        if (!visible[0] && !visible[1]) continue;
+        quad.eyeVisibility = visible[0] && visible[1] ? XR_EYE_VISIBILITY_BOTH
+                           : visible[0] ? XR_EYE_VISIBILITY_LEFT
+                                        : XR_EYE_VISIBILITY_RIGHT;
+        renderQuadLayer(session, &quad, texturePrepared, !layerCounted);
+        texturePrepared = true;
+        layerCounted = true;
+    }
+
+    static uint64_t cylinderLogCount = 0;
+    if (g_logVerbose && (++cylinderLogCount <= 5 || cylinderLogCount % 120 == 1)) {
+        Logf("[SimXR] Cylinder layer: radius=%.3f angle=%.3f aspect=%.3f segments=%zu",
+             cylinder->radius, cylinder->centralAngle, cylinder->aspectRatio, segments.size());
+    }
+    return layerCounted;
+}
+
 // Draw the newest preview frame the GPU has actually finished into the GDI back buffer.
 // Nothing here waits: a frame that is not ready yet stays pending and is picked up on a
 // later call, and if two are ready only the newest is painted - painting the older one
@@ -7156,11 +7931,203 @@ static void renderProjectionOverlay(rt::Session& s, const XrCompositionLayerProj
     }
 }
 
-static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* info) {
+static bool IsExtensionEnabled(const char* name) {
+    return std::find(rt::g_instance.enabledExtensions.begin(), rt::g_instance.enabledExtensions.end(), name) !=
+        rt::g_instance.enabledExtensions.end();
+}
+
+static bool IsCompositionSpace(XrSpace space) {
+    return rt::g_referenceSpaces.find(space) != rt::g_referenceSpaces.end() ||
+        rt::g_controllerSpaces.find(space) != rt::g_controllerSpaces.end();
+}
+
+static XrResult ValidateCompositionSubImage(const XrSwapchainSubImage& subImage) {
+    auto it = rt::g_swapchains.find(subImage.swapchain);
+    if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
+    const rt::Swapchain& chain = it->second;
+    const bool released = chain.lastReleased != UINT32_MAX &&
+        chain.lastReleased < chain.imageCount && !chain.lifecycle.IsAppOwned(chain.lastReleased);
+    return composition_validation::ValidateSubImage(subImage, {
+        chain.width, chain.height, chain.arraySize, chain.faceCount, released,
+    });
+}
+
+static XrResult ValidateProjectionView(const XrCompositionLayerProjectionView& view) {
+    if (view.type != XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW) return XR_ERROR_VALIDATION_FAILURE;
+    if (!pose_math::IsNormalized(view.pose.orientation)) return XR_ERROR_POSE_INVALID;
+    if (!composition_validation::IsValidFov(view.fov)) return XR_ERROR_VALIDATION_FAILURE;
+    XrResult result = ValidateCompositionSubImage(view.subImage);
+    if (XR_FAILED(result)) return result;
+
+    for (const XrBaseInStructure* next = reinterpret_cast<const XrBaseInStructure*>(view.next);
+         next; next = next->next) {
+        if (next->type != XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR) continue;
+        if (!IsExtensionEnabled(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME)) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+        const auto* depth = reinterpret_cast<const XrCompositionLayerDepthInfoKHR*>(next);
+        result = ValidateCompositionSubImage(depth->subImage);
+        if (XR_FAILED(result)) return result;
+        if (!std::isfinite(depth->minDepth) || !std::isfinite(depth->maxDepth) ||
+            depth->minDepth < 0.0f || depth->maxDepth > 1.0f ||
+            depth->minDepth >= depth->maxDepth ||
+            !(depth->nearZ > 0.0f) || !(depth->farZ > 0.0f) ||
+            depth->nearZ == depth->farZ) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+    }
+    return XR_SUCCESS;
+}
+
+static XrResult ValidateFrameSubmission(const XrFrameEndInfo& info) {
+    if (info.displayTime <= 0) return XR_ERROR_TIME_INVALID;
+    if (info.environmentBlendMode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE) {
+        return XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED;
+    }
+    if (info.layerCount > 16) return XR_ERROR_LAYER_LIMIT_EXCEEDED;
+    if (info.layerCount > 0 && !info.layers) return XR_ERROR_VALIDATION_FAILURE;
+
+    constexpr XrCompositionLayerFlags validLayerFlags =
+        XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT |
+        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+    for (uint32_t i = 0; i < info.layerCount; ++i) {
+        const XrCompositionLayerBaseHeader* base = info.layers[i];
+        if (!base) return XR_ERROR_LAYER_INVALID;
+        if (base->layerFlags & ~validLayerFlags) return XR_ERROR_VALIDATION_FAILURE;
+        if (!IsCompositionSpace(base->space)) return XR_ERROR_HANDLE_INVALID;
+
+        XrResult result = XR_SUCCESS;
+        switch (base->type) {
+            case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
+                const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(base);
+                if (projection->viewCount != 2 || !projection->views) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                for (uint32_t view = 0; view < projection->viewCount; ++view) {
+                    result = ValidateProjectionView(projection->views[view]);
+                    if (XR_FAILED(result)) return result;
+                }
+                break;
+            }
+            case XR_TYPE_COMPOSITION_LAYER_QUAD: {
+                const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(base);
+                if (!pose_math::IsNormalized(quad->pose.orientation)) {
+                    return XR_ERROR_POSE_INVALID;
+                }
+                if (quad->eyeVisibility != XR_EYE_VISIBILITY_BOTH &&
+                    quad->eyeVisibility != XR_EYE_VISIBILITY_LEFT &&
+                    quad->eyeVisibility != XR_EYE_VISIBILITY_RIGHT) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                if (!std::isfinite(quad->size.width) || !std::isfinite(quad->size.height) ||
+                    quad->size.width < 0.0f || quad->size.height < 0.0f) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                result = ValidateCompositionSubImage(quad->subImage);
+                if (XR_FAILED(result)) return result;
+                break;
+            }
+            case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR: {
+                if (!IsExtensionEnabled(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME)) {
+                    return XR_ERROR_LAYER_INVALID;
+                }
+                const auto* cylinder = reinterpret_cast<const XrCompositionLayerCylinderKHR*>(base);
+                if (!pose_math::IsNormalized(cylinder->pose.orientation)) {
+                    return XR_ERROR_POSE_INVALID;
+                }
+                if (cylinder->eyeVisibility != XR_EYE_VISIBILITY_BOTH &&
+                    cylinder->eyeVisibility != XR_EYE_VISIBILITY_LEFT &&
+                    cylinder->eyeVisibility != XR_EYE_VISIBILITY_RIGHT) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                constexpr float twoPi = 6.28318530717958647692f;
+                if (std::isnan(cylinder->radius) || cylinder->radius < 0.0f ||
+                    !std::isfinite(cylinder->centralAngle) || cylinder->centralAngle < 0.0f ||
+                    cylinder->centralAngle >= twoPi || !std::isfinite(cylinder->aspectRatio) ||
+                    cylinder->aspectRatio <= 0.0f) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                result = ValidateCompositionSubImage(cylinder->subImage);
+                if (XR_FAILED(result)) return result;
+                break;
+            }
+            default:
+                return XR_ERROR_LAYER_INVALID;
+        }
+    }
+    return XR_SUCCESS;
+}
+
+static void RecordProjectionSubmission(const XrCompositionLayerProjection& projection,
+                                       uint64_t frame) {
+    if (projection.viewCount < 1 || !projection.views) return;
+
+    mcp::ProjLogEntry entry{};
+    entry.frame = frame;
+    entry.poseQx = projection.views[0].pose.orientation.x;
+    entry.poseQy = projection.views[0].pose.orientation.y;
+    entry.poseQz = projection.views[0].pose.orientation.z;
+    entry.poseQw = projection.views[0].pose.orientation.w;
+    entry.posX = projection.views[0].pose.position.x;
+    entry.posY = projection.views[0].pose.position.y;
+    entry.posZ = projection.views[0].pose.position.z;
+    const uint32_t count = (std::min)(projection.viewCount, 2u);
+    XrSwapchain seenSwapchains[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+    for (uint32_t view = 0; view < count; ++view) {
+        entry.aL[view] = projection.views[view].fov.angleLeft;
+        entry.aR[view] = projection.views[view].fov.angleRight;
+        entry.aU[view] = projection.views[view].fov.angleUp;
+        entry.aD[view] = projection.views[view].fov.angleDown;
+        entry.rectX[view] = projection.views[view].subImage.imageRect.offset.x;
+        entry.rectY[view] = projection.views[view].subImage.imageRect.offset.y;
+        entry.rectW[view] = projection.views[view].subImage.imageRect.extent.width;
+        entry.rectH[view] = projection.views[view].subImage.imageRect.extent.height;
+
+        const XrSwapchain handle = projection.views[view].subImage.swapchain;
+        auto chainIt = rt::g_swapchains.find(handle);
+        if (chainIt != rt::g_swapchains.end()) {
+            rt::Swapchain& chain = chainIt->second;
+            entry.imageIndex[view] = chain.lastReleased;
+            entry.releaseSerial[view] = chain.releaseSerial;
+            bool alreadySeen = false;
+            for (uint32_t previous = 0; previous < view; ++previous) {
+                if (seenSwapchains[previous] == handle) {
+                    entry.fresh[view] = entry.fresh[previous];
+                    alreadySeen = true;
+                    break;
+                }
+            }
+            if (!alreadySeen) {
+                entry.fresh[view] = chain.lastReleased != UINT32_MAX &&
+                    chain.releaseSerial != 0 &&
+                    chain.releaseSerial != chain.lastProjectionReleaseSerial;
+                chain.lastProjectionReleaseSerial = chain.releaseSerial;
+            }
+        }
+        seenSwapchains[view] = handle;
+    }
+    mcp::g_projLog[mcp::g_projLogHead] = entry;
+    mcp::g_projLogHead = (mcp::g_projLogHead + 1) % mcp::PROJ_LOG_CAPACITY;
+    if (mcp::g_projLogCount < mcp::PROJ_LOG_CAPACITY) ++mcp::g_projLogCount;
+    mcp::g_lastProjEntry = entry;
+}
+
+static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEndInfo* info) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_FRAME_END_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        if (!rt::g_session.frameLifecycle.CanEnd()) return XR_ERROR_CALL_ORDER_INVALID;
+    }
+    const XrResult validation = ValidateFrameSubmission(*info);
+    if (XR_FAILED(validation)) return validation;
+
     // Reentrance guard: when our preview swapchain calls Present(), Steam's overlay
     // (gameoverlayrenderer64) hooks it, which can trigger UEVR to re-submit frames
     // through the OpenXR API layer chain, re-entering this function and causing
-    // infinite recursion → EXCEPTION_STACK_OVERFLOW.
+    // infinite recursion â†’ EXCEPTION_STACK_OVERFLOW.
     static std::atomic_flag inEndFrame = ATOMIC_FLAG_INIT;
     if (inEndFrame.test_and_set(std::memory_order_acquire)) {
         static std::atomic<int> reentrantCount{0};
@@ -7194,12 +8161,6 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         }
     }
 
-    if (!info) {
-        Log("[SimXR] xrEndFrame: ERROR - info is null");
-        inEndFrame.clear(std::memory_order_release);
-        return XR_ERROR_VALIDATION_FAILURE;
-    }
-
     // Drain the requests that decide whether this frame has to reach the mirror, before
     // deciding it. Every backend's screenshot path then just tests g_screenshotRequested.
     if (mcp::g_commandsDue) mcp::CheckScreenshotRequest();
@@ -7209,12 +8170,10 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     // burst's baseline and every later frame shows the app catching up.
     if (mcp::g_commandsDue) {
         mcp::BurstCommand bc = mcp::CheckBurstCommand();
-        if (bc.valid && !rt::g_session.usesD3D12) {
-            // A burst is recorded out of the D3D12 preview's DIB back buffer, the only place
-            // a composited frame sits in CPU memory. The D3D11 and OpenGL previews go
-            // straight to a swapchain, so say so rather than leaving a poller waiting on a
-            // burst_done.json that is never coming.
-            Log("[SimXR] burst: only D3D12 and Vulkan sessions can be recorded");
+        if (bc.valid && rt::g_session.usesOpenGL) {
+            // D3D12/Vulkan already expose a CPU DIB; direct D3D11 now uses an asynchronous
+            // staging ring. OpenGL is the only backend still without this burst path.
+            Log("[SimXR] burst: OpenGL sessions cannot be recorded");
             mcp::WriteCommandAck("burst", false);
         } else if (bc.valid) {
             if (bc.pose.valid) {
@@ -7234,7 +8193,10 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     // hangs off it (see g_previewDueThisFrame). A pending screenshot or a running burst
     // overrides the cap - both asked for a particular frame, not for the next one the rate
     // happens to allow, and with the mirror off there would be no next one.
-    g_previewDueThisFrame = ui::PreviewFrameDue() || mcp::g_screenshotRequested || mcp::g_burstActive;
+    // Forced detector windows and bursts require consecutive composed xrEndFrame samples;
+    // neither is allowed to inherit the user's Mirror Rate cap.
+    g_previewDueThisFrame = ui::PreviewFrameDue() || mcp::g_screenshotRequested ||
+                            mcp::g_burstActive || flicker::WantsPreviewReadback();
 
     // Order the app's Vulkan queue against the compositor's D3D12 queue. Skipped when the
     // mirror is not due this frame: nothing reads the app's images then.
@@ -7244,7 +8206,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         Logf("[SimXR] xrEndFrame: layers=%u", info->layerCount);
     }
 
-    // First pass: count layer types to know if we need to defer Present
+    // Count layer types for diagnostics and timing; rendering itself stays in submission order.
     int projectionCount = 0, quadCount = 0, cylinderCount = 0, otherCount = 0;
     bool hasStereoProjection = false;
     for (uint32_t i = 0; i < info->layerCount; ++i) {
@@ -7265,7 +8227,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
                 break;
             }
             case XR_TYPE_COMPOSITION_LAYER_QUAD: quadCount++; break;
-            case (XrStructureType)37: cylinderCount++; break; // XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR
+            case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR: cylinderCount++; break;
             default: otherCount++; break;
         }
     }
@@ -7274,123 +8236,87 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     flicker::ObserveSubmission((uint64_t)frameCount, (uint32_t)projectionCount,
                                info->layerCount);
 
-    // Determine if we need to defer Present for overlay layers
     g_presentPending = false;
 
-    // Record the primary projection for screenshot geometry. Foreground stereo
-    // layers must not replace the world view or resize the preview mid-composite.
-    for (uint32_t i = 0; i < info->layerCount; ++i) {
-        const XrCompositionLayerBaseHeader* base = info->layers[i];
-        if (!base) continue;
+    bool compositionStarted = false;
+    bool projectionComposed = false;
+    LONGLONG projectionTicks = 0;
+    LONGLONG overlayTicks = 0;
 
-        if (base->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-            const auto* proj = reinterpret_cast<const XrCompositionLayerProjection*>(base);
-
-            // Capture the FOV+pose+rect the app is submitting into the
-            // projection log. MCP get_projection_log returns the recent
-            // window so the caller can diff "what app told the
-            // compositor" vs "what the simulator is configured to use."
-            if (proj->viewCount >= 1 && proj->views) {
-                mcp::ProjLogEntry e{};
-                e.frame   = frameCount;
-                e.poseQx  = proj->views[0].pose.orientation.x;
-                e.poseQy  = proj->views[0].pose.orientation.y;
-                e.poseQz  = proj->views[0].pose.orientation.z;
-                e.poseQw  = proj->views[0].pose.orientation.w;
-                e.posX    = proj->views[0].pose.position.x;
-                e.posY    = proj->views[0].pose.position.y;
-                e.posZ    = proj->views[0].pose.position.z;
-                uint32_t cap = (proj->viewCount >= 2) ? 2u : 1u;
-                for (uint32_t v = 0; v < cap; ++v) {
-                    e.aL[v] = proj->views[v].fov.angleLeft;
-                    e.aR[v] = proj->views[v].fov.angleRight;
-                    e.aU[v] = proj->views[v].fov.angleUp;
-                    e.aD[v] = proj->views[v].fov.angleDown;
-                    e.rectX[v] = proj->views[v].subImage.imageRect.offset.x;
-                    e.rectY[v] = proj->views[v].subImage.imageRect.offset.y;
-                    e.rectW[v] = proj->views[v].subImage.imageRect.extent.width;
-                    e.rectH[v] = proj->views[v].subImage.imageRect.extent.height;
-                }
-                mcp::g_projLog[mcp::g_projLogHead] = e;
-                mcp::g_projLogHead = (mcp::g_projLogHead + 1) % mcp::PROJ_LOG_CAPACITY;
-                if (mcp::g_projLogCount < mcp::PROJ_LOG_CAPACITY) ++mcp::g_projLogCount;
-                mcp::g_lastProjEntry = e;
-            }
-
-            if (proj->views && proj->viewCount) {
-                uint32_t width = 0, height = 0;
-                for (uint32_t eye = 0; eye < (std::min)(proj->viewCount, 2u); ++eye) {
-                    auto chain = rt::g_swapchains.find(proj->views[eye].subImage.swapchain);
-                    if (chain == rt::g_swapchains.end()) continue;
-                    const auto rect = rt::ResolveSubImageRect(proj->views[eye].subImage.imageRect,
-                        chain->second.width, chain->second.height, "primary projection");
-                    width = (std::max)(width, rect.w); height = (std::max)(height, rect.h);
-                }
-                if (width && height) {
-                    const auto oldW = rt::g_sourceWidth.exchange(width), oldH = rt::g_sourceHeight.exchange(height);
-                    if (rt::g_session.hwnd && (oldW != width || oldH != height)) rt::FitWindowToContentAspect(rt::g_session.hwnd);
-                }
-            }
-            break;
-        }
-    }
-    LARGE_INTEGER afterProjection{};
-    QueryPerformanceCounter(&afterProjection);
-
-    // OpenXR layer order is authoritative; layer type does not reorder the stack.
-    // The common opaque-first projection already sizes and clears the preview.
-    // Only bootstrap here when another kind of layer starts the frame, avoiding
-    // an extra full-screen clear / RTV creation on the ordinary game path.
-    bool drewLayer = false;
-    const auto prepareForOverlay = [&]() {
-        if (drewLayer) return;
+    // A quad can be the first pixel-producing layer even when an earlier projection has
+    // empty view rectangles. Give it a clean canvas without changing the submitted order.
+    const auto prepareOverlayCanvas = [&](bool anotherLayerWillDraw) {
         ensurePreviewWithoutProjection(rt::g_session);
-        if (g_previewDueThisFrame) {
-            if (!rt::g_session.usesD3D12) clearPreviewToBlack(rt::g_session);
-            else if (rt::PreviewFrame12* slot = beginPreviewSlot(rt::g_session)) beginPreviewRT(rt::g_session, *slot);
+        if (!g_previewDueThisFrame) return;
+        if (!rt::g_session.usesD3D12) {
+            clearPreviewToBlack(rt::g_session);
+        } else if (!anotherLayerWillDraw) {
+            // A D3D12 layer opens and clears the target itself. An entirely empty frame
+            // has no layer pass, so open it here to replace the previous frame with black.
+            if (rt::PreviewFrame12* slot = beginPreviewSlot(rt::g_session)) {
+                beginPreviewRT(rt::g_session, *slot);
+            }
         }
     };
+
+    // OpenXR uses a painter's algorithm: each layer is composited over all earlier array
+    // entries. Keep one traversal so a projection submitted after a quad actually remains
+    // above that quad, and defer the desktop Present until the traversal is complete.
     for (uint32_t i = 0; i < info->layerCount; ++i) {
         const XrCompositionLayerBaseHeader* base = info->layers[i];
-        if (!base) continue;
+        LARGE_INTEGER layerStart{}, layerFinish{};
+        QueryPerformanceCounter(&layerStart);
 
         switch (base->type) {
             case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
-                const auto& projection = *reinterpret_cast<const XrCompositionLayerProjection*>(base);
-                if (!drewLayer && rt::BlendForLayerFlags(projection.layerFlags) == rt::LayerBlend::Opaque)
-                    presentProjection(rt::g_session, projection, true);
-                else {
-                    prepareForOverlay();
-                    renderProjectionOverlay(rt::g_session, projection);
+                const auto* projection =
+                    reinterpret_cast<const XrCompositionLayerProjection*>(base);
+                RecordProjectionSubmission(*projection, (uint64_t)frameCount);
+                if (composition_render::HasPixels(*projection)) {
+                    presentProjection(rt::g_session, *projection, true, !compositionStarted);
+                    compositionStarted = true;
+                    projectionComposed = true;
                 }
-                drewLayer = true;
+                QueryPerformanceCounter(&layerFinish);
+                projectionTicks += layerFinish.QuadPart - layerStart.QuadPart;
                 break;
             }
             case XR_TYPE_COMPOSITION_LAYER_QUAD: {
-                prepareForOverlay();
                 const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(base);
-                renderQuadLayer(rt::g_session, quad);
-                drewLayer = true;
+                if (composition_render::HasPixels(*quad)) {
+                    if (!compositionStarted) prepareOverlayCanvas(true);
+                    renderQuadLayer(rt::g_session, quad);
+                    compositionStarted = true;
+                }
+                QueryPerformanceCounter(&layerFinish);
+                overlayTicks += layerFinish.QuadPart - layerStart.QuadPart;
                 break;
             }
-            case (XrStructureType)37: {
-                // TODO: Implement cylinder layer rendering
+            case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR: {
+                const auto* cylinder =
+                    reinterpret_cast<const XrCompositionLayerCylinderKHR*>(base);
+                if (composition_render::HasPixels(*cylinder)) {
+                    if (!compositionStarted) prepareOverlayCanvas(true);
+                    compositionStarted = renderCylinderLayer(rt::g_session, cylinder) ||
+                                         compositionStarted;
+                }
+                QueryPerformanceCounter(&layerFinish);
+                overlayTicks += layerFinish.QuadPart - layerStart.QuadPart;
                 break;
             }
             default:
                 break;
         }
     }
-    if (!drewLayer) prepareForOverlay();
-    if (g_previewDueThisFrame && drewLayer && !rt::g_session.usesD3D12) g_presentPending = true;
-    LARGE_INTEGER afterOverlays{};
-    QueryPerformanceCounter(&afterOverlays);
+    if (!compositionStarted) prepareOverlayCanvas(false);
+    LARGE_INTEGER afterLayers{};
+    QueryPerformanceCounter(&afterLayers);
     if (g_previewDueThisFrame || !ui_auto::g_captures.empty()) ui_auto::g_frame = BuildUiFrame(info, (uint64_t)frameCount);
 
     // Every layer of this frame has now been recorded, so hand the slot to the painter and
     // paint whichever earlier frame the GPU has finished in the meantime.
     if (rt::g_session.usesD3D12) {
-        closePreviewSlot(rt::g_session, (uint32_t)frameCount, projectionCount > 0);
+        closePreviewSlot(rt::g_session, (uint32_t)frameCount, projectionComposed);
         vkrt::FrameSyncEnd(rt::g_session);
         // Shows a finished composite if the GPU has produced one, and serves the
         // screenshot and burst requests off the very pixels it showed.
@@ -7411,6 +8337,22 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     }
     // Every command file has been looked at for this change notification.
     mcp::g_commandsDue = false;
+
+    // Consume older D3D11 staging slots without flushing or waiting, then queue this
+    // xrEndFrame's fully composed two-eye backbuffer before flip-model Present makes its
+    // contents undefined. A forced capture/burst already overrode Mirror Rate above.
+    if (!rt::g_session.usesD3D12 && !rt::g_session.usesOpenGL) {
+        consumeD3D11PreviewReadbacks(rt::g_session);
+        if (g_presentPending && g_previewDueThisFrame && projectionComposed &&
+            rt::g_session.previewSwapchain) {
+            ComPtr<ID3D11Texture2D> composedBackbuffer;
+            if (SUCCEEDED(rt::g_session.previewSwapchain->GetBuffer(
+                    0, IID_PPV_ARGS(composedBackbuffer.GetAddressOf())))) {
+                queueD3D11PreviewReadback(rt::g_session, composedBackbuffer.Get(),
+                                          (uint32_t)frameCount);
+            }
+        }
+    }
 
     // D3D11 and OpenGL capture from the preview swapchain inside presentProjection, which a
     // frame carrying no projection layer never reaches - so on a 2D-only frame the request
@@ -7480,9 +8422,9 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         const auto elapsedMs = [&](const LARGE_INTEGER& begin, const LARGE_INTEGER& end) {
             return 1000.0 * (double)(end.QuadPart - begin.QuadPart) / (double)frequency.QuadPart;
         };
-        projectionMs += elapsedMs(endFrameStart, afterProjection);
-        overlayMs += elapsedMs(afterProjection, afterOverlays);
-        detectPaintMs += elapsedMs(afterOverlays, afterDetectionAndPaint);
+        projectionMs += 1000.0 * (double)projectionTicks / (double)frequency.QuadPart;
+        overlayMs += 1000.0 * (double)overlayTicks / (double)frequency.QuadPart;
+        detectPaintMs += elapsedMs(afterLayers, afterDetectionAndPaint);
         remainderMs += elapsedMs(afterDetectionAndPaint, endFrameFinish);
         totalMs += elapsedMs(endFrameStart, endFrameFinish);
         if (++timingFrames == 300) {
@@ -7495,32 +8437,158 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         }
     }
 
+    XrResult result;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        result = rt::g_session.running
+            ? rt::g_session.frameLifecycle.End()
+            : XR_ERROR_SESSION_NOT_RUNNING;
+    }
     inEndFrame.clear(std::memory_order_release);
-    return XR_SUCCESS;
+    return result;
 }
 
-static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInfo* li, XrViewState* vs, uint32_t cap, uint32_t* outCount, XrView* views) {
-    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
-    if (outCount) *outCount = 2;
-    if (vs) { 
-        vs->type = XR_TYPE_VIEW_STATE; 
-        // Set both VALID and TRACKED bits so Unity knows this is a real tracked HMD
-        vs->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | 
-                            XR_VIEW_STATE_POSITION_VALID_BIT | 
-                            XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | 
-                            XR_VIEW_STATE_POSITION_TRACKED_BIT; 
-    }
-    if (cap < 2 || !views) return XR_SUCCESS;
+struct SpaceWorldState {
+    XrPosef pose{pose_math::Identity()};
+    bool tracked{false};
+    bool velocityValid{false};
+    XrVector3f linearVelocity{};
+    XrVector3f angularVelocity{};
+};
 
-    // Composition-layer placement reads these same two helpers, which is what keeps
-    // an overlay pinned to the geometry the app renders around it.
+static bool GetSpaceWorldState(XrSpace space, SpaceWorldState& state) {
+    auto actionIt = rt::g_controllerSpaces.find(space);
+    if (actionIt != rt::g_controllerSpaces.end()) {
+        const rt::ActionSpace& actionSpace = actionIt->second;
+        auto actionRecordIt = rt::g_actions.find(actionSpace.action);
+        if (actionRecordIt == rt::g_actions.end()) return false;
+        const rt::ActionRecord& action = actionRecordIt->second;
+        auto activeSetIt = rt::g_activeActionSetSources.find(action.actionSet);
+        if (activeSetIt == rt::g_activeActionSetSources.end()) return true;
+
+        int sourceMask = actionSpace.sourceMask;
+        if (sourceMask == 0) {
+            for (const rt::ActionBinding& binding : action.bindings) {
+                if (binding.profile == rt::g_activeProfile &&
+                    binding.input == rt::ActionInput::Pose &&
+                    (binding.sourceMask & activeSetIt->second & action.declaredSourceMask)) {
+                    const int candidate = binding.sourceMask &
+                        (interaction_query::kLeftHandSource |
+                         interaction_query::kRightHandSource);
+                    const size_t candidateSlot =
+                        interaction_query::ActionSlotForSourceMask(candidate);
+                    if (candidateSlot != 0 && action.slots[candidateSlot].poseActive) {
+                        sourceMask = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!interaction_query::IsSimulatedHandSource(sourceMask)) {
+            return true;
+        }
+        const size_t slot = interaction_query::ActionSlotForSourceMask(sourceMask);
+        if (!(activeSetIt->second & sourceMask) ||
+            !action.slots[slot].poseActive) {
+            return true;
+        }
+        const rt::ControllerState& controller =
+            sourceMask == interaction_query::kLeftHandSource
+            ? rt::g_leftController : rt::g_rightController;
+        if (!controller.isTracking) return true;
+        XrPosef controllerWorld{};
+        rt::GetControllerPose(controller, &controllerWorld);
+        const XrVector3f offsetWorld =
+            pose_math::Rotate(controllerWorld.orientation, actionSpace.poseInActionSpace.position);
+        const XrVector3f offsetVelocity =
+            pose_math::Cross(controller.angularVelocity, offsetWorld);
+        state.pose = pose_math::Compose(controllerWorld, actionSpace.poseInActionSpace);
+        state.tracked = true;
+        state.velocityValid = true;
+        state.linearVelocity = {
+            controller.linearVelocity.x + offsetVelocity.x,
+            controller.linearVelocity.y + offsetVelocity.y,
+            controller.linearVelocity.z + offsetVelocity.z,
+        };
+        state.angularVelocity = controller.angularVelocity;
+        return true;
+    }
+
+    auto referenceIt = rt::g_referenceSpaces.find(space);
+    if (referenceIt == rt::g_referenceSpaces.end()) return false;
+    XrPosef naturalOrigin = pose_math::Identity();
+    if (referenceIt->second.type == XR_REFERENCE_SPACE_TYPE_VIEW) {
+        float yaw, pitch, roll;
+        rt::GetEffectiveHeadAngles(yaw, pitch, roll);
+        naturalOrigin.orientation = rt::QuatFromYawPitchRoll(yaw, pitch, roll);
+        naturalOrigin.position = rt::g_headPos;
+    }
+    state.pose = pose_math::Compose(naturalOrigin, referenceIt->second.poseInRef);
+    state.tracked = true;
+    // LOCAL and STAGE are static in the simulator's world frame. VIEW motion is
+    // not sampled with enough history to advertise a trustworthy velocity.
+    state.velocityValid = referenceIt->second.type != XR_REFERENCE_SPACE_TYPE_VIEW;
+    return true;
+}
+
+static bool GetCommonEntityRelativePose(XrSpace space, XrSpace baseSpace, XrPosef& pose) {
+    if (space == baseSpace) {
+        pose = pose_math::Identity();
+        return true;
+    }
+
+    auto spaceAction = rt::g_controllerSpaces.find(space);
+    auto baseAction = rt::g_controllerSpaces.find(baseSpace);
+    if (spaceAction != rt::g_controllerSpaces.end() &&
+        baseAction != rt::g_controllerSpaces.end() &&
+        spaceAction->second.action == baseAction->second.action &&
+        spaceAction->second.subactionPath == baseAction->second.subactionPath) {
+        pose = pose_math::Relative(spaceAction->second.poseInActionSpace,
+                                   baseAction->second.poseInActionSpace);
+        return true;
+    }
+
+    auto spaceReference = rt::g_referenceSpaces.find(space);
+    auto baseReference = rt::g_referenceSpaces.find(baseSpace);
+    if (spaceReference != rt::g_referenceSpaces.end() &&
+        baseReference != rt::g_referenceSpaces.end() &&
+        spaceReference->second.type == baseReference->second.type) {
+        pose = pose_math::Relative(spaceReference->second.poseInRef,
+                                   baseReference->second.poseInRef);
+        return true;
+    }
+    return false;
+}
+
+static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession session, const XrViewLocateInfo* li, XrViewState* vs, uint32_t cap, uint32_t* outCount, XrView* views) {
+    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    if (!li || !vs || !outCount || li->type != XR_TYPE_VIEW_LOCATE_INFO ||
+        vs->type != XR_TYPE_VIEW_STATE) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (li->viewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    }
+    if (li->displayTime <= 0) return XR_ERROR_TIME_INVALID;
+    *outCount = 2;
+
+    SpaceWorldState baseState;
+    if (!GetSpaceWorldState(li->space, baseState)) return XR_ERROR_HANDLE_INVALID;
+    vs->viewStateFlags = baseState.tracked
+        ? XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT |
+          XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT
+        : 0;
+    if (cap == 0) return XR_SUCCESS;
+    if (!views) return XR_ERROR_VALIDATION_FAILURE;
+    if (cap < 2) return XR_ERROR_SIZE_INSUFFICIENT;
+
     float effYaw, effPitch, effRoll;
     rt::GetEffectiveHeadAngles(effYaw, effPitch, effRoll);
-
     for (uint32_t i = 0; i < 2; ++i) {
-        views[i].type = XR_TYPE_VIEW;
-        views[i].pose = ui_auto::Compose(ui_auto::Inverse(SpaceWorldPose(li ? li->space : XR_NULL_HANDLE)),
-                                       rt::ViewPoseFromAngles(i, effYaw, effPitch, effRoll));
+        if (views[i].type != XR_TYPE_VIEW) return XR_ERROR_VALIDATION_FAILURE;
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        const XrPosef eyeWorld = rt::ViewPoseFromAngles(i, effYaw, effPitch, effRoll);
+        views[i].pose = pose_math::Relative(eyeWorld, baseState.pose);
         views[i].fov = rt::GetViewFov(i);
     }
     static int locateCount = 0;
@@ -7533,148 +8601,486 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
 }
 
 // Add missing space/action functions for compatibility
-static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrReferenceSpaceCreateInfo* info, XrSpace* space) {
+static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(
+    XrSession session, const XrReferenceSpaceCreateInfo* info, XrSpace* space) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
-    if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
-    static uintptr_t nextSpace = 100;
-    *space = (XrSpace)(nextSpace++);
-    rt::g_referenceSpaces[*space] = rt::RefSpace{ info->referenceSpaceType, info->poseInReferenceSpace };
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_REFERENCE_SPACE_CREATE_INFO || !space) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW &&
+        info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL &&
+        info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE) {
+        return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+    }
+    if (!pose_math::IsNormalized(info->poseInReferenceSpace.orientation)) {
+        return XR_ERROR_POSE_INVALID;
+    }
+    XrPosef pose = info->poseInReferenceSpace;
+    pose.orientation = pose_math::Normalize(pose.orientation);
+    *space = (XrSpace)(rt::g_nextSpaceHandle++);
+    rt::g_referenceSpaces[*space] = rt::RefSpace{info->referenceSpaceType, pose};
     Logf("[SimXR] xrCreateReferenceSpace: type=%d space=%p", info->referenceSpaceType, *space);
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrDestroySpace_runtime(XrSpace space) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
-    rt::g_referenceSpaces.erase(space);
-    rt::g_controllerSpaces.erase(space);
+    const size_t erased = rt::g_referenceSpaces.erase(space) + rt::g_controllerSpaces.erase(space);
+    if (!erased) return XR_ERROR_HANDLE_INVALID;
     Logf("[SimXR] xrDestroySpace: space=%p", space);
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace, XrTime, XrSpaceLocation* location) {
+static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation* location) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     if (!location) return XR_ERROR_VALIDATION_FAILURE;
-    location->type=XR_TYPE_SPACE_LOCATION;
-    location->locationFlags=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT|
-                            XR_SPACE_LOCATION_POSITION_TRACKED_BIT|XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
-    location->pose=ui_auto::Compose(ui_auto::Inverse(SpaceWorldPose(baseSpace)),SpaceWorldPose(space));
-    auto it=rt::g_controllerSpaces.find(space);
-    if (it!=rt::g_controllerSpaces.end()) {
-        const int hand=ResolveSpaceHand(it->second);
-        const auto& ctrl=hand==0 ? rt::g_leftController:rt::g_rightController;
-        if (hand<0 || !ctrl.isTracking) location->locationFlags=0;
-        auto* velocity=(XrSpaceVelocity*)location->next;
-        if (velocity && velocity->type==XR_TYPE_SPACE_VELOCITY) {
-            velocity->velocityFlags=XR_SPACE_VELOCITY_LINEAR_VALID_BIT|XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
-            const auto toBase=ui_auto::Inverse(SpaceWorldPose(baseSpace)).orientation;
-            velocity->linearVelocity=ui_auto::Rotate(toBase,ctrl.linearVelocity);
-            velocity->angularVelocity=ui_auto::Rotate(toBase,ctrl.angularVelocity);
+    if (location->type != XR_TYPE_SPACE_LOCATION) return XR_ERROR_VALIDATION_FAILURE;
+    if (time <= 0) return XR_ERROR_TIME_INVALID;
+
+    XrSpaceVelocity* velocity = reinterpret_cast<XrSpaceVelocity*>(location->next);
+    if (velocity && velocity->type == XR_TYPE_SPACE_VELOCITY) velocity->velocityFlags = 0;
+
+    SpaceWorldState spaceState, baseState;
+    if (!GetSpaceWorldState(space, spaceState) ||
+        !GetSpaceWorldState(baseSpace, baseState)) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (GetCommonEntityRelativePose(space, baseSpace, location->pose)) {
+        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                  XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                                  XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                                  XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+        if (velocity && velocity->type == XR_TYPE_SPACE_VELOCITY) {
+            velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT |
+                                      XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+            velocity->linearVelocity = {};
+            velocity->angularVelocity = {};
         }
+        return XR_SUCCESS;
+    }
+    if (!spaceState.tracked || !baseState.tracked) {
+        location->locationFlags = 0;
+        location->pose = pose_math::Identity();
+        return XR_SUCCESS;
+    }
+
+    location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                              XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                              XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                              XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+    location->pose = pose_math::Relative(spaceState.pose, baseState.pose);
+
+    if (velocity && velocity->type == XR_TYPE_SPACE_VELOCITY &&
+        spaceState.velocityValid && baseState.velocityValid) {
+        const XrQuaternionf worldToBase = pose_math::Inverse(baseState.pose.orientation);
+        const XrVector3f worldSeparation{
+            spaceState.pose.position.x - baseState.pose.position.x,
+            spaceState.pose.position.y - baseState.pose.position.y,
+            spaceState.pose.position.z - baseState.pose.position.z,
+        };
+        const XrVector3f rotatingBaseVelocity =
+            pose_math::Cross(baseState.angularVelocity, worldSeparation);
+        const XrVector3f relativeLinearWorld{
+            spaceState.linearVelocity.x - baseState.linearVelocity.x - rotatingBaseVelocity.x,
+            spaceState.linearVelocity.y - baseState.linearVelocity.y - rotatingBaseVelocity.y,
+            spaceState.linearVelocity.z - baseState.linearVelocity.z - rotatingBaseVelocity.z,
+        };
+        const XrVector3f relativeAngularWorld{
+            spaceState.angularVelocity.x - baseState.angularVelocity.x,
+            spaceState.angularVelocity.y - baseState.angularVelocity.y,
+            spaceState.angularVelocity.z - baseState.angularVelocity.z,
+        };
+        velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT |
+                                  XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+        velocity->linearVelocity = pose_math::Rotate(worldToBase, relativeLinearWorld);
+        velocity->angularVelocity = pose_math::Rotate(worldToBase, relativeAngularWorld);
     }
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrEnumerateReferenceSpaces_runtime(XrSession, uint32_t capacity, uint32_t* count, XrReferenceSpaceType* spaces) {
-    if (count) *count = 3;
-    if (capacity >= 3 && spaces) {
-        spaces[0] = XR_REFERENCE_SPACE_TYPE_VIEW;
-        spaces[1] = XR_REFERENCE_SPACE_TYPE_LOCAL;
-        spaces[2] = XR_REFERENCE_SPACE_TYPE_STAGE;
-    }
+static XrResult XRAPI_PTR xrEnumerateReferenceSpaces_runtime(XrSession session, uint32_t capacity, uint32_t* count, XrReferenceSpaceType* spaces) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, spaces, 3);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
+    spaces[0] = XR_REFERENCE_SPACE_TYPE_VIEW;
+    spaces[1] = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    spaces[2] = XR_REFERENCE_SPACE_TYPE_STAGE;
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrCreateActionSpace_runtime(XrSession, const XrActionSpaceCreateInfo* info, XrSpace* space) {
+static XrResult XRAPI_PTR xrCreateActionSpace_runtime(
+    XrSession session, const XrActionSpaceCreateInfo* info, XrSpace* space) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
-    if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
-    static uintptr_t nextSpace = 200;
-    *space = (XrSpace)(nextSpace++);
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_ACTION_SPACE_CREATE_INFO || !space) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    auto actionIt = rt::g_actions.find(info->action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    if (actionIt->second.type != XR_ACTION_TYPE_POSE_INPUT) {
+        return XR_ERROR_ACTION_TYPE_MISMATCH;
+    }
+    if (!pose_math::IsNormalized(info->poseInActionSpace.orientation)) {
+        return XR_ERROR_POSE_INVALID;
+    }
 
-    // Detect controller subaction paths and register the space
-    int controllerType = 0;  // 0=none, 1=left, 2=right
-    Logf("[SimXR] xrCreateActionSpace: subactionPath=%llu, g_pathStrings.size()=%zu",
-         (unsigned long long)info->subactionPath, rt::g_pathStrings.size());
+    // Detect controller subaction paths and register the space.
+    int sourceMask = 0; // XR_NULL_PATH selects a combined action space.
 
     if (info->subactionPath != XR_NULL_PATH) {
         auto it = rt::g_pathStrings.find(info->subactionPath);
-        if (it != rt::g_pathStrings.end()) {
-            const std::string& pathStr = it->second;
-            Logf("[SimXR] xrCreateActionSpace: found path='%s'", pathStr.c_str());
-            if (pathStr.find("/user/hand/left") != std::string::npos) {
-                controllerType = 1;  // Left controller
-                Logf("[SimXR] xrCreateActionSpace: LEFT controller space %llu", (unsigned long long)*space);
-            } else if (pathStr.find("/user/hand/right") != std::string::npos) {
-                controllerType = 2;  // Right controller
-                Logf("[SimXR] xrCreateActionSpace: RIGHT controller space %llu", (unsigned long long)*space);
-            }
-        } else {
-            Logf("[SimXR] xrCreateActionSpace: path %llu NOT FOUND in g_pathStrings", (unsigned long long)info->subactionPath);
+        if (it == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+        if (!actionIt->second.declaredSubactionPaths.count(info->subactionPath)) {
+            return XR_ERROR_PATH_UNSUPPORTED;
         }
-    } else {
-        Log("[SimXR] xrCreateActionSpace: subactionPath is XR_NULL_PATH");
+        sourceMask = interaction_query::ActionSourceMask(it->second);
     }
 
-    if (rt::g_actionInfo.count(info->action)) {
-        rt::g_controllerSpaces[*space] = {controllerType-1, info->action, info->poseInActionSpace};
-    }
+    *space = (XrSpace)(rt::g_nextSpaceHandle++);
+    XrPosef pose = info->poseInActionSpace;
+    pose.orientation = pose_math::Normalize(pose.orientation);
+    rt::g_controllerSpaces[*space] = rt::ActionSpace{
+        info->action, info->subactionPath, sourceMask, pose};
 
     Log("[SimXR] xrCreateActionSpace");
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrCreateActionSet_runtime(XrInstance, const XrActionSetCreateInfo* info, XrActionSet* set) {
-    if (!info || !set) return XR_ERROR_VALIDATION_FAILURE;
+static int SourceMaskForTopLevelPath(XrPath path) {
+    auto it = rt::g_pathStrings.find(path);
+    if (it == rt::g_pathStrings.end()) return 0;
+    return interaction_query::ActionSourceMask(it->second);
+}
+
+static int SourceMaskForBindingPath(const std::string& path) {
+    static const char* const topLevels[] = {
+        "/user/hand/left", "/user/hand/right", "/user/head", "/user/gamepad",
+    };
+    for (const char* topLevel : topLevels) {
+        const size_t length = std::strlen(topLevel);
+        if (path.compare(0, length, topLevel) == 0 && path.size() > length &&
+            path[length] == '/') {
+            return interaction_query::ActionSourceMask(topLevel);
+        }
+    }
+    return 0;
+}
+
+static rt::ActionInput InputForBindingPath(XrActionType type, const std::string& path) {
+    const auto componentFor = [&](const char* identifier, std::string& component) {
+        const std::string needle = std::string("/input/") + identifier;
+        const size_t pos = path.find(needle);
+        if (pos == std::string::npos) return false;
+        const size_t end = pos + needle.size();
+        if (end == path.size()) {
+            component.clear();
+            return true;
+        }
+        if (path[end] != '/' || path.find('/', end + 1) != std::string::npos) return false;
+        component = path.substr(end + 1);
+        return true;
+    };
+
+    const auto hasConvertibleComponent = [&](const char* identifier, const char* components) {
+        std::string component;
+        if (!componentFor(identifier, component)) return false;
+        if (component.empty()) return true;
+        const std::string allowed = std::string("|") + components + "|";
+        return allowed.find(std::string("|") + component + "|") != std::string::npos;
+    };
+
+    std::string component;
+    if (type == XR_ACTION_TYPE_POSE_INPUT) {
+        if ((componentFor("grip", component) || componentFor("aim", component)) && component == "pose") {
+            return rt::ActionInput::Pose;
+        }
+        return rt::ActionInput::Unknown;
+    }
+    if (type == XR_ACTION_TYPE_BOOLEAN_INPUT) {
+        if (hasConvertibleComponent("trigger", "click|value") ||
+            hasConvertibleComponent("select", "click|value")) return rt::ActionInput::Trigger;
+        if (hasConvertibleComponent("squeeze", "click|value|force") ||
+            hasConvertibleComponent("grip", "click|value|force")) return rt::ActionInput::Grip;
+        if (hasConvertibleComponent("menu", "click")) return rt::ActionInput::Menu;
+        if (hasConvertibleComponent("a", "click") || hasConvertibleComponent("x", "click")) {
+            return rt::ActionInput::Primary;
+        }
+        if (hasConvertibleComponent("b", "click") || hasConvertibleComponent("y", "click")) {
+            return rt::ActionInput::Secondary;
+        }
+        if (hasConvertibleComponent("thumbstick", "click")) return rt::ActionInput::Thumbstick;
+        return rt::ActionInput::Unknown;
+    }
+    if (type == XR_ACTION_TYPE_FLOAT_INPUT) {
+        if (hasConvertibleComponent("trigger", "click|value") ||
+            hasConvertibleComponent("select", "click|value")) return rt::ActionInput::Trigger;
+        if (hasConvertibleComponent("squeeze", "click|value|force") ||
+            hasConvertibleComponent("grip", "click|value|force")) return rt::ActionInput::Grip;
+        return rt::ActionInput::Unknown;
+    }
+    if (type == XR_ACTION_TYPE_VECTOR2F_INPUT) {
+        if (componentFor("thumbstick", component) && component.empty()) return rt::ActionInput::Thumbstick;
+        return rt::ActionInput::Unknown;
+    }
+    if (type == XR_ACTION_TYPE_VIBRATION_OUTPUT) {
+        if (path.find("/output/haptic") != std::string::npos) {
+            return rt::ActionInput::Haptic;
+        }
+        return rt::ActionInput::Unknown;
+    }
+    return rt::ActionInput::Unknown;
+}
+
+static bool HasPathPrefix(const std::string& path, const char* prefix) {
+    return path.compare(0, std::strlen(prefix), prefix) == 0;
+}
+
+template <size_t N>
+static bool StringIn(const std::string& value, const char* const (&values)[N]) {
+    return std::find_if(std::begin(values), std::end(values), [&](const char* item) {
+        return value == item;
+    }) != std::end(values);
+}
+
+static bool IsSupportedInteractionProfilePath(const std::string& path) {
+    static const char* const profiles[] = {
+        "/interaction_profiles/khr/simple_controller",
+        "/interaction_profiles/google/daydream_controller",
+        "/interaction_profiles/htc/vive_controller",
+        "/interaction_profiles/htc/vive_pro",
+        "/interaction_profiles/microsoft/motion_controller",
+        "/interaction_profiles/microsoft/xbox_controller",
+        "/interaction_profiles/oculus/go_controller",
+        "/interaction_profiles/oculus/touch_controller",
+        "/interaction_profiles/valve/index_controller",
+    };
+    return StringIn(path, profiles);
+}
+
+static bool SplitBindingPath(const std::string& path, std::string& topLevel, std::string& suffix) {
+    static const char* const topLevels[] = {
+        "/user/hand/left", "/user/hand/right", "/user/head", "/user/gamepad",
+    };
+    for (const char* top : topLevels) {
+        const std::string prefix = std::string(top) + "/";
+        if (HasPathPrefix(path, prefix.c_str())) {
+            topLevel = top;
+            suffix = path.substr(prefix.size());
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool IsAllowedBindingPath(const std::string& profile, const std::string& path) {
+    std::string topLevel, suffix;
+    if (!SplitBindingPath(path, topLevel, suffix)) return false;
+
+    static const char* const simple[] = {
+        "input/select/click", "input/menu/click", "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+    static const char* const daydream[] = {
+        "input/select/click", "input/trackpad/x", "input/trackpad/y", "input/trackpad/click",
+        "input/trackpad/touch", "input/grip/pose", "input/aim/pose",
+    };
+    static const char* const vive[] = {
+        "input/system/click", "input/squeeze/click", "input/menu/click", "input/trigger/click",
+        "input/trigger/value", "input/trackpad/x", "input/trackpad/y", "input/trackpad/click",
+        "input/trackpad/touch", "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+    static const char* const vivePro[] = {
+        "input/system/click", "input/volume_up/click", "input/volume_down/click", "input/mute_mic/click",
+    };
+    static const char* const motion[] = {
+        "input/menu/click", "input/squeeze/click", "input/trigger/value", "input/thumbstick/x",
+        "input/thumbstick/y", "input/thumbstick/click", "input/trackpad/x", "input/trackpad/y",
+        "input/trackpad/click", "input/trackpad/touch", "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+    static const char* const xbox[] = {
+        "input/menu/click", "input/view/click", "input/a/click", "input/b/click", "input/x/click",
+        "input/y/click", "input/dpad_down/click", "input/dpad_right/click", "input/dpad_up/click",
+        "input/dpad_left/click", "input/shoulder_left/click", "input/shoulder_right/click",
+        "input/thumbstick_left/click", "input/thumbstick_right/click", "input/trigger_left/value",
+        "input/trigger_right/value", "input/thumbstick_left/x", "input/thumbstick_left/y",
+        "input/thumbstick_right/x", "input/thumbstick_right/y", "output/haptic_left", "output/haptic_right",
+        "output/haptic_left_trigger", "output/haptic_right_trigger",
+    };
+    static const char* const go[] = {
+        "input/system/click", "input/trigger/click", "input/back/click", "input/trackpad/x",
+        "input/trackpad/y", "input/trackpad/click", "input/trackpad/touch", "input/grip/pose", "input/aim/pose",
+    };
+    static const char* const touchCommon[] = {
+        "input/squeeze/value", "input/trigger/value", "input/trigger/touch", "input/thumbstick/x",
+        "input/thumbstick/y", "input/thumbstick/click", "input/thumbstick/touch", "input/thumbrest/touch",
+        "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+    static const char* const touchLeft[] = {
+        "input/x/click", "input/x/touch", "input/y/click", "input/y/touch", "input/menu/click",
+    };
+    static const char* const touchRight[] = {
+        "input/a/click", "input/a/touch", "input/b/click", "input/b/touch", "input/system/click",
+    };
+    static const char* const index[] = {
+        "input/system/click", "input/system/touch", "input/a/click", "input/a/touch", "input/b/click",
+        "input/b/touch", "input/squeeze/value", "input/squeeze/force", "input/trigger/click",
+        "input/trigger/value", "input/trigger/touch", "input/thumbstick/x", "input/thumbstick/y",
+        "input/thumbstick/click", "input/thumbstick/touch", "input/trackpad/x", "input/trackpad/y",
+        "input/trackpad/force", "input/trackpad/touch", "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+
+    const bool hand = topLevel == "/user/hand/left" || topLevel == "/user/hand/right";
+    if (profile == "/interaction_profiles/khr/simple_controller") return hand && input::BindingPathAllowed(suffix, simple);
+    if (profile == "/interaction_profiles/google/daydream_controller") return hand && input::BindingPathAllowed(suffix, daydream);
+    if (profile == "/interaction_profiles/htc/vive_controller") return hand && input::BindingPathAllowed(suffix, vive);
+    if (profile == "/interaction_profiles/htc/vive_pro") return topLevel == "/user/head" && input::BindingPathAllowed(suffix, vivePro);
+    if (profile == "/interaction_profiles/microsoft/motion_controller") return hand && input::BindingPathAllowed(suffix, motion);
+    if (profile == "/interaction_profiles/microsoft/xbox_controller") {
+        return topLevel == "/user/gamepad" && input::BindingPathAllowed(suffix, xbox);
+    }
+    if (profile == "/interaction_profiles/oculus/go_controller") return hand && input::BindingPathAllowed(suffix, go);
+    if (profile == "/interaction_profiles/oculus/touch_controller") {
+        return hand && (input::BindingPathAllowed(suffix, touchCommon) ||
+            (topLevel == "/user/hand/left" && input::BindingPathAllowed(suffix, touchLeft)) ||
+            (topLevel == "/user/hand/right" && input::BindingPathAllowed(suffix, touchRight)));
+    }
+    if (profile == "/interaction_profiles/valve/index_controller") return hand && input::BindingPathAllowed(suffix, index);
+    return false;
+}
+
+static XrTime QpcToNs(long long counter, long long freq) {
+    const long long seconds = counter / freq;
+    const long long remainder = counter % freq;
+    return seconds * 1000000000LL + (remainder * 1000000000LL) / freq;
+}
+
+static XrTime CurrentXrTime() {
+    LARGE_INTEGER counter{}, frequency{};
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    return QpcToNs(counter.QuadPart, frequency.QuadPart);
+}
+
+static XrResult XRAPI_PTR xrCreateActionSet_runtime(
+    XrInstance instance, const XrActionSetCreateInfo* info, XrActionSet* set) {
+    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_ACTION_SET_CREATE_INFO || !set) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    const size_t nameLength = strnlen(info->actionSetName, XR_MAX_ACTION_SET_NAME_SIZE);
+    const size_t localizedLength =
+        strnlen(info->localizedActionSetName, XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE);
+    if (nameLength == XR_MAX_ACTION_SET_NAME_SIZE ||
+        localizedLength == XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (nameLength == 0) return XR_ERROR_NAME_INVALID;
+    if (localizedLength == 0) return XR_ERROR_LOCALIZED_NAME_INVALID;
+    if (!api_validation::IsWellFormedPathLevel(
+            info->actionSetName, XR_MAX_ACTION_SET_NAME_SIZE)) {
+        return XR_ERROR_PATH_FORMAT_INVALID;
+    }
+    for (const auto& entry : rt::g_actionSets) {
+        if (entry.second.name == info->actionSetName) return XR_ERROR_NAME_DUPLICATED;
+        if (entry.second.localizedName == info->localizedActionSetName) {
+            return XR_ERROR_LOCALIZED_NAME_DUPLICATED;
+        }
+    }
+
     static uintptr_t nextSet = 300;
     *set = (XrActionSet)(nextSet++);
-    // actionSetName may not be null-terminated
-    char setName[XR_MAX_ACTION_SET_NAME_SIZE + 1] = {0};
-    memcpy(setName, info->actionSetName, XR_MAX_ACTION_SET_NAME_SIZE);
-    Logf("[SimXR] xrCreateActionSet: name=%s", setName);
+    Logf("[SimXR] xrCreateActionSet: name=%s", info->actionSetName);
+    rt::ActionSetRecord record;
+    record.priority = info->priority;
+    record.name = info->actionSetName;
+    record.localizedName = info->localizedActionSetName;
+    rt::g_actionSets.emplace(*set, std::move(record));
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrDestroyActionSet_runtime(XrActionSet set) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     Log("[SimXR] xrDestroyActionSet");
-    for (auto it=rt::g_actionInfo.begin();it!=rt::g_actionInfo.end();) {
-        if (it->second.set!=set) { ++it; continue; }
-        const auto action=it->first;
-        rt::g_actionSnapshots.erase(action); rt::g_actionNames.erase(action); rt::g_actionHand.erase(action);
-        for (auto& profile:rt::g_bindings) {
-            auto& bindings=profile.second;
-            bindings.erase(std::remove_if(bindings.begin(),bindings.end(),[&](const auto& b){ return b.action==action; }),bindings.end());
+    if (!rt::g_actionSets.erase(set)) return XR_ERROR_HANDLE_INVALID;
+    rt::g_attachedActionSets.erase(set);
+    rt::g_activeActionSetSources.erase(set);
+    for (auto it = rt::g_actions.begin(); it != rt::g_actions.end();) {
+        if (it->second.actionSet != set) {
+            ++it;
+            continue;
         }
-        it=rt::g_actionInfo.erase(it);
+        const XrAction action = it->first;
+        for (auto spaceIt = rt::g_controllerSpaces.begin();
+             spaceIt != rt::g_controllerSpaces.end();) {
+            if (spaceIt->second.action == action) spaceIt = rt::g_controllerSpaces.erase(spaceIt);
+            else ++spaceIt;
+        }
+        it = rt::g_actions.erase(it);
     }
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet set, const XrActionCreateInfo* info, XrAction* action) {
+static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet actionSet, const XrActionCreateInfo* info, XrAction* action) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
-    if (!info || !action) return XR_ERROR_VALIDATION_FAILURE;
-    static uintptr_t nextAction = 400;
-    *action = (XrAction)(nextAction++);
-    // actionName may not be null-terminated
-    char actName[XR_MAX_ACTION_NAME_SIZE + 1] = {0};
-    memcpy(actName, info->actionName, XR_MAX_ACTION_NAME_SIZE);
-    Logf("[SimXR] xrCreateAction: name=%s, type=%d", actName, info->actionType);
-
-    // Store action name for input mapping
-    rt::g_actionNames[*action] = actName;
-    rt::g_actionInfo[*action] = {set, info->actionType};
-
-    // Detect which hand this action is bound to based on subactionPaths
-    int handBinding = 0;  // 0=both/any
-    if (info->countSubactionPaths > 0 && info->subactionPaths) {
-        for (uint32_t i = 0; i < info->countSubactionPaths; i++) {
-            auto it = rt::g_pathStrings.find(info->subactionPaths[i]);
-            if (it != rt::g_pathStrings.end()) {
-                if (it->second.find("left") != std::string::npos) handBinding |= 1;
-                if (it->second.find("right") != std::string::npos) handBinding |= 2;
-            }
+    if (!info || info->type != XR_TYPE_ACTION_CREATE_INFO || !action) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    auto setIt = rt::g_actionSets.find(actionSet);
+    if (setIt == rt::g_actionSets.end()) return XR_ERROR_HANDLE_INVALID;
+    if (setIt->second.everAttached) return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
+    if (info->countSubactionPaths && !info->subactionPaths) return XR_ERROR_VALIDATION_FAILURE;
+    if (info->actionType != XR_ACTION_TYPE_BOOLEAN_INPUT &&
+        info->actionType != XR_ACTION_TYPE_FLOAT_INPUT &&
+        info->actionType != XR_ACTION_TYPE_VECTOR2F_INPUT &&
+        info->actionType != XR_ACTION_TYPE_POSE_INPUT &&
+        info->actionType != XR_ACTION_TYPE_VIBRATION_OUTPUT) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    const size_t nameLength = strnlen(info->actionName, XR_MAX_ACTION_NAME_SIZE);
+    const size_t localizedLength =
+        strnlen(info->localizedActionName, XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    if (nameLength == XR_MAX_ACTION_NAME_SIZE ||
+        localizedLength == XR_MAX_LOCALIZED_ACTION_NAME_SIZE) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (nameLength == 0) return XR_ERROR_NAME_INVALID;
+    if (localizedLength == 0) return XR_ERROR_LOCALIZED_NAME_INVALID;
+    if (!api_validation::IsWellFormedPathLevel(info->actionName, XR_MAX_ACTION_NAME_SIZE)) {
+        return XR_ERROR_PATH_FORMAT_INVALID;
+    }
+    for (const auto& entry : rt::g_actions) {
+        if (entry.second.actionSet != actionSet) continue;
+        if (entry.second.name == info->actionName) return XR_ERROR_NAME_DUPLICATED;
+        if (entry.second.localizedName == info->localizedActionName) {
+            return XR_ERROR_LOCALIZED_NAME_DUPLICATED;
         }
     }
-    rt::g_actionHand[*action] = handBinding;
+    Logf("[SimXR] xrCreateAction: name=%s, type=%d", info->actionName, info->actionType);
+
+    int sourceMask = info->countSubactionPaths == 0
+        ? interaction_query::kAllActionSources : 0;
+    std::unordered_set<XrPath> declaredPaths;
+    if (info->countSubactionPaths > 0) {
+        for (uint32_t i = 0; i < info->countSubactionPaths; i++) {
+            const XrPath path = info->subactionPaths[i];
+            if (!rt::g_pathStrings.count(path)) return XR_ERROR_PATH_INVALID;
+            const int pathSource = SourceMaskForTopLevelPath(path);
+            if (!pathSource || !declaredPaths.insert(path).second) return XR_ERROR_PATH_UNSUPPORTED;
+            sourceMask |= pathSource;
+        }
+    }
+    static uintptr_t nextAction = 400;
+    *action = (XrAction)(nextAction++);
+    rt::ActionRecord record;
+    record.actionSet = actionSet;
+    record.type = info->actionType;
+    record.name = info->actionName;
+    record.localizedName = info->localizedActionName;
+    record.declaredSourceMask = sourceMask;
+    record.declaredSubactionPaths = declaredPaths;
+    rt::g_actions.emplace(*action, std::move(record));
+    setIt->second.declaredSubactionPaths.insert(declaredPaths.begin(), declaredPaths.end());
 
     return XR_SUCCESS;
 }
@@ -7682,53 +9088,131 @@ static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet set, const XrAction
 static XrResult XRAPI_PTR xrDestroyAction_runtime(XrAction action) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     Log("[SimXR] xrDestroyAction");
-    rt::g_actionInfo.erase(action); rt::g_actionSnapshots.erase(action); rt::g_actionNames.erase(action); rt::g_actionHand.erase(action);
-    for (auto& profile:rt::g_bindings) {
-        auto& bindings=profile.second;
-        bindings.erase(std::remove_if(bindings.begin(),bindings.end(),[&](const auto& b){ return b.action==action; }),bindings.end());
+    auto actionIt = rt::g_actions.find(action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    const XrActionSet actionSet = actionIt->second.actionSet;
+    for (auto spaceIt = rt::g_controllerSpaces.begin();
+         spaceIt != rt::g_controllerSpaces.end();) {
+        if (spaceIt->second.action == action) spaceIt = rt::g_controllerSpaces.erase(spaceIt);
+        else ++spaceIt;
+    }
+    rt::g_actions.erase(actionIt);
+    auto setIt = rt::g_actionSets.find(actionSet);
+    if (setIt != rt::g_actionSets.end()) {
+        setIt->second.declaredSubactionPaths.clear();
+        for (const auto& entry : rt::g_actions) {
+            if (entry.second.actionSet == actionSet) {
+                setIt->second.declaredSubactionPaths.insert(entry.second.declaredSubactionPaths.begin(),
+                                                            entry.second.declaredSubactionPaths.end());
+            }
+        }
     }
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrSuggestInteractionProfileBindings_runtime(XrInstance, const XrInteractionProfileSuggestedBinding* bindings) {
+static XrResult XRAPI_PTR xrSuggestInteractionProfileBindings_runtime(XrInstance instance, const XrInteractionProfileSuggestedBinding* bindings) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     if (!bindings) return XR_ERROR_VALIDATION_FAILURE;
+    if (instance != rt::g_instance.handle) return XR_ERROR_HANDLE_INVALID;
     if (bindings->countSuggestedBindings && !bindings->suggestedBindings) return XR_ERROR_VALIDATION_FAILURE;
-    auto& sources=rt::g_bindings[bindings->interactionProfile];
-    sources.clear();
-    if (bindings->countSuggestedBindings) sources.assign(bindings->suggestedBindings,bindings->suggestedBindings+bindings->countSuggestedBindings);
     // interactionProfile is an XrPath (integer), not a C-string
     Logf("[SimXR] xrSuggestInteractionProfileBindings: profile=0x%llx",
          (unsigned long long)bindings->interactionProfile);
-    if (bindings->interactionProfile != XR_NULL_PATH) {
-        auto& list = rt::g_suggestedProfiles;
-        if (std::find(list.begin(), list.end(), bindings->interactionProfile) == list.end()) {
-            list.push_back(bindings->interactionProfile);
+    auto profileIt = rt::g_pathStrings.find(bindings->interactionProfile);
+    if (profileIt == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+    if (!IsSupportedInteractionProfilePath(profileIt->second)) return XR_ERROR_PATH_UNSUPPORTED;
+
+    struct PendingBinding { XrAction action; rt::ActionBinding binding; };
+    std::vector<PendingBinding> pending;
+    for (uint32_t i = 0; i < bindings->countSuggestedBindings; ++i) {
+        const XrActionSuggestedBinding& suggested = bindings->suggestedBindings[i];
+        auto actionIt = rt::g_actions.find(suggested.action);
+        if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+        auto setIt = rt::g_actionSets.find(actionIt->second.actionSet);
+        if (setIt != rt::g_actionSets.end() && setIt->second.everAttached) {
+            return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
         }
+        auto pathIt = rt::g_pathStrings.find(suggested.binding);
+        if (pathIt == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+        if (!IsAllowedBindingPath(profileIt->second, pathIt->second)) return XR_ERROR_PATH_UNSUPPORTED;
+        const int sourceMask = SourceMaskForBindingPath(pathIt->second);
+        const rt::ActionInput inputKind = InputForBindingPath(actionIt->second.type, pathIt->second);
+        if (sourceMask && inputKind != rt::ActionInput::Unknown) {
+            pending.push_back({suggested.action,
+                               {bindings->interactionProfile, suggested.binding,
+                                input::BindingCollisionKey(pathIt->second), sourceMask, inputKind}});
+        }
+    }
+
+    // A second successful suggestion for the same profile atomically replaces
+    // the first one. Validation above deliberately performs no mutation.
+    for (auto& action : rt::g_actions) {
+        auto& actionBindings = action.second.bindings;
+        actionBindings.erase(std::remove_if(actionBindings.begin(), actionBindings.end(), [&](const rt::ActionBinding& b) {
+            return b.profile == bindings->interactionProfile;
+        }), actionBindings.end());
+    }
+    for (const PendingBinding& item : pending) {
+        rt::g_actions.at(item.action).bindings.push_back(item.binding);
+    }
+    auto& list = rt::g_suggestedProfiles;
+    if (std::find(list.begin(), list.end(), bindings->interactionProfile) == list.end()) {
+        list.push_back(bindings->interactionProfile);
     }
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrAttachSessionActionSets_runtime(XrSession, const XrSessionActionSetsAttachInfo* info) {
+static XrResult XRAPI_PTR xrAttachSessionActionSets_runtime(XrSession session, const XrSessionActionSetsAttachInfo* info) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
-    if (!info) return XR_ERROR_VALIDATION_FAILURE;
+    if (!info || info->type != XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO || info->countActionSets == 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (rt::g_sessionActionSetsAttached) return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
+    if (info->countActionSets && !info->actionSets) return XR_ERROR_VALIDATION_FAILURE;
+    for (uint32_t i = 0; i < info->countActionSets; ++i) {
+        if (!rt::g_actionSets.count(info->actionSets[i])) return XR_ERROR_HANDLE_INVALID;
+    }
     Logf("[SimXR] xrAttachSessionActionSets: count=%u", info->countActionSets);
 
-    // The synthetic controllers behave like Touch, so prefer that profile.
+    rt::g_attachedActionSets.clear();
+    for (uint32_t i = 0; i < info->countActionSets; ++i) {
+        rt::g_attachedActionSets.insert(info->actionSets[i]);
+        rt::g_actionSets.at(info->actionSets[i]).everAttached = true;
+    }
+    rt::g_sessionActionSetsAttached = true;
+
+    return XR_SUCCESS;
+}
+
+static XrPath SelectSyntheticInteractionProfile() {
+    // The synthetic devices are two hand controllers. Prefer Touch when the app supplied
+    // it, otherwise emulate the first suggested hand-controller profile. Headset and
+    // gamepad profiles must not become active when this runtime has no such input device.
     for (XrPath p : rt::g_suggestedProfiles) {
         auto it = rt::g_pathStrings.find(p);
         if (it != rt::g_pathStrings.end() && it->second.find("oculus/touch") != std::string::npos) {
-            rt::g_activeProfile = p;
-            break;
+            return p;
         }
     }
-    if (rt::g_activeProfile == XR_NULL_PATH && !rt::g_suggestedProfiles.empty()) {
-        rt::g_activeProfile = rt::g_suggestedProfiles.front();
+    for (XrPath p : rt::g_suggestedProfiles) {
+        auto it = rt::g_pathStrings.find(p);
+        if (it != rt::g_pathStrings.end() && interaction_query::ProfileSupportsTopLevel(
+                it->second, "/user/hand/left")) {
+            return p;
+        }
     }
-    if (rt::g_activeProfile != XR_NULL_PATH) {
-        auto it = rt::g_pathStrings.find(rt::g_activeProfile);
-        Logf("[SimXR] xrAttachSessionActionSets: active interaction profile = %s", it != rt::g_pathStrings.end() ? it->second.c_str() : "<unknown>");
+    return XR_NULL_PATH;
+}
 
+static void UpdateInteractionProfileAtSync() {
+    const XrPath selected = SelectSyntheticInteractionProfile();
+    if (selected == rt::g_activeProfile) return;
+    rt::g_activeProfile = selected;
+    auto it = rt::g_pathStrings.find(selected);
+    Logf("[SimXR] xrSyncActions: active interaction profile = %s",
+         it != rt::g_pathStrings.end() ? it->second.c_str() : "<none>");
+    if (rt::g_session.running) {
         XrEventDataInteractionProfileChanged e{ XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED };
         e.session = rt::g_session.handle;
         XrEventDataBuffer buf{};
@@ -7736,65 +9220,384 @@ static XrResult XRAPI_PTR xrAttachSessionActionSets_runtime(XrSession, const XrS
         std::memcpy(&buf, &e, sizeof(e));
         rt::g_eventQueue.push_back(buf);
     }
+}
+
+static const rt::ControllerState* ControllerForSource(int sourceMask) {
+    if (sourceMask == interaction_query::kLeftHandSource) return &rt::g_leftController;
+    if (sourceMask == interaction_query::kRightHandSource) return &rt::g_rightController;
+    return nullptr;
+}
+
+static bool ReadBooleanInput(rt::ActionInput input, const rt::ControllerState& controller) {
+    switch (input) {
+        case rt::ActionInput::Trigger: return controller.triggerPressed;
+        case rt::ActionInput::Grip: return controller.gripPressed;
+        case rt::ActionInput::Menu: return controller.menuPressed;
+        case rt::ActionInput::Primary: return controller.primaryPressed;
+        case rt::ActionInput::Secondary: return controller.secondaryPressed;
+        case rt::ActionInput::Thumbstick: return controller.thumbstickPressed;
+        default: return false;
+    }
+}
+
+static float ReadFloatInput(rt::ActionInput input, const rt::ControllerState& controller) {
+    if (input == rt::ActionInput::Trigger) return controller.triggerValue;
+    if (input == rt::ActionInput::Grip) return controller.gripValue;
+    return 0.0f;
+}
+
+static void SyncActionSlot(rt::ActionRecord& action, size_t slot, int requestedSources,
+                           int activeSources,
+                           uint32_t actionSetPriority,
+                           const input::BindingPriorities& sourcePriorities,
+                           XrTime syncTime) {
+    const int eligibleSources =
+        requestedSources & activeSources & action.declaredSourceMask;
+    bool active = false;
+    bool booleanValue = false;
+    float scalarValue = 0.0f;
+    XrVector2f vectorValue{0.0f, 0.0f};
+    float vectorMagnitude = -1.0f;
+
+    for (const rt::ActionBinding& binding : action.bindings) {
+        if (binding.profile != rt::g_activeProfile ||
+            !(binding.sourceMask & eligibleSources)) continue;
+        if (!sourcePriorities.Allows(binding.collisionKey, actionSetPriority)) continue;
+        const rt::ControllerState* controller = ControllerForSource(binding.sourceMask);
+        if (!controller || !controller->isTracking) continue;
+        switch (action.type) {
+            case XR_ACTION_TYPE_BOOLEAN_INPUT:
+                active = true;
+                booleanValue = booleanValue || ReadBooleanInput(binding.input, *controller);
+                break;
+            case XR_ACTION_TYPE_FLOAT_INPUT: {
+                active = true;
+                const float value = ReadFloatInput(binding.input, *controller);
+                if (std::fabs(value) > std::fabs(scalarValue)) scalarValue = value;
+                break;
+            }
+            case XR_ACTION_TYPE_VECTOR2F_INPUT: {
+                if (binding.input != rt::ActionInput::Thumbstick) break;
+                active = true;
+                const float magnitude = controller->thumbstick.x * controller->thumbstick.x +
+                                        controller->thumbstick.y * controller->thumbstick.y;
+                if (magnitude > vectorMagnitude) {
+                    vectorMagnitude = magnitude;
+                    vectorValue = controller->thumbstick;
+                }
+                break;
+            }
+            case XR_ACTION_TYPE_POSE_INPUT:
+                if (binding.input == rt::ActionInput::Pose) active = true;
+                break;
+            default: break;
+        }
+    }
+
+    input::ActionSlot& state = action.slots[slot];
+    switch (action.type) {
+        case XR_ACTION_TYPE_BOOLEAN_INPUT:
+            state.boolean.Sync(booleanValue ? XR_TRUE : XR_FALSE, active, syncTime);
+            break;
+        case XR_ACTION_TYPE_FLOAT_INPUT:
+            state.scalar.Sync(scalarValue, active, syncTime);
+            break;
+        case XR_ACTION_TYPE_VECTOR2F_INPUT:
+            state.vector.Sync(vectorValue, active, syncTime);
+            break;
+        case XR_ACTION_TYPE_POSE_INPUT:
+            state.poseActive = active ? XR_TRUE : XR_FALSE;
+            break;
+        default:
+            state.SetInactive(syncTime);
+            break;
+    }
+}
+
+static void LatchActions(XrTime syncTime) {
+    input::BindingPriorities sourcePriorities;
+    for (const auto& entry : rt::g_actions) {
+        const rt::ActionRecord& action = entry.second;
+        auto activeIt = rt::g_activeActionSetSources.find(action.actionSet);
+        if (activeIt == rt::g_activeActionSetSources.end()) continue;
+        auto setIt = rt::g_actionSets.find(action.actionSet);
+        if (setIt == rt::g_actionSets.end()) continue;
+        const int eligibleSources = activeIt->second & action.declaredSourceMask;
+        for (const rt::ActionBinding& binding : action.bindings) {
+            if (binding.profile != rt::g_activeProfile ||
+                !(binding.sourceMask & eligibleSources)) continue;
+            sourcePriorities.Observe(binding.collisionKey, setIt->second.priority);
+        }
+    }
+
+    for (auto& entry : rt::g_actions) {
+        rt::ActionRecord& action = entry.second;
+        auto activeIt = rt::g_activeActionSetSources.find(action.actionSet);
+        const int activeSources =
+            activeIt == rt::g_activeActionSetSources.end() ? 0 : activeIt->second;
+        auto setIt = rt::g_actionSets.find(action.actionSet);
+        const uint32_t priority = setIt == rt::g_actionSets.end() ? 0 : setIt->second.priority;
+        SyncActionSlot(action, 0, interaction_query::kAllActionSources,
+                       activeSources, priority, sourcePriorities, syncTime);
+        static const int sources[] = {
+            interaction_query::kLeftHandSource, interaction_query::kRightHandSource,
+            interaction_query::kHeadSource, interaction_query::kGamepadSource,
+        };
+        for (int source : sources) {
+            SyncActionSlot(action, interaction_query::ActionSlotForSourceMask(source),
+                           source, activeSources, priority, sourcePriorities, syncTime);
+        }
+    }
+}
+
+static XrResult FindActionSlot(const XrActionStateGetInfo* info, XrActionType expectedType,
+                               const input::ActionSlot** slot) {
+    if (!info || !slot || info->type != XR_TYPE_ACTION_STATE_GET_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    auto actionIt = rt::g_actions.find(info->action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    if (actionIt->second.type != expectedType) return XR_ERROR_ACTION_TYPE_MISMATCH;
+    if (!rt::g_attachedActionSets.count(actionIt->second.actionSet)) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+
+    int slotIndex = 0;
+    if (info->subactionPath != XR_NULL_PATH) {
+        if (!rt::g_pathStrings.count(info->subactionPath)) return XR_ERROR_PATH_INVALID;
+        const int sourceMask = SourceMaskForTopLevelPath(info->subactionPath);
+        if (!sourceMask || !actionIt->second.declaredSubactionPaths.count(info->subactionPath)) {
+            return XR_ERROR_PATH_UNSUPPORTED;
+        }
+        slotIndex = static_cast<int>(
+            interaction_query::ActionSlotForSourceMask(sourceMask));
+    }
+    *slot = &actionIt->second.slots[slotIndex];
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrGetActionStateBoolean_runtime(XrSession session, const XrActionStateGetInfo* info, XrActionStateBoolean* state) {
+    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    if (!state || state->type != XR_TYPE_ACTION_STATE_BOOLEAN) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const input::ActionSlot* slot = nullptr;
+    const XrResult result = FindActionSlot(info, XR_ACTION_TYPE_BOOLEAN_INPUT, &slot);
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) {
+        state->currentState = state->changedSinceLastSync = state->isActive = XR_FALSE;
+        state->lastChangeTime = 0;
+    } else {
+        state->currentState = slot->boolean.current;
+        state->changedSinceLastSync = slot->boolean.changed;
+        state->lastChangeTime = slot->boolean.lastChangeTime;
+        state->isActive = slot->boolean.active;
+    }
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrGetActionStateFloat_runtime(XrSession session, const XrActionStateGetInfo* info, XrActionStateFloat* state) {
+    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    if (!state || state->type != XR_TYPE_ACTION_STATE_FLOAT) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const input::ActionSlot* slot = nullptr;
+    const XrResult result = FindActionSlot(info, XR_ACTION_TYPE_FLOAT_INPUT, &slot);
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) {
+        state->currentState = 0.0f;
+        state->changedSinceLastSync = state->isActive = XR_FALSE;
+        state->lastChangeTime = 0;
+    } else {
+        state->currentState = slot->scalar.current;
+        state->changedSinceLastSync = slot->scalar.changed;
+        state->lastChangeTime = slot->scalar.lastChangeTime;
+        state->isActive = slot->scalar.active;
+    }
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrGetActionStatePose_runtime(XrSession session, const XrActionStateGetInfo* info, XrActionStatePose* state) {
+    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    if (!state || state->type != XR_TYPE_ACTION_STATE_POSE) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const input::ActionSlot* slot = nullptr;
+    const XrResult result = FindActionSlot(info, XR_ACTION_TYPE_POSE_INPUT, &slot);
+    if (XR_FAILED(result)) return result;
+    state->isActive = rt::g_session.state == XR_SESSION_STATE_FOCUSED ? slot->poseActive : XR_FALSE;
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrGetActionStateVector2f_runtime(XrSession session, const XrActionStateGetInfo* info, XrActionStateVector2f* state) {
+    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    if (!state || state->type != XR_TYPE_ACTION_STATE_VECTOR2F) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const input::ActionSlot* slot = nullptr;
+    const XrResult result = FindActionSlot(info, XR_ACTION_TYPE_VECTOR2F_INPUT, &slot);
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) {
+        state->currentState = {0.0f, 0.0f};
+        state->changedSinceLastSync = state->isActive = XR_FALSE;
+        state->lastChangeTime = 0;
+    } else {
+        state->currentState = slot->vector.current;
+        state->changedSinceLastSync = slot->vector.changed;
+        state->lastChangeTime = slot->vector.lastChangeTime;
+        state->isActive = slot->vector.active;
+    }
     return XR_SUCCESS;
 }
 
 #include "action_sync.h"
 
-static XrResult XRAPI_PTR xrStringToPath_runtime(XrInstance, const char* pathString, XrPath* path) {
-    if (!pathString || !path) return XR_ERROR_VALIDATION_FAILURE;
-    // Simple hash as path ID
-    size_t hash = 5381;
-    for (const char* c = pathString; *c; ++c) {
-        hash = ((hash << 5) + hash) + *c;
+static XrResult XRAPI_PTR xrSyncActions_runtime(XrSession session, const XrActionsSyncInfo* info) {
+    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    if (!info || info->type != XR_TYPE_ACTIONS_SYNC_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (info->countActiveActionSets && !info->activeActionSets) return XR_ERROR_VALIDATION_FAILURE;
+
+    std::unordered_map<XrActionSet, int> requestedActionSets;
+    for (uint32_t i = 0; i < info->countActiveActionSets; ++i) {
+        const XrActiveActionSet& active = info->activeActionSets[i];
+        if (!rt::g_attachedActionSets.count(active.actionSet)) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+        auto setIt = rt::g_actionSets.find(active.actionSet);
+        if (setIt == rt::g_actionSets.end()) return XR_ERROR_HANDLE_INVALID;
+        int sourceMask = interaction_query::kAllActionSources;
+        if (active.subactionPath != XR_NULL_PATH) {
+            if (!rt::g_pathStrings.count(active.subactionPath)) return XR_ERROR_PATH_INVALID;
+            sourceMask = SourceMaskForTopLevelPath(active.subactionPath);
+            if (!sourceMask ||
+                !setIt->second.declaredSubactionPaths.count(active.subactionPath)) {
+                return XR_ERROR_PATH_UNSUPPORTED;
+            }
+        }
+        requestedActionSets[active.actionSet] |= sourceMask;
     }
-    *path = (XrPath)hash;
-    // Store path string for controller detection
-    rt::g_pathStrings[*path] = pathString;
+
+    ++ui_auto::g_sync;
+    mcp::RefreshCommandsDue(); PollUiPointerCommand(); ApplyUiPointerButtons();
+
+    // OpenXR permits interaction-profile selection to change only at this call. Delaying
+    // the initial selection until the running session's first sync also ensures the
+    // corresponding change event is never emitted for a non-running session.
+    if (rt::g_session.running) UpdateInteractionProfileAtSync();
+
+    const XrTime syncTime = CurrentXrTime();
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) {
+        rt::g_activeActionSetSources.clear();
+        LatchActions(syncTime);
+        return XR_SESSION_NOT_FOCUSED;
+    }
+
+    rt::g_activeActionSetSources = std::move(requestedActionSets);
+    LatchActions(syncTime);
+    ObserveUiPointerSync();
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrStringToPath_runtime(XrInstance instance, const char* pathString, XrPath* path) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!pathString || !path) return XR_ERROR_VALIDATION_FAILURE;
+    if (!api_validation::IsWellFormedPath(pathString)) return XR_ERROR_PATH_FORMAT_INVALID;
+    auto existing = rt::g_stringPaths.find(pathString);
+    if (existing != rt::g_stringPaths.end()) {
+        *path = existing->second;
+        return XR_SUCCESS;
+    }
+    if (rt::g_nextPath == XR_NULL_PATH) return XR_ERROR_PATH_COUNT_EXCEEDED;
+    *path = rt::g_nextPath++;
+    rt::g_pathStrings.emplace(*path, pathString);
+    rt::g_stringPaths.emplace(pathString, *path);
     Logf("[SimXR] xrStringToPath: %s -> %llu", pathString, (unsigned long long)*path);
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrPathToString_runtime(XrInstance, XrPath path, uint32_t bufferCapacityInput, uint32_t* bufferCountOutput, char* buffer) {
+static XrResult XRAPI_PTR xrPathToString_runtime(XrInstance instance, XrPath path, uint32_t bufferCapacityInput, uint32_t* bufferCountOutput, char* buffer) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     auto it = rt::g_pathStrings.find(path);
     if (it == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
     const std::string& str = it->second;
     const uint32_t len = (uint32_t)str.size() + 1;
-    if (bufferCountOutput) *bufferCountOutput = len;
-    if (bufferCapacityInput == 0) return XR_SUCCESS;  // sizing call
-    if (!buffer) return XR_ERROR_VALIDATION_FAILURE;
-    if (bufferCapacityInput < len) return XR_ERROR_SIZE_INSUFFICIENT;
+    const XrResult validation = api_validation::ValidateEnumeration(
+        bufferCapacityInput, bufferCountOutput, buffer, len);
+    if (XR_FAILED(validation) || bufferCapacityInput == 0) return validation;
     std::memcpy(buffer, str.c_str(), len);
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetCurrentInteractionProfile_runtime(XrSession, XrPath topLevelUserPath, XrInteractionProfileState* interactionProfile) {
-    if (!interactionProfile) return XR_ERROR_VALIDATION_FAILURE;
-    interactionProfile->type = XR_TYPE_INTERACTION_PROFILE_STATE;
-    interactionProfile->interactionProfile = rt::g_activeProfile;
-    return XR_SUCCESS;
-}
-
-static XrResult XRAPI_PTR xrEnumerateBoundSourcesForAction_runtime(XrSession, const XrBoundSourcesForActionEnumerateInfo* info, uint32_t sourceCapacityInput, uint32_t* sourceCountOutput, XrPath* sources) {
-    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
-    if (!info || !sourceCountOutput || (sourceCapacityInput && !sources)) return XR_ERROR_VALIDATION_FAILURE;
-    std::vector<XrPath> bound;
-    for (const auto& b:rt::g_bindings[rt::g_activeProfile])
-        if (b.action==info->action && std::find(bound.begin(),bound.end(),b.binding)==bound.end()) bound.push_back(b.binding);
-    *sourceCountOutput=(uint32_t)bound.size();
-    if (sourceCapacityInput && sourceCapacityInput<bound.size()) return XR_ERROR_SIZE_INSUFFICIENT;
-    if (sourceCapacityInput) std::copy(bound.begin(),bound.end(),sources);
-    return XR_SUCCESS;
-}
-
-static XrResult XRAPI_PTR xrGetInputSourceLocalizedName_runtime(XrSession, const XrInputSourceLocalizedNameGetInfo* info, uint32_t bufferCapacityInput, uint32_t* bufferCountOutput, char* buffer) {
-    const char* name = "Unknown";
-    size_t len = strlen(name) + 1;
-    if (bufferCountOutput) *bufferCountOutput = (uint32_t)len;
-    if (buffer && bufferCapacityInput > 0) {
-        strncpy(buffer, name, bufferCapacityInput - 1);
-        buffer[bufferCapacityInput - 1] = '\0';
+static XrResult XRAPI_PTR xrGetCurrentInteractionProfile_runtime(
+    XrSession session, XrPath topLevelUserPath, XrInteractionProfileState* interactionProfile) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!interactionProfile || interactionProfile->type != XR_TYPE_INTERACTION_PROFILE_STATE) {
+        return XR_ERROR_VALIDATION_FAILURE;
     }
+    if (!rt::g_sessionActionSetsAttached) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+    auto pathIt = rt::g_pathStrings.find(topLevelUserPath);
+    if (pathIt == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+    if (!interaction_query::IsCoreTopLevelUserPath(pathIt->second)) {
+        return XR_ERROR_PATH_UNSUPPORTED;
+    }
+
+    interactionProfile->interactionProfile = XR_NULL_PATH;
+    auto profileIt = rt::g_pathStrings.find(rt::g_activeProfile);
+    if (profileIt != rt::g_pathStrings.end() &&
+        interaction_query::ProfileSupportsTopLevel(profileIt->second, pathIt->second)) {
+        interactionProfile->interactionProfile = rt::g_activeProfile;
+    }
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrEnumerateBoundSourcesForAction_runtime(
+    XrSession session, const XrBoundSourcesForActionEnumerateInfo* info,
+    uint32_t sourceCapacityInput, uint32_t* sourceCountOutput, XrPath* sources) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    auto actionIt = rt::g_actions.find(info->action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    if (!rt::g_attachedActionSets.count(actionIt->second.actionSet)) {
+        return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+    }
+
+    std::vector<XrPath> boundSources;
+    for (const rt::ActionBinding& binding : actionIt->second.bindings) {
+        if (binding.profile != rt::g_activeProfile ||
+            !(binding.sourceMask & actionIt->second.declaredSourceMask) ||
+            std::find(boundSources.begin(), boundSources.end(), binding.sourcePath) !=
+                boundSources.end()) {
+            continue;
+        }
+        boundSources.push_back(binding.sourcePath);
+    }
+    const XrResult validation = api_validation::ValidateEnumeration(
+        sourceCapacityInput, sourceCountOutput, sources,
+        static_cast<uint32_t>(boundSources.size()));
+    if (XR_FAILED(validation) || sourceCapacityInput == 0) return validation;
+    std::copy(boundSources.begin(), boundSources.end(), sources);
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrGetInputSourceLocalizedName_runtime(
+    XrSession session, const XrInputSourceLocalizedNameGetInfo* info,
+    uint32_t bufferCapacityInput, uint32_t* bufferCountOutput, char* buffer) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (!rt::g_sessionActionSetsAttached) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+    constexpr XrInputSourceLocalizedNameFlags validFlags =
+        XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT |
+        XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT |
+        XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT;
+    if (info->whichComponents == 0 || (info->whichComponents & ~validFlags) != 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    auto sourceIt = rt::g_pathStrings.find(info->sourcePath);
+    if (sourceIt == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+    const auto profileIt = rt::g_pathStrings.find(rt::g_activeProfile);
+    const std::string profile = profileIt == rt::g_pathStrings.end() ? "" : profileIt->second;
+    const std::string name = interaction_query::LocalizedSourceName(
+        sourceIt->second, profile, info->whichComponents);
+    const uint32_t required = static_cast<uint32_t>(name.size() + 1);
+    const XrResult validation = api_validation::ValidateEnumeration(
+        bufferCapacityInput, bufferCountOutput, buffer, required);
+    if (XR_FAILED(validation) || bufferCapacityInput == 0) return validation;
+    std::memcpy(buffer, name.c_str(), required);
     return XR_SUCCESS;
 }
 
@@ -7830,44 +9633,104 @@ static XrResult XRAPI_PTR xrDestroySwapchain_runtime(XrSwapchain sc) {
 }
 
 // Missing functions Unity needs
-static XrResult XRAPI_PTR xrResultToString_runtime(XrInstance, XrResult value, char buffer[XR_MAX_RESULT_STRING_SIZE]) {
-    const char* str = "XR_SUCCESS";
-    if (value != XR_SUCCESS) str = "XR_ERROR";
-    strncpy(buffer, str, XR_MAX_RESULT_STRING_SIZE - 1);
-    buffer[XR_MAX_RESULT_STRING_SIZE - 1] = '\0';
+static XrResult XRAPI_PTR xrResultToString_runtime(
+    XrInstance instance, XrResult value, char buffer[XR_MAX_RESULT_STRING_SIZE]) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!buffer) return XR_ERROR_VALIDATION_FAILURE;
+    const std::string name = enum_strings::Result(value);
+    std::snprintf(buffer, XR_MAX_RESULT_STRING_SIZE, "%s", name.c_str());
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrStructureTypeToString_runtime(XrInstance, XrStructureType value, char buffer[XR_MAX_STRUCTURE_NAME_SIZE]) {
-    snprintf(buffer, XR_MAX_STRUCTURE_NAME_SIZE, "XrStructureType_%d", (int)value);
+static XrResult XRAPI_PTR xrStructureTypeToString_runtime(
+    XrInstance instance, XrStructureType value,
+    char buffer[XR_MAX_STRUCTURE_NAME_SIZE]) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!buffer) return XR_ERROR_VALIDATION_FAILURE;
+    const std::string name = enum_strings::StructureType(value);
+    std::snprintf(buffer, XR_MAX_STRUCTURE_NAME_SIZE, "%s", name.c_str());
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetReferenceSpaceBoundsRect_runtime(XrSession, XrReferenceSpaceType, XrExtent2Df* bounds) {
+static XrResult XRAPI_PTR xrGetReferenceSpaceBoundsRect_runtime(
+    XrSession session, XrReferenceSpaceType type, XrExtent2Df* bounds) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (!bounds) return XR_ERROR_VALIDATION_FAILURE;
-    bounds->width = 3.0f;
-    bounds->height = 3.0f;
-    Log("[SimXR] xrGetReferenceSpaceBoundsRect: 3x3 meters");
+    if (type != XR_REFERENCE_SPACE_TYPE_VIEW && type != XR_REFERENCE_SPACE_TYPE_LOCAL &&
+        type != XR_REFERENCE_SPACE_TYPE_STAGE) {
+        return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+    }
+    if (type != XR_REFERENCE_SPACE_TYPE_STAGE) {
+        *bounds = {0.0f, 0.0f};
+        return XR_SPACE_BOUNDS_UNAVAILABLE;
+    }
+    *bounds = {3.0f, 3.0f};
+    Log("[SimXR] xrGetReferenceSpaceBoundsRect: STAGE is 3x3 meters");
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetViewConfigurationProperties_runtime(XrInstance, XrSystemId, XrViewConfigurationType type, 
+static XrResult XRAPI_PTR xrGetViewConfigurationProperties_runtime(XrInstance instance, XrSystemId systemId, XrViewConfigurationType type,
                                                                    XrViewConfigurationProperties* props) {
-    if (!props) return XR_ERROR_VALIDATION_FAILURE;
-    props->type = XR_TYPE_VIEW_CONFIGURATION_PROPERTIES;
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (type != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    }
+    if (!props || props->type != XR_TYPE_VIEW_CONFIGURATION_PROPERTIES) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
     props->viewConfigurationType = type;
     props->fovMutable = XR_FALSE;
     Log("[SimXR] xrGetViewConfigurationProperties");
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrApplyHapticFeedback_runtime(XrSession, const XrHapticActionInfo* info, const XrHapticBaseHeader* haptic) {
-    // Just stub for now
+static XrResult ValidateHapticActionInfo(
+    XrSession session, const XrHapticActionInfo* info) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_HAPTIC_ACTION_INFO) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    auto actionIt = rt::g_actions.find(info->action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    if (actionIt->second.type != XR_ACTION_TYPE_VIBRATION_OUTPUT) {
+        return XR_ERROR_ACTION_TYPE_MISMATCH;
+    }
+    if (!rt::g_attachedActionSets.count(actionIt->second.actionSet)) {
+        return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+    }
+    if (info->subactionPath != XR_NULL_PATH) {
+        if (!rt::g_pathStrings.count(info->subactionPath)) return XR_ERROR_PATH_INVALID;
+        if (!SourceMaskForTopLevelPath(info->subactionPath) ||
+            !actionIt->second.declaredSubactionPaths.count(info->subactionPath)) {
+            return XR_ERROR_PATH_UNSUPPORTED;
+        }
+    }
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrStopHapticFeedback_runtime(XrSession, const XrHapticActionInfo* info) {
-    // Just stub for now
+static XrResult XRAPI_PTR xrApplyHapticFeedback_runtime(
+    XrSession session, const XrHapticActionInfo* info, const XrHapticBaseHeader* haptic) {
+    XrResult result = ValidateHapticActionInfo(session, info);
+    if (XR_FAILED(result)) return result;
+    if (!haptic || haptic->type != XR_TYPE_HAPTIC_VIBRATION) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    result = input::ValidateHapticVibration(
+        *reinterpret_cast<const XrHapticVibration*>(haptic));
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) return XR_SESSION_NOT_FOCUSED;
+
+    // The simulator has no physical vibration device. OpenXR permits a runtime to
+    // ignore a valid request when no appropriate device is available.
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrStopHapticFeedback_runtime(
+    XrSession session, const XrHapticActionInfo* info) {
+    const XrResult result = ValidateHapticActionInfo(session, info);
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) return XR_SESSION_NOT_FOCUSED;
     return XR_SUCCESS;
 }
 
@@ -7875,13 +9738,16 @@ static XrResult XRAPI_PTR xrStopHapticFeedback_runtime(XrSession, const XrHaptic
 static XrResult XRAPI_PTR xrConvertWin32PerformanceCounterToTimeKHR_runtime(XrInstance instance,
                                                                             const LARGE_INTEGER* performanceCounter,
                                                                             XrTime* time) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     if (!performanceCounter || !time) return XR_ERROR_VALIDATION_FAILURE;
     
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     
-    // Convert to nanoseconds
+    // Convert to nanoseconds, guarding against overflow (khr_win32_convert_performance_
+    // counter_time.adoc: XR_ERROR_TIME_INVALID when the output cannot represent the input).
     const long long secs = performanceCounter->QuadPart / freq.QuadPart;
+    if (secs > INT64_MAX / 1000000000LL) return XR_ERROR_TIME_INVALID;
     const long long rem = performanceCounter->QuadPart % freq.QuadPart;
     *time = secs * 1000000000LL + (rem * 1000000000LL) / freq.QuadPart;
     return XR_SUCCESS;
@@ -7890,13 +9756,15 @@ static XrResult XRAPI_PTR xrConvertWin32PerformanceCounterToTimeKHR_runtime(XrIn
 static XrResult XRAPI_PTR xrConvertTimeToWin32PerformanceCounterKHR_runtime(XrInstance instance,
                                                                              XrTime time,
                                                                              LARGE_INTEGER* performanceCounter) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     if (!performanceCounter) return XR_ERROR_VALIDATION_FAILURE;
     
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     
-    // Convert from nanoseconds  
+    // Convert from nanoseconds, guarding against overflow
     const long long secs = time / 1000000000LL;
+    if (secs > INT64_MAX / freq.QuadPart) return XR_ERROR_TIME_INVALID;
     const long long rem = time % 1000000000LL;
     performanceCounter->QuadPart = secs * freq.QuadPart + (rem * freq.QuadPart) / 1000000000LL;
     return XR_SUCCESS;
@@ -7986,10 +9854,50 @@ static const NameFn kFnTable[] = {
     {"xrConvertTimeToWin32PerformanceCounterKHR", (PFN_xrVoidFunction)xrConvertTimeToWin32PerformanceCounterKHR_runtime},
 };
 
+static bool IsGlobalCommand(const char* name) {
+    return strcmp(name, "xrEnumerateApiLayerProperties") == 0 ||
+           strcmp(name, "xrEnumerateInstanceExtensionProperties") == 0 ||
+           strcmp(name, "xrCreateInstance") == 0;
+}
+
+static const char* RequiredExtensionForCommand(const char* name) {
+    if (strcmp(name, "xrGetD3D11GraphicsRequirementsKHR") == 0)
+        return XR_KHR_D3D11_ENABLE_EXTENSION_NAME;
+    if (strcmp(name, "xrGetD3D12GraphicsRequirementsKHR") == 0)
+        return XR_KHR_D3D12_ENABLE_EXTENSION_NAME;
+    if (strcmp(name, "xrGetOpenGLGraphicsRequirementsKHR") == 0)
+        return XR_KHR_OPENGL_ENABLE_EXTENSION_NAME;
+    if (strcmp(name, "xrGetVulkanGraphicsRequirementsKHR") == 0 ||
+        strcmp(name, "xrGetVulkanInstanceExtensionsKHR") == 0 ||
+        strcmp(name, "xrGetVulkanDeviceExtensionsKHR") == 0 ||
+        strcmp(name, "xrGetVulkanGraphicsDeviceKHR") == 0)
+        return XR_KHR_VULKAN_ENABLE_EXTENSION_NAME;
+    if (strcmp(name, "xrGetVulkanGraphicsRequirements2KHR") == 0 ||
+        strcmp(name, "xrCreateVulkanInstanceKHR") == 0 ||
+        strcmp(name, "xrCreateVulkanDeviceKHR") == 0 ||
+        strcmp(name, "xrGetVulkanGraphicsDevice2KHR") == 0)
+        return XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME;
+    if (strcmp(name, "xrConvertWin32PerformanceCounterToTimeKHR") == 0 ||
+        strcmp(name, "xrConvertTimeToWin32PerformanceCounterKHR") == 0)
+        return XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME;
+    return nullptr;
+}
+
 static XrResult XRAPI_PTR xrGetInstanceProcAddr_runtime(XrInstance instance, const char* name, PFN_xrVoidFunction* fn) {
     if (!name || !fn) {
         Logf("[SimXR] xrGetInstanceProcAddr: ERROR - name=%p, fn=%p", name, fn);
         return XR_ERROR_VALIDATION_FAILURE;
+    }
+    *fn = nullptr;
+    if (instance == XR_NULL_HANDLE) {
+        if (!IsGlobalCommand(name)) return XR_ERROR_HANDLE_INVALID;
+    } else if (!IsValidInstance(instance)) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (const char* extension = RequiredExtensionForCommand(name)) {
+        if (instance == XR_NULL_HANDLE || !IsExtensionEnabled(extension)) {
+            return XR_ERROR_FUNCTION_UNSUPPORTED;
+        }
     }
     
     // Reduce logging verbosity for xrGetInstanceProcAddr

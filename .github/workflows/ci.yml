@@ -1,0 +1,151 @@
+name: CI and Release
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.arch }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            cmake_arch: x64
+            binary_name: openxr_simulator.dll
+          - arch: x86
+            cmake_arch: Win32
+            binary_name: openxr_simulator-32.dll
+
+    steps:
+      - name: Check out OpenXR Simulator
+        uses: actions/checkout@v7
+
+      - name: Check out Vulkan headers
+        uses: actions/checkout@v7
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: v1.4.360
+          path: vulkan-headers
+
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake -S . -B "build/${{ matrix.arch }}"
+          -G "Visual Studio 17 2022"
+          -A "${{ matrix.cmake_arch }}"
+          -DSIMXR_VULKAN_INCLUDE_DIR="${{ github.workspace }}/vulkan-headers/include"
+
+      - name: Build
+        run: cmake --build "build/${{ matrix.arch }}" --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir "build/${{ matrix.arch }}" -C Release --output-on-failure
+
+      - name: Stage runtime DLL
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force 'staged-binary' | Out-Null
+          Copy-Item 'bin/openxr_simulator.dll' 'staged-binary/${{ matrix.binary_name }}'
+
+      - name: Upload runtime DLL
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.arch }}
+          path: staged-binary/${{ matrix.binary_name }}
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Assemble user package
+    needs: build
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out OpenXR Simulator
+        uses: actions/checkout@v7
+
+      - name: Download runtime DLLs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: built-binaries
+          merge-multiple: true
+
+      - name: Package and verify
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') {
+              $env:GITHUB_REF_NAME
+          } else {
+              'sha-' + $env:GITHUB_SHA.Substring(0, 7)
+          }
+          $packageArgs = @{
+              Version = $version
+              X64Binary = 'built-binaries/openxr_simulator.dll'
+              X86Binary = 'built-binaries/openxr_simulator-32.dll'
+              OutputDirectory = 'dist'
+          }
+          & ./scripts/package-release.ps1 @packageArgs
+
+      - name: Upload user package
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-package
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@v8
+        with:
+          name: release-package
+          path: release-assets
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release-assets/*.zip release-assets/*.sha256)
+          if (( ${#assets[@]} == 0 )); then
+            echo "No release assets were downloaded" >&2
+            exit 1
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --verify-tag \
+              --generate-notes \
+              --title "OpenXR Simulator $GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY"
+          fi

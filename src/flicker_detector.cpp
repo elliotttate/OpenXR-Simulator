@@ -28,6 +28,12 @@ constexpr uint32_t kHistoryFrames = 10;
 constexpr uint32_t kPostIncidentFrames = 12;
 constexpr uint64_t kIncidentCooldownFrames = 300;
 
+// Manual composed-preview captures need CPU pixels even on backends that normally present
+// straight from the GPU. The frame budget supplies the incident's post-trigger packet; the
+// deadline prevents a request made just as rendering stops from pinning Mirror Rate on forever.
+std::atomic<uint32_t> g_forcedPreviewFrames{0};
+std::atomic<ULONGLONG> g_forcedPreviewDeadlineMs{0};
+
 // Disk-lifecycle guards. A chronically-firing heuristic must not be able to
 // fill the drive: each session stops writing new incident packets after this
 // many, and the worker prunes older sessions' packets at startup.
@@ -48,6 +54,7 @@ struct Sample {
     float temporalRight = 0.0f;
     float brightFractionLeft = 0.0f;
     float brightFractionRight = 0.0f;
+    PreviewFrameInfo frameInfo{};
 };
 
 // The classifier metrics without the pixels: what the status JSON needs, small
@@ -65,6 +72,7 @@ Sample MetricsOnly(const Sample& sample) {
     metrics.temporalRight = sample.temporalRight;
     metrics.brightFractionLeft = sample.brightFractionLeft;
     metrics.brightFractionRight = sample.brightFractionRight;
+    metrics.frameInfo = sample.frameInfo;
     return metrics;
 }
 
@@ -188,6 +196,10 @@ UiState& GetUiState() {
 const std::filesystem::path& DataRoot() {
     static const std::filesystem::path* root = []() {
         wchar_t buffer[MAX_PATH] = {};
+        const DWORD overrideLength = GetEnvironmentVariableW(L"SIMXR_DATA_DIR", buffer, MAX_PATH);
+        if (overrideLength > 0 && overrideLength < MAX_PATH) {
+            return new std::filesystem::path(buffer);
+        }
         const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, MAX_PATH);
         std::filesystem::path base = length > 0 && length < MAX_PATH ? buffer : L".";
         return new std::filesystem::path(base / L"OpenXR-Simulator");
@@ -274,9 +286,10 @@ uint8_t Luma(const uint8_t* bgra) {
 // caller maps is 256-byte aligned, and sampling it in place is what removed the
 // full-frame repack the detector used to force on the render thread.
 Sample Downsample(const uint8_t* bgra, uint32_t width, uint32_t height,
-                  uint32_t pitchBytes, uint64_t frame) {
+                  uint32_t pitchBytes, uint64_t frame, const PreviewFrameInfo* info) {
     Sample sample;
     sample.frame = frame;
+    if (info) sample.frameInfo = *info;
     // Detection runs on the application's xrEndFrame thread. A 320-wide signal
     // retains far more spatial detail than the temporal/luma classifier needs
     // while keeping sampling and history comparisons cheap.
@@ -455,11 +468,27 @@ void WriteBmpRegion(const std::filesystem::path& path, const Sample& sample,
 void SaveSample(const std::filesystem::path& directory, const Sample& sample) {
     std::error_code ec;
     std::filesystem::create_directories(directory, ec);
+    const std::string stem = "frame" + std::to_string(sample.frame);
+
+    // Publish metadata atomically before its matching preview. The MCP waits on preview
+    // counts, so seeing an image now guarantees its sidecar is already complete.
+    const bool projectionFresh = sample.frameInfo.fresh[0] && sample.frameInfo.fresh[1];
+    std::ostringstream meta;
+    meta << "{\n  \"frame\": " << sample.frame
+         << ",\n  \"projectionFresh\": " << (projectionFresh ? "true" : "false")
+         << ",\n  \"left\": {\"imageIndex\": " << sample.frameInfo.imageIndex[0]
+         << ", \"releaseSerial\": " << sample.frameInfo.releaseSerial[0]
+         << ", \"fresh\": " << (sample.frameInfo.fresh[0] ? "true" : "false") << "}"
+         << ",\n  \"right\": {\"imageIndex\": " << sample.frameInfo.imageIndex[1]
+         << ", \"releaseSerial\": " << sample.frameInfo.releaseSerial[1]
+         << ", \"fresh\": " << (sample.frameInfo.fresh[1] ? "true" : "false") << "}\n}\n";
+    AtomicWrite(directory / (stem + "_meta.json"), meta.str());
+
     const uint32_t leftWidth = sample.width / 2;
     const uint32_t rightWidth = sample.width - leftWidth;
-    WriteBmpRegion(directory / ("frame" + std::to_string(sample.frame) + "_color_L.bmp"), sample, 0, leftWidth);
-    WriteBmpRegion(directory / ("frame" + std::to_string(sample.frame) + "_color_R.bmp"), sample, leftWidth, rightWidth);
-    WriteBmpRegion(directory / ("frame" + std::to_string(sample.frame) + "_preview.bmp"), sample, 0, sample.width);
+    WriteBmpRegion(directory / (stem + "_color_L.bmp"), sample, 0, leftWidth);
+    WriteBmpRegion(directory / (stem + "_color_R.bmp"), sample, leftWidth, rightWidth);
+    WriteBmpRegion(directory / (stem + "_preview.bmp"), sample, 0, sample.width);
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +508,7 @@ struct PendingFile {
 struct PendingSample {
     std::filesystem::path directory;
     Sample sample;
+    bool completesIncident = false;
 };
 
 struct IoWorker {
@@ -502,16 +532,18 @@ void QueueFile(std::filesystem::path path, std::string contents) {
     worker.wake.notify_one();
 }
 
-void QueueSample(const std::filesystem::path& directory, const Sample& sample) {
+bool QueueSample(const std::filesystem::path& directory, const Sample& sample,
+                 bool completesIncident = false) {
     IoWorker& worker = GetWorker();
     {
         std::lock_guard<std::mutex> guard(worker.mutex);
         // Bound the backlog if storage cannot keep up; dropping a post-incident
         // frame beats growing without limit on the app's memory.
-        if (worker.samples.size() >= 64) return;
-        worker.samples.push_back(PendingSample{ directory, sample });
+        if (worker.samples.size() >= 64) return false;
+        worker.samples.push_back(PendingSample{ directory, sample, completesIncident });
     }
     worker.wake.notify_one();
+    return true;
 }
 
 std::string BuildStatusJson(const State& state, const Sample* sample, uint64_t frame) {
@@ -614,6 +646,10 @@ void BeginIncident(State& state, const std::string& reason, uint64_t frame, bool
         (L"incident_" + std::to_wstring(frame));
     state.lastIncidentDirectory = state.activeIncidentDirectory;
     state.postFramesRemaining = kPostIncidentFrames;
+    if (reason == "MANUAL_CAPTURE") {
+        g_forcedPreviewFrames.store(kPostIncidentFrames, std::memory_order_release);
+        g_forcedPreviewDeadlineMs.store(GetTickCount64() + 15000, std::memory_order_release);
+    }
     state.activeLastSavedFrame = 0;
     for (const auto& historySample : state.history) {
         QueueSample(state.activeIncidentDirectory, historySample);
@@ -803,7 +839,15 @@ void WorkerMain() {
             samples.swap(worker.samples);
         }
         for (PendingFile& file : files) AtomicWrite(file.path, file.contents);
-        for (PendingSample& pending : samples) SaveSample(pending.directory, pending.sample);
+        for (PendingSample& pending : samples) {
+            SaveSample(pending.directory, pending.sample);
+            if (pending.completesIncident) {
+                std::ostringstream complete;
+                complete << "{\n  \"complete\": true,\n  \"finalFrame\": "
+                         << pending.sample.frame << "\n}\n";
+                AtomicWrite(pending.directory / L"capture_complete.json", complete.str());
+            }
+        }
         FlushDirtyStatus();
         PollManualRequests();
         // Prune after the first service cycle, not before it: clearing a large
@@ -832,6 +876,14 @@ void EnsureWorker() {
 }
 
 } // namespace
+
+bool WantsPreviewReadback() {
+    uint32_t frames = g_forcedPreviewFrames.load(std::memory_order_acquire);
+    if (frames == 0) return false;
+    if (GetTickCount64() <= g_forcedPreviewDeadlineMs.load(std::memory_order_acquire)) return true;
+    g_forcedPreviewFrames.store(0, std::memory_order_release);
+    return false;
+}
 
 void ObserveSubmission(uint64_t frame, uint32_t projectionLayers, uint32_t totalLayers) {
     EnsureWorker();
@@ -870,7 +922,8 @@ void ObserveSubmission(uint64_t frame, uint32_t projectionLayers, uint32_t total
 }
 
 void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
-                    uint32_t pitchBytes, uint64_t generation, uint64_t frame) {
+                    uint32_t pitchBytes, uint64_t generation, uint64_t frame,
+                    const PreviewFrameInfo* info) {
     if (!bgra || width < 4 || height < 2) return;
     if (pitchBytes == 0) pitchBytes = width * 4;
     EnsureWorker();
@@ -879,7 +932,7 @@ void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
     if (generation == 0 || generation == state.lastGeneration) return;
     state.lastGeneration = generation;
 
-    Sample current = Downsample(bgra, width, height, pitchBytes, frame);
+    Sample current = Downsample(bgra, width, height, pitchBytes, frame, info);
     if (!state.history.empty()) CalculateTemporal(current, state.history.back());
     ++state.previewSamples;
 
@@ -922,10 +975,12 @@ void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
     if (!reason.empty()) BeginIncident(state, reason, frame);
 
     if (!state.activeIncidentDirectory.empty() && state.activeLastSavedFrame != current.frame) {
-        QueueSample(state.activeIncidentDirectory, current);
-        state.activeLastSavedFrame = current.frame;
-        if (state.postFramesRemaining > 0) --state.postFramesRemaining;
-        if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
+        const bool completesIncident = state.postFramesRemaining == 1;
+        if (QueueSample(state.activeIncidentDirectory, current, completesIncident)) {
+            state.activeLastSavedFrame = current.frame;
+            if (state.postFramesRemaining > 0) --state.postFramesRemaining;
+            if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
+        }
     }
     if (state.previewSamples % 15 == 0 || !reason.empty()) {
         state.statusDirty = true;
@@ -935,6 +990,11 @@ void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
 
     state.history.push_back(std::move(current));
     while (state.history.size() > kHistoryFrames) state.history.pop_front();
+
+    uint32_t remaining = g_forcedPreviewFrames.load(std::memory_order_acquire);
+    while (remaining != 0 &&
+           !g_forcedPreviewFrames.compare_exchange_weak(
+               remaining, remaining - 1, std::memory_order_acq_rel, std::memory_order_acquire)) {}
 }
 
 void ObservePaint(uint64_t generation, bool paintedPreview) {
@@ -1020,10 +1080,12 @@ void ObserveUi(const uint8_t* bgra, uint32_t width, uint32_t height,
     if (!reason.empty()) BeginUiIncident(state, reason, frame);
     if (!current.bgra.empty()) {
         if (!state.activeIncidentDirectory.empty() && state.activeLastSavedFrame != current.frame) {
-            QueueSample(state.activeIncidentDirectory, current);
-            state.activeLastSavedFrame = current.frame;
-            if (state.postFramesRemaining > 0) --state.postFramesRemaining;
-            if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
+            const bool completesIncident = state.postFramesRemaining == 1;
+            if (QueueSample(state.activeIncidentDirectory, current, completesIncident)) {
+                state.activeLastSavedFrame = current.frame;
+                if (state.postFramesRemaining > 0) --state.postFramesRemaining;
+                if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
+            }
         }
         state.lastMetrics = MetricsOnly(current);
         state.hasMetrics = true;

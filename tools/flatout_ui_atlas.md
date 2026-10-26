@@ -174,8 +174,12 @@ Use `--comfort-guides` to run the read-only MCP `analyze_ui_visibility` tool
 after each screenshot. Each state links a separate diagnostic PNG and JSON;
 the original native screenshot is unchanged. Native control rectangles use
 their measured world plane or both-eye composition carrier. Split livery
-controls retain their own full-canvas plane mapping. Unknown spatial text,
-out-of-canvas regions and controls crossing physical planes remain explicitly
+controls retain their own full-canvas plane mapping. Spatial text with native
+`rendered_bounds` is measured from its actual HUD layout rectangle; this does
+not infer glyph ink or a ray collider. Spatial Back uses its native centre,
+half-extents and scaled layout axes. Both are included in inventory and
+both-eye overlays. Text without those bounds, out-of-canvas regions and
+controls crossing physical planes remain explicitly
 unmeasured rather than receiving a guessed depth.
 
 Comfort mode takes a fresh frame for every requested state, including repeated

@@ -3,12 +3,14 @@
 #pragma once
 
 static int ResolveSpaceHand(const rt::ActionSpace& space) {
-    if (space.hand>=0) return space.hand;
-    for (const auto& binding:rt::g_bindings[rt::g_activeProfile]) {
-        if (binding.action!=space.action) continue;
-        const auto& path=rt::g_pathStrings[binding.binding];
-        if (path.find("/user/hand/left/")==0) return 0;
-        if (path.find("/user/hand/right/")==0) return 1;
+    if (space.sourceMask==interaction_query::kLeftHandSource) return 0;
+    if (space.sourceMask==interaction_query::kRightHandSource) return 1;
+    auto action=rt::g_actions.find(space.action);
+    if (action==rt::g_actions.end()) return -1;
+    for (const auto& binding:action->second.bindings) {
+        if (binding.profile!=rt::g_activeProfile) continue;
+        if (binding.sourceMask==interaction_query::kLeftHandSource) return 0;
+        if (binding.sourceMask==interaction_query::kRightHandSource) return 1;
     }
     return -1;
 }
@@ -20,7 +22,7 @@ static XrPosef SpaceWorldPose(XrSpace space) {
         const int hand=ResolveSpaceHand(controller->second);
         if (hand<0) return ui_auto::Identity();
         rt::GetControllerPose(hand == 0 ? rt::g_leftController : rt::g_rightController, &pose);
-        return ui_auto::Compose(pose, controller->second.offset);
+        return ui_auto::Compose(pose, controller->second.poseInActionSpace);
     }
     auto ref = rt::g_referenceSpaces.find(space);
     if (ref == rt::g_referenceSpaces.end()) return ui_auto::Identity();
@@ -144,7 +146,7 @@ static void ResetUiAutomation() {
     static unsigned serial=0;
     ui_auto::g_session=std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64())+"-"+std::to_string(++serial);
     ui_auto::g_sync=0; ui_auto::g_frame={}; ui_auto::g_captures.clear();
-    rt::g_actionSnapshots.clear();
+    for (auto& action:rt::g_actions) action.second.slots={};
 }
 
 static bool CompatibleCapture(const ui_auto::Frame& a, int surfaceId) {

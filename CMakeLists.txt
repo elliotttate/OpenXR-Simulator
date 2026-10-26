@@ -42,8 +42,12 @@ add_library(openxr_simulator SHARED
     src/json.h
     src/mcp_integration.h
     src/projection_timing.h
+    src/preview_focus.h
     src/ui_enhancements.h
 )
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    target_sources(openxr_simulator PRIVATE openxr_simulator_x86.def)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
@@ -131,6 +135,37 @@ if(BUILD_TESTING)
             set_tests_properties(ui_e2e_secondary_${hand} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
         endforeach()
     endif()
+    add_executable(action_state_tests tests/action_state_tests.cpp)
+    target_include_directories(action_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME action_state COMMAND action_state_tests)
+
+    add_executable(pose_math_tests tests/pose_math_tests.cpp)
+    target_include_directories(pose_math_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME pose_math COMMAND pose_math_tests)
+
+    add_executable(swapchain_state_tests tests/swapchain_state_tests.cpp)
+    target_include_directories(swapchain_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME swapchain_state COMMAND swapchain_state_tests)
+
+    add_executable(frame_state_tests tests/frame_state_tests.cpp)
+    target_include_directories(frame_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME frame_state COMMAND frame_state_tests)
+    add_executable(preview_focus_tests tests/preview_focus_tests.cpp)
+    target_include_directories(preview_focus_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME preview_focus COMMAND preview_focus_tests)
+
+
+    add_executable(composition_validation_tests tests/composition_validation_tests.cpp)
+    target_include_directories(composition_validation_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME composition_validation COMMAND composition_validation_tests)
+
+    add_executable(composition_render_tests tests/composition_render_tests.cpp)
+    target_include_directories(composition_render_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME composition_render COMMAND composition_render_tests)
+
+    add_executable(api_validation_tests tests/api_validation_tests.cpp)
+    target_include_directories(api_validation_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME api_validation COMMAND api_validation_tests)
 endif()
 
 # Link libraries
@@ -163,6 +198,7 @@ endif()
 set(RUNTIME_MANIFEST_CONTENT "{
     \"file_format_version\": \"1.0.0\",
     \"runtime\": {
+        \"name\": \"OpenXR Simulator\",
         \"library_path\": \"${SIMXR_OUTPUT_DIRECTORY}/openxr_simulator.dll\"
     }
 }")
