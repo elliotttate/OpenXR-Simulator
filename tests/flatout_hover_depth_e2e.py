@@ -269,7 +269,7 @@ class NativeDepth(Frontend):
             # below it, this ray crosses the base plane outside the source rect.
             face = copy.deepcopy(raised)
             face["geometry"]["surfaces"] = [tile]
-            x,y = quad_pixel(face, (960,21.6,960,21.6))
+            x,y = quad_pixel(face, (960,1.08,960,1.08))
             aim = {**aim,"capture_id":raised["capture_id"],"surface_id":tile["id"],"x":float(x),"y":float(y)}
             edge = await self.tool("hover_ui_at",aim,"native-raised-face-top-edge")
             assert edge["status"] == "input_delivered",edge

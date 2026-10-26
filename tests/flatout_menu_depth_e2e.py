@@ -29,6 +29,7 @@ class MenuDepth(Frontend):
             before = await self.query('vr.targets')
             legacy_index = int(name.split('.')[1]) if name.startswith('legacy.') else None
             if legacy_index is not None:
+                legacy_selection = (await self.query('menu.get_state'))['selection_index']
                 mapping = await self.query('ui.vr_button_map')
                 button = next(b for b in mapping['buttons'] if b['index'] == legacy_index)
                 assert button['hits'] and button['visible'], button
@@ -61,8 +62,14 @@ class MenuDepth(Frontend):
             current = await self.query('vr.targets')
             assert current['clicks'] == before['clicks'], current
             if legacy_index is not None:
-                menu = await self.query('menu.get_state')
-                assert menu['selection_index'] == legacy_index, menu
+                if any(t['name'] == name for t in current['targets']):
+                    # Carousels preview on hover and commit selection on click.
+                    assert current['hovered'] == name, current
+                    assert (await self.query('menu.get_state'))['selection_index'] == legacy_selection, 'Hover committed carousel selection'
+                    assert next(t['rect'] for t in current['targets'] if t['name'] == name) == target['rect'], 'Hover moved hit bounds'
+                else:
+                    menu = await self.query('menu.get_state')
+                    assert menu['selection_index'] == legacy_index, menu
             else:
                 assert current['hovered'] == name, current
                 assert next(t['rect'] for t in current['targets'] if t['name'] == name) == target['rect'], 'Hover moved hit bounds'

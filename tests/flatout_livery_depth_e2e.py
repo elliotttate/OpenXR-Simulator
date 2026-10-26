@@ -5,10 +5,12 @@ only; all interaction goes through screenshot-targeted simulator XR input.
 """
 import argparse
 import asyncio
+import copy
 import json
 import os
 from pathlib import Path
 import sys
+import uuid
 
 import numpy as np
 from mcp import ClientSession, StdioServerParameters
@@ -19,6 +21,9 @@ from flatout_frontend_e2e import read_game
 
 class LiveryDepth(LiveryTest):
     async def run(self):
+        if self.args.click:
+            initial = await self.state()
+            assert initial[self.args.expected_key] != self.args.expected_value, 'Click must cause an observable state transition'
         for label in self.args.target:
             before = await self.state()
             control = next(c for c in before['vr']['controls'] if c['label'] == label and c['enabled'])
@@ -33,7 +38,9 @@ class LiveryDepth(LiveryTest):
             assert receipt['status'] == 'input_delivered', receipt
             hovered = await self.state()
             hit = hovered['vr']['hands'][self.args.hand == 'right']
-            assert hit['ui_hit'] and max(abs(hit['u'] * 1920 - hx), abs(hit['v'] * 1080 - hy)) < 1, hit
+            assert hit['ui_hit'], hit
+            assert control['x'] <= hit['u'] * 1920 <= control['x'] + control['width'], hit
+            assert control['y'] <= hit['v'] * 1080 <= control['y'] + control['height'], hit
             current = next(c for c in hovered['vr']['controls'] if c['label'] == label)
             assert all(current[k] == control[k] for k in ('x', 'y', 'width', 'height')), 'Hover moved hit bounds'
             raised = await self.tool('capture_screenshot', {'eye': 'both', 'max_width': 4096}, 'raised-' + label)
@@ -52,8 +59,72 @@ class LiveryDepth(LiveryTest):
                                'submitted_surfaces': raised['geometry']['surfaces'],
                                'native_hover': hit})
             assert passed, (label, 'No matching 15mm stereo control plane', candidates)
+            # A hand-origin ray aimed using the old base image intersects the
+            # raised face at a different UV. Check the real parallel plane,
+            # rather than demanding the obsolete base-plane UV.
+            frame = hovered['vr']['frame']
+            panel = frame['panel']
+            normal = -np.array(panel['back'])
+            normal /= np.linalg.norm(normal)
+            plane = np.array(panel['origin']) + normal * .015
+            origin, direction = np.array(hit['origin']), np.array(hit['direction'])
+            distance = np.dot(plane-origin, normal) / np.dot(direction, normal)
+            point = origin + distance * direction
+            relative = point - np.array(panel['origin'])
+            expected_uv = [.5 + np.dot(relative, panel['right']) / frame['panel_width'],
+                           .5 - np.dot(relative, panel['up']) / frame['panel_height']]
+            assert max(abs(hit['u']-expected_uv[0])*1920, abs(hit['v']-expected_uv[1])*1080) < 1, (hit, expected_uv)
+            assert np.linalg.norm(np.array(hit['end'])-point) < .002, ('Ray misses raised face', hit, point.tolist())
+            self.cases.append({'case': 'raised-face-ray-intersection', 'passed': True, 'expected_uv': expected_uv})
+            if self.args.raised_edge_top:
+                tile = next(t['tile'] for t in candidates if abs(t['offset_meters'][2]-.015) < .001)
+                edge_state = copy.deepcopy(hovered)
+                edge_state['vr']['frame']['panel']['origin'] = plane.tolist()
+                ex, ey = screenshot_pixel(edge_state, raised, hx, control['y'] + .25)
+                edge_aim = {'capture_id': raised['capture_id'], 'x': float(ex), 'y': float(ey),
+                            'origin_mode': 'hand', 'hand': self.args.hand, 'surface_id': tile['id'], 'dwell_frames': 45}
+                edge = await self.tool('hover_ui_at', edge_aim, 'raised-edge-' + label)
+                assert edge['status'] == 'input_delivered', edge
+                ray = edge['target']['application_ray']
+                origin, direction = np.array(ray['position']), np.array(ray['direction'])
+                normal = basis[:, 2]
+                distance = np.dot(np.array(base['pose']['position'])-origin, normal) / np.dot(direction, normal)
+                relative = basis.T @ (origin+distance*direction-np.array(base['pose']['position']))
+                base_y = (.5-relative[1]/base['size'][1])*1080
+                assert base_y < control['y']-.25, ('Edge test also hits base widget', base_y, control)
+                state = await self.state()
+                hit = state['vr']['hands'][self.args.hand == 'right']
+                assert hit['ui_hit'] and control['y'] <= hit['v']*1080 < control['y']+2, hit
+                self.cases.append({'case': 'raised-edge-outside-base-hit', 'passed': True, 'base_y': base_y})
+                if self.args.click == label:
+                    self.edge_click_aim = edge_aim
+                if self.args.drag_off:
+                    initial = await self.state()
+                    held = await self.tool('hold_ui_at', edge_aim, 'edge-press-before-drag-off')
+                    assert held['status'] == 'input_delivered', held
+                    pressed = await self.state()
+                    assert pressed['tab'] == initial['tab'], 'Button activated before release'
+                    ox, oy = screenshot_pixel(before, source, control['x']+control['width']+20, hy)
+                    away = {**aim, 'x': float(ox), 'y': float(oy), 'dwell_frames': 30}
+                    moved = await self.tool('hold_ui_at', away, 'held-drag-outside-widget')
+                    assert moved['status'] == 'input_delivered', moved
+                    await self.release(self.args.hand)
+                    cancelled = await self.state()
+                    assert all(cancelled[k] == initial[k] for k in ('tab', 'document', 'generation')), cancelled
+                    self.cases.append({'case': 'genuine-drag-off-cancels-release', 'passed': True})
         if self.args.click:
-            after = await self.click(self.args.click, retry=True, hand=self.args.hand)
+            if self.args.raised_edge_top:
+                assert hasattr(self, 'edge_click_aim'), '--click must be among --target for raised-edge testing'
+                command = {**self.edge_click_aim, 'command_id': uuid.uuid4().hex, 'hold_frames': 45}
+                click = await self.tool('click_ui_at', command, 'raised-edge-click')
+                assert click['status'] == 'input_delivered', click
+                after = await self.state()
+                retry = await self.tool('click_ui_at', command, 'raised-edge-click-retry')
+                assert retry['delivery']['sync_id'] == click['delivery']['sync_id'], retry
+                repeated = await self.state()
+                assert all(repeated[k] == after[k] for k in ('document', 'generation', 'tab', 'page', 'mode')), repeated
+            else:
+                after = await self.click(self.args.click, retry=True, hand=self.args.hand)
             assert after[self.args.expected_key] == self.args.expected_value, after
             self.cases.append({'case': 'click-result', 'passed': True,
                                'key': self.args.expected_key, 'value': after[self.args.expected_key]})
@@ -91,10 +162,14 @@ if __name__ == '__main__':
     p.add_argument('--evidence', required=True, type=Path)
     p.add_argument('--target', action='append', required=True)
     p.add_argument('--hand', choices=('left', 'right'), default='right')
+    p.add_argument('--raised-edge-top', action='store_true')
+    p.add_argument('--drag-off', action='store_true', help='Hold the raised edge, move outside and release; no activation is allowed')
     p.add_argument('--click')
     p.add_argument('--expected-key')
     p.add_argument('--expected-value', type=json.loads)
     args = p.parse_args()
     if args.click and not args.expected_key:
         p.error('--click requires --expected-key and --expected-value')
+    if args.drag_off and (not args.raised_edge_top or args.click):
+        p.error('--drag-off requires --raised-edge-top and excludes --click')
     asyncio.run(main(args))

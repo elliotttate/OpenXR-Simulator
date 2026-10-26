@@ -111,6 +111,33 @@ def world_pixel(state, capture, point, eye_name):
     return np.array([(ex+u*ew-cx)/cw*width-.5, (ey+v*eh-cy)/ch*height-.5])
 
 
+def assert_control_ray_hit(state, control, hand):
+    """Account for the oblique hand ray intersecting a physically raised face.
+
+    The separate depth test verifies the face against submitted XR geometry.
+    Here the ray's visible endpoint identifies the interaction plane; freshly
+    rebuilt ImGui records can precede the next render's promotion metadata.
+    """
+    hit = state['vr'].get('hands', [state['vr'], state['vr']])[hand == 'right']
+    frame = state['vr']['frame']
+    panel = frame['panel']
+    normal = -np.array(panel['back'])
+    normal /= np.linalg.norm(normal)
+    lift = np.dot(np.array(hit['end'])-np.array(panel['origin']), normal)
+    assert -.001 <= lift <= .016, ('Unexpected control interaction plane', lift)
+    plane = np.array(panel['origin']) + normal * lift
+    origin, direction = np.array(hit['origin']), np.array(hit['direction'])
+    distance = np.dot(plane-origin, normal) / np.dot(direction, normal)
+    point = origin + distance * direction
+    relative = point - np.array(panel['origin'])
+    u = .5 + np.dot(relative, panel['right']) / frame['panel_width']
+    v = .5 - np.dot(relative, panel['up']) / frame['panel_height']
+    assert hit['ui_hit'] and max(abs(hit['u']-u)*1920, abs(hit['v']-v)*1080) < 1, (hit, [u, v])
+    assert control['x'] <= hit['u']*1920 <= control['x']+control['width'], hit
+    assert control['y'] <= hit['v']*1080 <= control['y']+control['height'], hit
+    return hit
+
+
 class LiveryTest:
     def __init__(self, args, session):
         self.args, self.session, self.sequence, self.cases = args, session, 0, []
@@ -182,8 +209,7 @@ class LiveryTest:
         assert hover["status"] == "input_delivered", hover
         await asyncio.sleep(.3)
         hovered = await self.state()
-        hit = hovered["vr"].get("hands", [hovered["vr"], hovered["vr"]])[hand == "right"]
-        assert hit["ui_hit"] and max(abs(hit["u"]*1920-hx), abs(hit["v"]*1080-hy)) < 1, hit
+        hit = assert_control_ray_hit(hovered, control, hand)
         assert hovered["vr"]["hand"] == int(hand == "right"), "Deliberately re-aiming must transfer the idle UI hover"
         # The source image remains valid: the UI hover cannot move the XR camera.
         click = {**aim, "hold_frames": hold_frames, "command_id": uuid.uuid4().hex}
@@ -321,7 +347,42 @@ class LiveryTest:
         self.last_capture = capture
         ribbons = capture["geometry"]["decorations"]
         assert len(ribbons) == 2, "Livery rays must use two actual compositor quads"
-        assert not capture["geometry"]["surfaces"], "The livery UI remains a world-space surface"
+        # The panel stays in the world pass; compositor surfaces may contain
+        # only the focused control and its returning predecessor, in both eyes.
+        surfaces = capture["geometry"]["surfaces"]
+        assert 1 <= len(surfaces) <= 2, ("Expected only current/returning lifted controls", surfaces)
+        base = ui_surface(state)
+        base_basis = quaternion_matrix(base["pose"]["orientation"])
+        width, height = base["size"]
+        matched_controls, surface_ids = [], []
+        for tile in surfaces:
+            basis = quaternion_matrix(tile["pose"]["orientation"])
+            center = base_basis.T @ (np.array(tile["pose"]["position"])-base["pose"]["position"])
+            size = np.array(tile["size"])
+            assert np.isfinite(center).all() and np.isfinite(size).all(), tile
+            assert tile["visibility"] == 0, ("Each lifted face must serve both eyes", tile)
+            assert np.linalg.norm(basis-base_basis) < 1e-4, ("Control rotated away from the native panel", tile)
+            assert 0.000002 < center[2] <= .0151, ("Unexpected physical UI lift", center.tolist(), tile)
+            assert 0 < size[0] < width and 0 < size[1] < height, ("The base panel must remain world-space", tile)
+            left = (.5+(center[0]-size[0]/2)/width)*1920
+            right = (.5+(center[0]+size[0]/2)/width)*1920
+            top = (.5-(center[1]+size[1]/2)/height)*1080
+            bottom = (.5-(center[1]-size[1]/2)/height)*1080
+            matches = []
+            for control in state["vr"]["controls"]:
+                if not control["enabled"]:
+                    continue
+                # Native artwork adds at most three pixels plus rounding for
+                # its existing AA fringe; clipping can remove either fringe.
+                fringe = np.array([control["x"]-left, control["y"]-top,
+                                   right-control["x"]-control["width"], bottom-control["y"]-control["height"]])
+                if (fringe >= -.05).all() and (fringe <= 4.05).all():
+                    matches.append(control)
+            assert len(matches) == 1 and matches[0]["label"] in ("PAINT", "STICKERS"), ("Unexpected compositor UI face", tile, matches)
+            matched_controls.append(matches[0]["label"])
+            surface_ids.append(tile["id"])
+        assert len(set(surface_ids)) == len(surfaces) and len(set(matched_controls)) == len(surfaces), "Duplicate lifted control planes"
+        assert "PAINT" in matched_controls, "The final right-hand hover must promote its actual control"
         camera = state["vr"]["frame"]["camera"]
         inverse_camera = np.column_stack([camera[k] for k in ("right", "up", "back")]).T
         matched_ribbons = []
