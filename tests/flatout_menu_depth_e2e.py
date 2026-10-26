@@ -101,6 +101,23 @@ class MenuDepth(Frontend):
                 await self.capture('gpu-queued-' + name)
             self.cases.append({'case': 'physical-hover-' + name, 'passed': True, 'lift_meters': lifts,
                                'source_rect': target['rect'], 'base': base, 'tiles': tiles})
+            if name == getattr(self.args, 'inert_target', None):
+                menu_before = await self.query('menu.get_state')
+                message_before = await self.query('ui.get_message_box')
+                held = await self.tool('hold_ui_at', aim, 'locked-hold-' + name)
+                assert held['status'] == 'input_delivered', held
+                after = await self.query('vr.targets')
+                assert after['clicks'] == before['clicks'], 'Locked preview activated'
+                held_tiles = {s['id']: s for s in held['capture']['geometry']['surfaces']}
+                for tile in matching:
+                    assert tile['id'] in held_tiles, 'Locked highlight disappeared on press'
+                    assert np.allclose(held_tiles[tile['id']]['pose']['position'], tile['pose']['position'], atol=.001), 'Locked preview used active press travel'
+                await self.tool('release_ui_pointer', {'capture_id': held['capture']['capture_id'], 'hand': self.args.hand}, 'locked-release-' + name)
+                menu_after = await self.query('menu.get_state')
+                assert menu_after['current_menu'] == menu_before['current_menu']
+                assert menu_after['selection_index'] == menu_before['selection_index'], 'Locked preview committed selection'
+                assert (await self.query('ui.get_message_box')) == message_before, 'Locked preview opened a dialog'
+                self.cases.append({'case': 'locked-preview-stays-inert-' + name, 'passed': True})
         if self.args.click:
             await self.click(self.args.click)
             after = await self.query('menu.get_state')
@@ -144,6 +161,7 @@ if __name__ == '__main__':
     p.add_argument('--gpu-capture', type=Path, help='Capture the native atlas draw while the control is raised')
     p.add_argument('--target', action='append')
     p.add_argument('--legacy-index', action='append', type=int, default=[])
+    p.add_argument('--inert-target', help='Also hold/release this locked preview and require no activation or press travel')
     p.add_argument('--click')
     p.add_argument('--expected-menu')
     p.add_argument('--reading-distance', type=float)
