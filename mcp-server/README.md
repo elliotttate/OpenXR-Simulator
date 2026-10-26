@@ -533,6 +533,7 @@ python tests/flatout_leaderboard_scroll_e2e.py --pid <game-pid> --data-dir <ipc-
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --reading-comfort-only
 # From the first Flatout Mode page: keep Leaderboard enabled while the spare ray moves within Forest Arena; verify deliberate card entry, stationary trigger handoff and Back.
 python tests/flatout_leaderboard_hover_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory>
+# Repeat with --owner-hand left to mirror the two-ray hover and stationary-trigger handoff.
 # From the grid with an unlocked cup: verify readable placement, Start/Back, blank-area safety and a confirmed race start.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-cup-only
 # From Best Pilot, Race Recap or Cup Ranking after a non-final race in an isolated Career cup: advance once per page, check Continue/Main Menu and cancellation, and load the next round.
