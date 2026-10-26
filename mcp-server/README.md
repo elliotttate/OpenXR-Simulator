@@ -382,7 +382,8 @@ tool selection, two-hand sticker manipulation, Roof/Studio views, keyboard,
 Workshop browsing and sharing-preview cancellation. It never publishes. A captured
 drag may cross the car silhouette without losing its grab. A single Undo must
 restore the entire gesture; the successful run leaves the document unchanged.
-It saves both-eye car and column screenshots for visual inspection. The shared
+It saves both-eye car and column screenshots for visual inspection. The keyboard
+and Workshop use centered layouts; `--dialogs-only` reruns those exceptions. The shared
 click helper glances toward controls on the wide canvas without moving the eye
 position. The scroll regression measures physical target sizes so denser pixel
 layouts cannot silently shrink their ray targets.

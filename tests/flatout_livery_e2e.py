@@ -191,7 +191,7 @@ class LiveryTest:
         # before associating screenshot pixels with the new viewing direction.
         angle = math.radians(yaw_degrees)
         expected = [math.sin(angle), 0, math.cos(angle)]
-        for _ in range(60):
+        for _ in range(200):
             state = await self.state()
             if np.allclose(state['vr']['frame']['left_eye']['back'], expected, atol=1e-4):
                 await asyncio.sleep(.1)  # allow the submitted eye image to follow

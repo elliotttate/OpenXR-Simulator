@@ -38,8 +38,17 @@ def clearance(state):
 
 class WorkspaceTest(LiveryTest):
     def check_columns(self, state):
+        centered = {'Livery keyboard', 'Browse Workshop liveries', 'Share livery to Workshop'}
+        for popup in state['desktop_input']['popup_windows']:
+            if popup['name'] in centered:
+                x,y=popup['position']; w,h=popup['size']
+                assert abs(x+w/2-960)<1 and w>=1000, ('Expected a large centered dialog',popup)
+                assert x>=0 and y>=0 and x+w<=1920 and y+h<=1080, popup
         for control in state['vr']['controls']:
             x, y, w, h = (control[k] for k in ('x','y','width','height'))
+            if control['window'] in centered:
+                assert x>=0 and y>=0 and x+w<=1920 and y+h<=1080, control
+                continue
             assert (24-.5 <= x and x+w <= 504+.5) or (1416-.5 <= x and x+w <= 1896+.5), control
             assert y >= 120-.5 and y+h <= 960+.5, control
 
@@ -147,16 +156,28 @@ class WorkspaceTest(LiveryTest):
         await self.stereo('unobstructed-roof')
         await self.click('STUDIO')
         await self.click('BACK TO LAYERS')
+        await self.run_dialogs()
+        assert (await self.state())['document']==original['document']
+        self.cases.append({'case':'two-columns-and-dual-car-ray', 'passed':True})
+
+    async def run_dialogs(self):
+        original=await self.state()
+        if original['tab']!=1:
+            await self.click('STICKERS')
+        if (await self.state())['page']!=0:
+            await self.click('BACK TO LAYERS')
         await self.click('ADD STICKER')
         await self.click('Search stickers')
-        await self.stereo('keyboard-right-column')
+        await self.look(0, 'face-keyboard')
+        await self.stereo('keyboard-centered')
         await self.click('q')
         await self.click('CANCEL')
         await self.click('MY LIVERIES')
         await self.click('RENAME')
         await self.click('CANCEL')
         await self.click('BROWSE WORKSHOP')
-        await self.stereo('workshop-right-column')
+        await self.look(0, 'face-workshop')
+        await self.stereo('workshop-centered')
         await self.click('BACK TO MY LIVERIES')
         await self.click('SHARE TO WORKSHOP')
         for _ in range(60):
@@ -167,13 +188,13 @@ class WorkspaceTest(LiveryTest):
         else:
             raise AssertionError('The sharing preview did not finish')
         self.check_columns(shared)
-        await self.look(-44,'sharing-right-column')
-        await self.stereo('sharing-right-column')
+        await self.look(0,'face-sharing')
+        await self.stereo('sharing-centered')
         await self.click('BACK', control_window='Share livery to Workshop')
         await self.click('STICKERS')
         await self.look(0, 'finished')
         assert (await self.state())['document']==original['document']
-        self.cases.append({'case':'two-columns-and-dual-car-ray', 'passed':True})
+        self.cases.append({'case':'centered-keyboard-and-workshop', 'passed':True})
 
 
 async def run(args):
@@ -186,7 +207,10 @@ async def run(args):
             await session.initialize()
             test = WorkspaceTest(args, session)
             try:
-                await test.run_workspace()
+                if args.dialogs_only:
+                    await test.run_dialogs()
+                else:
+                    await test.run_workspace()
                 result['passed'] = True
             finally:
                 result['cases'] = test.cases
@@ -199,6 +223,7 @@ async def run(args):
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dialogs-only',action='store_true',help='Recheck centered keyboard and Workshop without repeating car gestures')
     parser.add_argument('--pid',type=int,required=True)
     parser.add_argument('--data-dir',type=Path,required=True)
     parser.add_argument('--evidence',type=Path,required=True)
