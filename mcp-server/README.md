@@ -696,3 +696,23 @@ trip. From private creation setup, `--create-private` additionally activates
 Create Private Lobby once and verifies a private host lobby with one human
 player. `--dock-only` rechecks the browser's reading surface and captions without
 repeating code entry. No test joins a public room.
+
+### Customization and orbit UI checks
+
+Start in Garage > Customize on the isolated simulator profile:
+
+```powershell
+python tests/flatout_customization_ui_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --hand right
+```
+
+The check visits all four categories through direct tabs and both arrows. It
+requires 80-pixel controls, 20-pixel gaps, separate carousel space, readable
+category captions, grey endpoint arrows and inert endpoint presses. Hovering
+a tab must preserve the category and item selection. Active clicks are held
+for 45 sync cycles and retried with the same command ID, with exactly one
+native activation. Both-eye captures retain visual evidence for each category.
+
+Orbit must expose only Return to selection, keep that action at a level reading
+position in both eyes after head movement, and return without changing the
+selected item. Use `--orbit-only` from Cars or Drivers to check their same return
+path. The test navigates previews without buying or equipping items.
