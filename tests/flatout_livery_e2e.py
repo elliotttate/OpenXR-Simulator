@@ -250,11 +250,11 @@ class LiveryTest:
                                                "hand": hand}, "release-"+hand)
         return await self.state()
 
-    async def dual_hands(self):
+    async def dual_hands(self, view="STUDIO"):
         await self.click("STICKERS", hand="left")
         selected = (await self.state())["selected"]
         await self.click("Layer "+str(selected), hand="left")
-        await self.click("STUDIO")
+        await self.click(view)
         state = await self.state()
         if any(c["label"] == "PLACE ON CAR" for c in state["vr"]["controls"]):
             await self.click("PLACE ON CAR")

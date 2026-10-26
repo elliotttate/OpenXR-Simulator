@@ -116,6 +116,8 @@ zero matching shell draws before the implementation is accepted.
   and rear depth rings; its rear depth is the selected 4 or 8 mm.
 - The submitted object transform and dimensions register to the native front,
   rather than merely producing unrelated 3D geometry elsewhere.
+- Both the native panel and actual submitted GPU body have world up `(0, 0, 1)`.
+  Matching a consistently pitched CPU anchor is insufficient.
 - Both eye draws use their actual native eye positions and distinct outputs.
   Back-face culling and scene depth testing are enabled.
 - Post-VS projection and pixel history show actual written body pixels outside
