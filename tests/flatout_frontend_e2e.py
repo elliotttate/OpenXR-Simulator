@@ -51,7 +51,7 @@ def read_game(pid, method, params=None):
 
 def quad_pixel(capture, rect, eye_name="left"):
     """Project the native 1920x1080 target through its submitted XR quad."""
-    surface = next(s for s in capture["geometry"]["surfaces"] if s["visibility"] == 0)
+    surface = max((s for s in capture["geometry"]["surfaces"] if s["visibility"] == 0), key=lambda s:s["size"][0]*s["size"][1])
     l, t, r, b = rect
     local = np.array([((l+r)/3840-.5)*surface["size"][0],
                       (.5-(t+b)/2160)*surface["size"][1], 0])
@@ -449,6 +449,11 @@ class Frontend:
                 "hand": hand or self.args.hand, "origin_mode": "hand", "ray_offset": RAY_OFFSET, "dwell_frames": 30}
         if surface:
             args["surface"] = surface
+        else:
+            # Use the same stable carrier for projection and input. A returning
+            # hover face can overlap this pixel while retiring during dwell.
+            carrier=max((s for s in capture["geometry"]["surfaces"] if s["visibility"]==0),key=lambda s:s["size"][0]*s["size"][1])
+            args["surface_id"]=carrier["id"]
         return before, args
 
     async def hover(self, name, fraction=(.5, .5)):
