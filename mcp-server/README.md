@@ -205,6 +205,39 @@ cases identified for game-level validation. Three more cases apply FlatOut's
 application-side ray offsets before the independent fixture hit-test, verifying
 the correction with subpixel accuracy for all three targeting modes.
 
+#### Foreground controller composition regression
+
+`xr_layer_order` submits a world projection, an opaque menu quad, a transparent
+stereo projection, and a final quad. The screenshot test verifies submission
+order, different left/right foreground content, alpha blending, array slices,
+and capture geometry still referring to the primary world projection:
+
+```powershell
+python tests/composition_layer_order_e2e.py --probe bin/xr_layer_order.exe --runtime bin/openxr_simulator.dll --evidence build-ui-automation/order-d3d11 --backend d3d11
+python tests/composition_layer_order_e2e.py --probe bin/xr_layer_order.exe --runtime bin/openxr_simulator.dll --evidence build-ui-automation/order-d3d12 --backend d3d12
+```
+
+For Fox, launch a Release build with an isolated test profile, open Options, and
+keep the simulator head level and facing forward. Run:
+
+```powershell
+python tests/flatout_controller_overlay_e2e.py --pid GAME_PID --data-dir SIMULATOR_DATA --evidence build-ui-automation/controller-visible
+```
+
+This compares actual rendered controller pixels with the native diagnostic
+`vr.controller_overlay` disabled/enabled in the same build, in both eyes. It
+restores the original controller poses and switch. The foreground projection
+retains native per-eye cameras, controller materials and self-depth; it is not
+a mono controller image pasted onto the menu.
+
+For GPU inspection, run `tests/flatout_controller_overlay_gpu.py` in RenderDoc's
+Python environment with `FOX_CONTROLLER_GPU_JOB` naming a JSON file containing
+`capture`, `native_state`, and `result` paths. `native_state` is a JSON response
+from `vr.get_state`. The check requires separate color/depth targets per eye,
+matching eye cameras, transparent clear pixels, actual controller pixel history,
+and no duplicate world-pass draws. Compare performance in the same Release
+build, without capture/replay or builds running during the sample.
+
 #### FlatOut 4 validation
 
 The Fox Release DLL build was tested on 2026-10-24 with the D3D11 simulator,

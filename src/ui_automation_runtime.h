@@ -74,10 +74,9 @@ static ui_auto::Frame BuildUiFrame(const XrFrameEndInfo* info, uint64_t frame) {
     for (uint32_t i=0;i<info->layerCount;++i) {
         const auto* layer=info->layers[i]; if (!layer) continue;
         if (layer->type==XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+            if (!g.projectionEyes.empty()) continue; // Keep the world view; overlay projections are not UI surfaces.
             const auto& p=*(const XrCompositionLayerProjection*)layer;
             if (!p.views || p.viewCount>2) { g.supported=false; continue; }
-            // Several overlapping projections are ambiguous to an image-only target.
-            if (!g.projectionEyes.empty()) g.supported=false;
             for (const auto& viewport:g.eyes) {
                 if ((uint32_t)viewport.eye>=p.viewCount) continue;
                 auto eye=viewport; const auto& v=p.views[eye.eye];
