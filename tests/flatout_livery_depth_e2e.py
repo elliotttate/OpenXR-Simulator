@@ -15,7 +15,7 @@ import uuid
 import numpy as np
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from flatout_livery_e2e import LiveryTest, ROOT, screenshot_pixel, ui_surface, quaternion_matrix
+from flatout_livery_e2e import LiveryTest, ROOT, screenshot_pixel, ui_surface, ui_frame_at, quaternion_matrix
 from flatout_frontend_e2e import read_game
 
 
@@ -27,11 +27,12 @@ class LiveryDepth(LiveryTest):
         for label in self.args.target:
             before = await self.state()
             control = next(c for c in before['vr']['controls'] if c['label'] == label and c['enabled'])
+            await self.face_control(before, control)
             source = await self.capture('source-' + label)
             hx = control['x'] + control['width'] / 2
             hy = control['y'] + control['height'] / 2
             x, y = screenshot_pixel(before, source, hx, hy)
-            base = ui_surface(before)
+            base = ui_surface(before, hx, hy)
             aim = {'capture_id': source['capture_id'], 'x': float(x), 'y': float(y),
                    'origin_mode': 'hand', 'hand': self.args.hand, 'surface': base, 'dwell_frames': 45}
             receipt = await self.tool('hover_ui_at', aim, 'hover-' + label)
@@ -68,7 +69,7 @@ class LiveryDepth(LiveryTest):
             # A hand-origin ray aimed using the old base image intersects the
             # raised face at a different UV. Check the real parallel plane,
             # rather than demanding the obsolete base-plane UV.
-            frame = hovered['vr']['frame']
+            frame = ui_frame_at(hovered, hx, hy)
             panel = frame['panel']
             normal = -np.array(panel['back'])
             normal /= np.linalg.norm(normal)
@@ -85,7 +86,7 @@ class LiveryDepth(LiveryTest):
             if self.args.raised_edge_top:
                 tile = next(t['tile'] for t in candidates if abs(t['offset_meters'][2]-.015) < .001)
                 edge_state = copy.deepcopy(hovered)
-                edge_state['vr']['frame']['panel']['origin'] = plane.tolist()
+                ui_frame_at(edge_state, hx, hy)['panel']['origin'] = plane.tolist()
                 ex, ey = screenshot_pixel(edge_state, raised, hx, control['y'] + .25)
                 edge_aim = {'capture_id': raised['capture_id'], 'x': float(ex), 'y': float(ey),
                             'origin_mode': 'hand', 'hand': self.args.hand, 'surface_id': tile['id'], 'dwell_frames': 45}

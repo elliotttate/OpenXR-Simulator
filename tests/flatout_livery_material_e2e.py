@@ -29,7 +29,7 @@ class MaterialEdits(DirectSticker):
         capture=await self.capture(label+"-source")
         x,y=screenshot_pixel(before,capture,control["x"]+control["width"]*fraction,control["y"]+control["height"]*.5)
         receipt=await self.tool("hold_ui_at",{"capture_id":capture["capture_id"],"x":float(x),"y":float(y),
-            "hand":"left","origin_mode":"hand","surface":ui_surface(before),"dwell_frames":2},label+"-drag")
+            "hand":"left","origin_mode":"hand","surface":ui_surface(before,control["x"]+control["width"]*fraction,control["y"]+control["height"]*.5),"dwell_frames":2},label+"-drag")
         assert receipt["status"]=="input_delivered"
         return await self.state()
 

@@ -1457,7 +1457,10 @@ class Frontend:
         assert not (await self.query("options.get_state"))["open"], "One Back click did not leave Options"
         if not (await self.query("hud.pause_menu"))["is_open"]:
             await self.menu_button()
-        await self.click("button.3")
+        pause=await self.query("hud.pause_menu")
+        exits=[i for i,label in enumerate(pause["items"]) if label.lower()=="main menu"]
+        assert len(exits)==1,("Expected one Main Menu action in Pause",pause)
+        await self.click("button."+str(exits[0]))
         assert (await self.query("ui.get_message_box"))["open"]
         await self.click("msgbox.validate")
         for _ in range(120):
@@ -1766,17 +1769,19 @@ class Frontend:
 
     async def livery_back_to_garage(self):
         # Livery owns its ImGui ray surface independently of the common menu pointer.
-        from flatout_livery_e2e import game_read
+        from flatout_livery_e2e import game_read, LiveryTest
+        livery = LiveryTest(self.args, self.session)
         before = await asyncio.to_thread(game_read,self.args.pid)
         assert before["ready"] and before["vr"]["active"] and not before["dirty"], before
         for step in range(3):
             controls = before["vr"]["controls"]
             control = next((c for c in controls if c["label"]=="BACK"), None)
             if control is None: control = next(c for c in controls if c["label"]=="BACK TO LAYERS")
+            await livery.face_control(before, control)
             capture = await self.capture("garage-livery-back-source")
             x,y = screenshot_pixel(before,capture,control["x"]+control["width"]/2,control["y"]+control["height"]/2)
             aim = {"capture_id":capture["capture_id"],"x":float(x),"y":float(y),"hand":self.args.hand,
-                   "origin_mode":"hand","surface":ui_surface(before),"dwell_frames":30}
+                   "origin_mode":"hand","surface":ui_surface(before,control["x"]+control["width"]/2,control["y"]+control["height"]/2),"dwell_frames":30}
             hover = await self.tool("hover_ui_at",aim,"garage-livery-back-hover")
             assert hover["status"]=="input_delivered"
             hovered = await asyncio.to_thread(game_read,self.args.pid)

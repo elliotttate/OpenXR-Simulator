@@ -32,7 +32,7 @@ class LiveryScroll(LiveryTest):
         source=await self.capture('park-before-grey')
         px,py=screenshot_pixel(before,source,park['x']+park['width']/2,park['y']+park['height']/2)
         await self.tool('hover_ui_at',dict(capture_id=source['capture_id'],x=float(px),y=float(py),
-            hand=self.args.hand,origin_mode='hand',surface=ui_surface(before),dwell_frames=8),'park-reticle-away-from-grey-icon')
+            hand=self.args.hand,origin_mode='hand',surface=ui_surface(before,park['x']+park['width']/2,park['y']+park['height']/2),dwell_frames=8),'park-reticle-away-from-grey-icon')
         capture=await self.capture('grey-'+label.replace(' ','-'))
         x0,y0=screenshot_pixel(before,capture,control['x'],control['y'])
         x1,y1=screenshot_pixel(before,capture,control['x']+control['width'],control['y']+control['height'])
@@ -52,7 +52,7 @@ class LiveryScroll(LiveryTest):
         capture=await self.capture('stick-scroll-source')
         x,y=screenshot_pixel(before,capture,hx,hy)
         command=dict(capture_id=capture['capture_id'],x=float(x),y=float(y),hand=self.args.hand,
-            origin_mode='hand',surface=ui_surface(before),dwell_frames=8,hold_frames=30,
+            origin_mode='hand',surface=ui_surface(before,hx,hy),dwell_frames=8,hold_frames=30,
             stick=[0,-.65],timeout=30,command_id=uuid.uuid4().hex)
         samples=[]
         for _ in range(3):

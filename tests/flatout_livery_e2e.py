@@ -57,9 +57,30 @@ def quaternion_matrix(q):
                      [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]])
 
 
-def ui_surface(state):
-    """Native panel in XR local space, allowing natural hand-origin targeting."""
+def ui_frame_at(state, x=None, y=None):
+    """Select the native affine canvas plane containing a UI canvas point.
+
+    Split livery panels each map the full canvas, with a different pose. Never
+    silently use the center plane for a point rendered on a side panel.
+    """
     frame = state["vr"]["frame"]
+    panels = frame.get("panels", [])
+    if not panels:
+        return frame
+    if x is None or y is None:
+        if len(panels) != 1:
+            raise ValueError("A canvas point is required for split livery panels")
+        return {**frame, **panels[0]}
+    matches = [p for p in panels if p["canvas_rect"][0] <= x < p["canvas_rect"][2]
+               and p["canvas_rect"][1] <= y < p["canvas_rect"][3]]
+    if len(matches) != 1:
+        raise ValueError(f"Canvas point {(x, y)} has {len(matches)} native panel mappings")
+    return {**frame, **matches[0]}
+
+
+def ui_surface(state, x=None, y=None):
+    """Native panel in XR local space, allowing natural hand-origin targeting."""
+    frame = ui_frame_at(state, x, y)
     camera, panel = frame["camera"], frame["panel"]
     inverse = np.column_stack([camera[k] for k in ("right", "up", "back")]).T
     basis = inverse @ np.column_stack([panel["right"], panel["up"], -np.array(panel["back"])])
@@ -81,7 +102,7 @@ def ui_surface(state):
 
 def screenshot_pixel(state, capture, x, y):
     """Project the game's independently reported rendered control onto the image."""
-    frame = state["vr"]["frame"]
+    frame = ui_frame_at(state, x, y)
     panel, camera = frame["panel"], frame["camera"]
     world = (np.array(panel["origin"]) + np.array(panel["right"])*(x/1920-.5)*frame["panel_width"]
              + np.array(panel["up"])*(.5-y/1080)*frame["panel_height"])
@@ -119,7 +140,7 @@ def assert_control_ray_hit(state, control, hand):
     rebuilt ImGui records can precede the next render's promotion metadata.
     """
     hit = state['vr'].get('hands', [state['vr'], state['vr']])[hand == 'right']
-    frame = state['vr']['frame']
+    frame = ui_frame_at(state, control['x']+control['width']/2, control['y']+control['height']/2)
     panel = frame['panel']
     normal = -np.array(panel['back'])
     normal /= np.linalg.norm(normal)
@@ -201,7 +222,7 @@ class LiveryTest:
 
     async def face_control(self, state, control):
         """Glance at a side column while keeping the same tracked eye position."""
-        frame = state['vr']['frame']
+        frame = ui_frame_at(state, control['x']+control['width']/2, control['y']+control['height']/2)
         if frame['panel_width'] < 4:
             return
         camera, panel = frame['camera'], frame['panel']
@@ -229,7 +250,7 @@ class LiveryTest:
         x, y = screenshot_pixel(before, capture, hx, hy)
         assert 0 <= x < capture["image_size"][0] and 0 <= y < capture["image_size"][1]
         aim = {"capture_id": capture["capture_id"], "x": float(x), "y": float(y),
-               "origin_mode": "hand", "surface": ui_surface(before), "dwell_frames": 30, "hand": hand}
+               "origin_mode": "hand", "surface": ui_surface(before, hx, hy), "dwell_frames": 30, "hand": hand}
         if before["vr"]["hand"] != int(hand == "right"):
             # A stationary spare ray may already point at this button. Move it
             # within the button first so hover handoff represents real motion.
@@ -313,7 +334,7 @@ class LiveryTest:
         x, y = screenshot_pixel(one, capture, tab["x"]+tab["width"]/2, tab["y"]+tab["height"]/2)
         receipt = await self.tool("click_ui_at", {"capture_id": capture["capture_id"],
             "x": float(x), "y": float(y), "hand": "right", "origin_mode": "hand",
-            "surface": ui_surface(one)}, "blocked-ui-click")
+            "surface": ui_surface(one, tab["x"]+tab["width"]/2, tab["y"]+tab["height"]/2)}, "blocked-ui-click")
         assert receipt["status"] == "input_delivered"
         blocked = await self.state()
         assert blocked["tab"] == 1 and blocked["page"] == 2 and blocked["vr"]["grab_mask"] == 1
@@ -374,7 +395,7 @@ class LiveryTest:
             capture = await self.capture("stereo-source")
             x, y = screenshot_pixel(before, capture, control["x"]+control["width"]/2, control["y"]+control["height"]/2)
             await self.tool("hover_ui_at", {"capture_id": capture["capture_id"], "x": float(x), "y": float(y),
-                "hand": hand, "origin_mode": "hand", "surface": ui_surface(before)}, "stereo-hover-"+hand)
+                "hand": hand, "origin_mode": "hand", "surface": ui_surface(before, control["x"]+control["width"]/2, control["y"]+control["height"]/2)}, "stereo-hover-"+hand)
         state = await self.state()
         capture = await self.tool("capture_screenshot", {"eye": "both", "max_width": 4096}, "stereo-both-rays")
         self.last_capture = capture
@@ -384,12 +405,17 @@ class LiveryTest:
         # only the focused control and its returning predecessor, in both eyes.
         surfaces = capture["geometry"]["surfaces"]
         assert 1 <= len(surfaces) <= 2, ("Expected only current/returning lifted controls", surfaces)
-        base = ui_surface(state)
-        base_basis = quaternion_matrix(base["pose"]["orientation"])
-        width, height = base["size"]
+        panels = state['vr']['frame'].get('panels', [])
+        bases = [ui_surface(state, (p['canvas_rect'][0]+p['canvas_rect'][2])/2,
+                            (p['canvas_rect'][1]+p['canvas_rect'][3])/2) for p in panels] if panels else [ui_surface(state)]
         matched_controls, surface_ids = [], []
         for tile in surfaces:
             basis = quaternion_matrix(tile["pose"]["orientation"])
+            carriers = [b for b in bases if np.linalg.norm(basis-quaternion_matrix(b['pose']['orientation'])) < 1e-4]
+            assert len(carriers) == 1, ('Lifted face must match exactly one native panel', tile, carriers)
+            base = carriers[0]
+            base_basis = quaternion_matrix(base['pose']['orientation'])
+            width, height = base['size']
             center = base_basis.T @ (np.array(tile["pose"]["position"])-base["pose"]["position"])
             size = np.array(tile["size"])
             assert np.isfinite(center).all() and np.isfinite(size).all(), tile
@@ -506,7 +532,7 @@ class LiveryTest:
                                     slider["y"]+slider["height"]*.5)
             receipt = await self.tool("hold_ui_at", {"capture_id": capture["capture_id"],
                 "x": float(x), "y": float(y), "hand": "left", "origin_mode": "hand",
-                "surface": ui_surface(current), "dwell_frames": 12}, "slider-drag")
+                "surface": ui_surface(current, slider["x"]+slider["width"]*fraction, slider["y"]+slider["height"]*.5), "dwell_frames": 12}, "slider-drag")
             assert receipt["status"] == "input_delivered"
             value = (await self.state())["document"]["gloss"]
             assert abs(value-fraction) < .04, (fraction, value, slider)
@@ -600,7 +626,7 @@ class LiveryTest:
             capture = await self.capture("rgb-source")
             x,y = screenshot_pixel(state,capture,c["x"]+c["width"]*fraction,c["y"]+c["height"]*.5)
             r = await self.tool("hold_ui_at",{"capture_id":capture["capture_id"],"x":float(x),"y":float(y),
-                "hand":"left","origin_mode":"hand","surface":ui_surface(state),"dwell_frames":12},"rgb-drag")
+                "hand":"left","origin_mode":"hand","surface":ui_surface(state,c["x"]+c["width"]*fraction,c["y"]+c["height"]*.5),"dwell_frames":12},"rgb-drag")
             assert r["status"]=="input_delivered"
             return await self.release("left")
 
@@ -767,7 +793,7 @@ class LiveryTest:
             capture=await self.capture("layer-tool-source")
             x,y=screenshot_pixel(before,capture,c["x"]+c["width"]*fraction,c["y"]+c["height"]*.5)
             r=await self.tool("hold_ui_at",{"capture_id":capture["capture_id"],"x":float(x),"y":float(y),
-                "hand":"left","origin_mode":"hand","surface":ui_surface(before),"dwell_frames":12},"layer-tool-drag")
+                "hand":"left","origin_mode":"hand","surface":ui_surface(before,c["x"]+c["width"]*fraction,c["y"]+c["height"]*.5),"dwell_frames":12},"layer-tool-drag")
             assert r["status"]=="input_delivered"
             return before,await self.release("left")
         before,after=await drag("Width",.4)
@@ -858,7 +884,7 @@ class LiveryTest:
                                     control["y"]+control["height"]*.5)
             receipt = await self.tool("hold_ui_at", {"capture_id": capture["capture_id"],
                 "x": float(x), "y": float(y), "hand": "left", "origin_mode": "hand",
-                "surface": ui_surface(before), "dwell_frames": 12}, "property-drag")
+                "surface": ui_surface(before, control["x"]+control["width"]*fraction, control["y"]+control["height"]*.5), "dwell_frames": 12}, "property-drag")
             assert receipt["status"] == "input_delivered", receipt
             after = await self.release("left")
             value = read_value(after)
