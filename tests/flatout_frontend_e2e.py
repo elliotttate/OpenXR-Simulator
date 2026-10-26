@@ -324,15 +324,7 @@ class Frontend:
                 assert all(index*w/2<=x<(index+1)*w/2 and 0<=y<h for x,y in points),("The full dialog must remain visible in each eye",eye,points)
         visible(before)
         try:
-            response=await self.session.call_tool("set_head_pose",{"x":.12,"y":1.82,"z":.10,"yaw_deg":8,"pitch_deg":-5,"roll_deg":4})
-            assert not response.isError
-            until=asyncio.get_running_loop().time()+8
-            while True:
-                moved=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},"popup-standing-head-moved")
-                self.last_capture=moved
-                if moved["geometry"]["head"]["position"][1]>1.8:break
-                assert asyncio.get_running_loop().time()<until,"Head movement did not arrive"
-                await asyncio.sleep(.1)
+            moved=await self.observed_head_pose("popup-standing-head-moved",{"x":.12,"y":1.82,"z":.10,"yaw_deg":8,"pitch_deg":-5,"roll_deg":4})
             current=next(s for s in moved["geometry"]["surfaces"] if s["visibility"]==0)
             assert np.allclose(current["pose"]["position"],base["pose"]["position"],atol=1e-5),"The dialog followed head translation"
             assert np.allclose(current["pose"]["orientation"],base["pose"]["orientation"],atol=1e-5),"The dialog followed head rotation"
@@ -344,7 +336,7 @@ class Frontend:
             self.cases.append({"case":"standing-popup-world-anchor-and-ray-hover","passed":True,"head_before":head,"head_after":moved["geometry"]["head"],"surface_before":base,"surface_after":current,"dialog":frames[0],"hand":self.args.hand})
         finally:
             x,y,z=head["position"]
-            await self.session.call_tool("set_head_pose",{"x":x,"y":y,"z":z,"yaw_deg":0,"pitch_deg":0,"roll_deg":0})
+            await self.observed_head_pose("popup-standing-head-restored",{"x":x,"y":y,"z":z,"yaw_deg":0,"pitch_deg":0,"roll_deg":0})
 
     async def popup_spacing(self):
         modal=await self.query("ui.get_message_box")
@@ -1089,12 +1081,38 @@ class Frontend:
         self.cases.append({"case":"party-stunt-page-count-readable","passed":count>=20,"visible":[first,last],"bright_letter_pixels":count})
         assert count >= 20, ("Page count needs bright lettering against a dark backing",count)
 
+    async def party_stunt_endpoint(self, direction):
+        before=await self.query("party.get_state")
+        native=await self.query("vr.targets")
+        assert "stunts.page."+direction not in [t["name"] for t in native["targets"]],native
+        capture=await self.capture("party-disabled-page-"+direction)
+        x=1660 if direction=="previous" else 1780
+        corners=[quad_pixel(capture,(a,b,a,b)) for a,b in ((x-32,64),(x+32,120))]
+        (x0,y0),(x1,y1)=corners
+        pixels=np.asarray(Image.open(self.last_image_path).convert("RGB")).astype(float)
+        patch=pixels[math.floor(min(y0,y1)):math.ceil(max(y0,y1)),math.floor(min(x0,x1)):math.ceil(max(x0,x1))]
+        grey=(np.min(patch,axis=2)>58)&(np.max(patch,axis=2)<155)&(np.ptp(patch,axis=2)<28)
+        assert int(np.sum(grey))>=8,("Unavailable Party page needs a grey arrow",direction,int(np.sum(grey)))
+        px,py=quad_pixel(capture,(x,92,x,92))
+        carrier=max((s for s in capture["geometry"]["surfaces"] if s["visibility"]==0),key=lambda s:s["size"][0]*s["size"][1])
+        aim={"capture_id":capture["capture_id"],"x":float(px),"y":float(py),"surface_id":carrier["id"],
+             "hand":self.args.hand,"origin_mode":"hand","dwell_frames":30,"ray_offset":RAY_OFFSET}
+        await self.tool("hover_ui_at",aim,"party-disabled-page-hover-"+direction)
+        args={**aim,"command_id":uuid.uuid4().hex,"hold_frames":45}
+        receipt=await self.tool("click_ui_at",args,"party-disabled-page-held-"+direction)
+        retry=await self.tool("click_ui_at",args,"party-disabled-page-retry-"+direction)
+        assert retry["delivery"]["sync_id"]==receipt["delivery"]["sync_id"]
+        assert (await self.query("vr.targets"))["clicks"]==native["clicks"],"Disabled Party page accepted a press"
+        assert await self.query("party.get_state")==before,"Disabled Party page changed the playlist or visible cards"
+        self.cases.append({"case":"party-disabled-"+direction+"-grey-and-inert","passed":True,"grey_pixels":int(np.sum(grey)),"state":before})
+
     async def party_stunts(self):
         targets = (await self.query("vr.targets"))["targets"]
         assert any(t["name"] == "stunts.page.next" for t in targets), "Party stunts need a ray-clickable Next page control"
         await self.party_stunts_header()
         state = await self.query("party.get_state")
         assert state["stunt_picker_open"] and state["visible"][0] == 0, state
+        await self.party_stunt_endpoint("previous")
         if state["playlist"]:
             clear = next(t["name"] for t in targets if t["name"].startswith("helper.Y."))
             await self.click(clear)
@@ -1102,6 +1120,9 @@ class Frontend:
         start = next(t["name"] for t in targets if t["name"].startswith("helper.Validate."))
         await self.click(start)
         assert (await self.query("ui.get_message_box"))["open"], "Empty Start needs a clear selection prompt"
+        await self.popup_spacing()
+        await self.popup_anchor()
+        assert all(t["name"].startswith("msgbox.") for t in (await self.query("vr.targets"))["targets"]),"Empty playlist dialog exposes menu actions"
         await self.click("msgbox.validate")
         selected = []
         for page in range(3):
@@ -1124,6 +1145,7 @@ class Frontend:
                 await self.click("stunts.page.next")
                 assert (await self.query("party.get_state"))["visible"][0] == (page+1)*4
         assert not any(t["name"] == "stunts.page.next" for t in (await self.query("vr.targets"))["targets"])
+        await self.party_stunt_endpoint("next")
         clear = next(t["name"] for t in (await self.query("vr.targets"))["targets"] if t["name"].startswith("helper.Y."))
         await self.click(clear)
         assert not (await self.query("party.get_state"))["playlist"]
@@ -1152,6 +1174,12 @@ class Frontend:
 
     async def party(self):
         targets = (await self.query("vr.targets"))["targets"]
+        await self.capture("party-player-next-step-caption")
+        nodes=(await self.query("hud.rects",{"root":"menu","max_depth":24}))["nodes"]
+        captions=[n["text"] for n in nodes if n["visible"] and n["path"].endswith("/RayActionLabel")]
+        named=any(c.lower()=="select stunts" for c in captions) and "Confirm" not in captions
+        self.cases.append({"case":"party-action-names-next-step","passed":named,"captions":captions})
+        assert named,("Player selection should name its next step",captions)
         names = {t["name"] for t in targets}
         required = {"players."+str(n) for n in range(2,9)}
         self.cases.append({"case":"all-player-counts-directly-available","passed":required<=names,

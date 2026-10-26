@@ -531,6 +531,8 @@ python tests/flatout_leaderboard_scroll_e2e.py --pid <game-pid> --data-dir <ipc-
 python tests/flatout_leaderboard_scroll_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --layout-only
 # From class selection or a Career grid/preview: check standing head-height placement, both eyes and world locking.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --reading-comfort-only
+# From the first Flatout Mode page: keep Leaderboard enabled while the spare ray moves within Forest Arena; verify deliberate card entry, stationary trigger handoff and Back.
+python tests/flatout_leaderboard_hover_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory>
 # From the grid with an unlocked cup: verify readable placement, Start/Back, blank-area safety and a confirmed race start.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-cup-only
 # From Best Pilot, Race Recap or Cup Ranking after a non-final race in an isolated Career cup: advance once per page, check Continue/Main Menu and cancellation, and load the next round.
@@ -576,9 +578,9 @@ python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory>
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --single-dialog-only
 # From the top of Statistics: check page arrows, scrolling endpoints, stable row hovers and categories.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --statistics-only
-# From Party Mode's player selector: hover all seven counts, then choose eight players once.
+# From Party Mode's player selector: verify Select stunts, hover all seven counts, then choose eight players once.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --party-only
-# From the first Party stunt page: select all twelve, test page endpoints, remove/clear, then start driver selection.
+# From the first Party stunt page: select all twelve, verify grey endpoints reject held/retried presses, remove/clear, then start driver selection.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --party-stunts-only
 # From post-race results: check the separate HUD footer and advance exactly one page.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --end-results-only
