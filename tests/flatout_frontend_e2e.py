@@ -1184,6 +1184,10 @@ class Frontend:
         arrow_pixels = int(np.sum(orange))
         self.cases.append({"case":"statistics-page-arrow-visible","passed":arrow_pixels>=8,"colored_pixels":arrow_pixels})
         assert arrow_pixels >= 8, "Page down has no visible amber arrow"
+        # Parking is only needed for the artwork capture. Release it before the
+        # long sweep: its ten-second lease would otherwise expire mid-hover and
+        # move the spare controller back to its normal pose, transferring focus.
+        await self.tool("release_ui_pointer", {"capture_id":capture["capture_id"],"hand":inactive}, "statistics-offhand-park-release")
         await self.audit("statistics-layout-top")
         positions = [initial]
         for _ in range(initial["total"]//max(1,initial["visible"]-1)+3):
