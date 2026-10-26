@@ -521,12 +521,18 @@ python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory>
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --spatial-locked-only
 # From Career's cup/event grid: check visible page controls, card spacing, every series and locked events.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-only
+# From FlatOut Mode: sweep every Challenge event page, fixed hit bounds, locked cards, and a safe vehicle-preview round trip.
+python tests/flatout_challenge_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --preview-round-trip --hand left
+# From a page containing a locked Challenge card: verify stable hover bounds and inert held/retried clicks.
+python tests/flatout_challenge_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --locked-only --hand left
 # From class selection or a Career grid/preview: check standing head-height placement, both eyes and world locking.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --reading-comfort-only
 # From the grid with an unlocked cup: verify readable placement, Start/Back, blank-area safety and a confirmed race start.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-cup-only
 # From Best Pilot, Race Recap or Cup Ranking after a non-final race in an isolated Career cup: advance once per page, check Continue/Main Menu and cancellation, and load the next round.
 python tests/flatout_career_results_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --hand left
+# From the same result pages after the final round: finish the cup once and return to the event browser.
+python tests/flatout_career_results_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --hand left --final-round
 # From the Career hub with an active isolated test cup: cancel abandonment, then confirm it.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-cancel-only
 # From class selection with the isolated Derby car: preserve scenery during both class warnings, then open filtered cars after OK.

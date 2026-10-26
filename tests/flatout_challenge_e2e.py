@@ -63,6 +63,10 @@ class Challenge(Frontend):
 
     async def run(self):
         menu, cards, initial_page = await self.layout()
+        if self.args.locked_only:
+            target=next(t for t in cards if menu['items'][int(t['name'].split('.')[-1])]['locked'])
+            await self.locked_card(target)
+            return
         if self.args.preview_only:
             await self.preview(initial_page)
             assert (await self.query("game.errors"))["total"] == self.errors_before
@@ -82,21 +86,14 @@ class Challenge(Frontend):
                 await self.hover(target["name"])
                 current = await self.query("menu.get_state")
                 assert current["selection_index"] == index and current["current_menu"] == "INSANITY", current
+                native=await self.query('vr.targets')
+                actual=next(t for t in native['targets'] if t['name']==target['name'])
+                assert actual['rect']==target['rect'],('Hover changed the card hit bounds',target,actual)
                 assert not (await self.query("ui.get_message_box"))["open"]
                 visited.append(index)
             locked = next((t for t in cards if menu["items"][int(t["name"].split(".")[-1])]["locked"]), None)
             if locked:
-                before, aim = await self.point_args(locked["name"])
-                assert (await self.tool("hover_ui_at", aim, "challenge-locked-hover"))["status"] == "input_delivered"
-                args = {**aim, "hold_frames": 45, "timeout": 30, "command_id": uuid.uuid4().hex}
-                assert (await self.tool("click_ui_at", args, "challenge-locked-click"))["status"] == "input_delivered"
-                after = await self.query("vr.targets")
-                assert after["clicks"] == before["clicks"], "A locked event dispatched an activation"
-                assert (await self.query("menu.get_state"))["current_menu"] == "INSANITY"
-                assert not (await self.query("game.get_state"))["is_loading"]
-                assert not (await self.query("ui.get_message_box"))["open"]
-                await self.tool("click_ui_at", args, "challenge-locked-retry")
-                assert (await self.query("vr.targets"))["clicks"] == before["clicks"]
+                await self.locked_card(locked)
                 locked_checked += 1
             print("FlatOut Mode page", page + 1, "of", page_count, "PASS", flush=True)
             if page + 1 < page_count:
@@ -110,6 +107,26 @@ class Challenge(Frontend):
         if self.args.preview_round_trip:
             await self.preview(initial_page)
         assert (await self.query("game.errors"))["total"] == self.errors_before
+
+    async def locked_card(self, target):
+        name=target['name']
+        before, hovered, aim=await self.hover(name)
+        actual=next(t for t in hovered['targets'] if t['name']==name)
+        self.cases.append({'case':'locked-card-hover-preserves-hit-bounds','passed':actual['rect']==target['rect'],'before':target,'after':actual})
+        assert actual['rect']==target['rect'],('Locked hover changed the card hit bounds',target,actual)
+        args={**aim,'hold_frames':45,'timeout':30,'command_id':uuid.uuid4().hex}
+        clicked=await self.tool('click_ui_at',args,'challenge-locked-click')
+        assert clicked['status']=='input_delivered',clicked
+        after=await self.query('vr.targets')
+        assert after['clicks']==before['clicks'],'A locked event dispatched an activation'
+        assert next(t['rect'] for t in after['targets'] if t['name']==name)==target['rect'],'Locked press moved the card hit bounds'
+        assert (await self.query('menu.get_state'))['current_menu']=='INSANITY'
+        assert not (await self.query('game.get_state'))['is_loading']
+        assert not (await self.query('ui.get_message_box'))['open']
+        retry=await self.tool('click_ui_at',args,'challenge-locked-retry')
+        assert retry['delivery']['sync_id']==clicked['delivery']['sync_id']
+        assert (await self.query('vr.targets'))['clicks']==before['clicks']
+        self.cases.append({'case':'locked-card-held-click-and-retry-inert','passed':True,'target':name})
 
     async def preview(self, initial_page):
         menu, cards, _ = await self.layout()
@@ -165,7 +182,7 @@ async def main(args):
     env = {**os.environ, "SIMXR_DATA_DIR": str(args.data_dir.resolve())}
     params = StdioServerParameters(command=sys.executable,
                                    args=[str(ROOT / "mcp-server/openxr_simulator_mcp.py")], env=env)
-    scope = "Fixed event-car preview spacing, blank held-click safety and Back" if args.preview_only else (
+    scope = "Locked event-card hover and press stability" if args.locked_only else "Fixed event-car preview spacing, blank held-click safety and Back" if args.preview_only else (
         "FlatOut Mode layout and head-height comfort" if args.layout_only else
         "Complete FlatOut Mode browser layout, 42-event paging, actual XR hover/click" + (" and safe vehicle preview" if args.preview_round_trip else ""))
     result = {"passed": False, "pid": args.pid, "hand": args.hand, "scope": scope}
@@ -194,6 +211,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--hand", choices=("left", "right"), default="right")
+    parser.add_argument("--locked-only", action="store_true")
     parser.add_argument("--layout-only", action="store_true")
     parser.add_argument("--preview-round-trip", action="store_true")
     parser.add_argument("--preview-only", action="store_true")

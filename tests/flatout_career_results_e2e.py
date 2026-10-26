@@ -1,7 +1,8 @@
-"""Walk a non-final Career cup's results into its next race through real XR input.
+"""Walk Career cup results into the next round or back to events through real XR input.
 
-Start after round one on Best Pilot or Race Recap. The test cancels Main Menu
-confirmation and continues to the next round; use an isolated progression slot.
+Start on Best Pilot, Race Recap or Cup Ranking. The default test cancels Main Menu
+confirmation and continues to the next round. --final-round verifies the last
+round returns to the event browser; use an isolated progression slot.
 """
 import argparse
 import asyncio
@@ -22,14 +23,19 @@ class CareerResults(Frontend):
         assert game['game_mode']=='career' and not game['is_main_menu'],game
         transitions={2:3,3:6,6:7}
         state=await self.query('race.end_screen')
+        if self.args.final_round:
+            assert state['screen'] in transitions,('Start on a result page of the final cup round',state)
         while state['screen']!=7:
             screen=state['screen']
-            assert screen in transitions,('Start on Best Pilot, Race Recap or Cup Ranking of a non-final round',state)
+            assert screen in transitions,('Start on Best Pilot, Race Recap or Cup Ranking',state)
             await self.audit('career-result-page-'+str(screen))
             targets=(await self.query('vr.targets'))['targets']
             for target in targets:
                 await self.hover(target['name'])
             name=next(t['name'] for t in targets if t['name'].startswith('endhelper.Validate.'))
+            if self.args.final_round and screen==6:
+                await self.complete_cup(name)
+                return
             await self.click(name)
             after=await self.query('race.end_screen')
             assert after['screen']==transitions[screen],('Held Continue skipped a results page',state,after)
@@ -72,9 +78,29 @@ class CareerResults(Frontend):
         await self.capture('career-next-round-loaded')
 
 
+    async def complete_cup(self, name):
+        targets=(await self.query('vr.targets'))['targets']
+        assert len(targets)==1 and targets[0]['name']==name,('Final cup ranking needs one Continue action',targets)
+        await self.footer_contrast('endhelper.')
+        await self.tool('capture_screenshot',{'eye':'both','max_width':2048},'career-final-cup-both-eyes')
+        await self.click(name)
+        for _ in range(120):
+            game=await self.query('game.get_state')
+            if game['is_main_menu'] and game['main_menu_ready'] and not game['is_loading']:
+                break
+            await asyncio.sleep(.5)
+        else:
+            raise AssertionError(('Final cup Continue did not return to the front end',game))
+        assert not (await self.query('ui.get_message_box'))['open'],'Unexpected modal after final cup'
+        menu=await self.query('menu.get_state')
+        assert menu['current_menu']=='FLATOUT_MODE' and 'career' in menu,('Completed cup must return to the event browser',menu)
+        await self.audit('career-complete-event-browser')
+        self.cases.append({'case':'final-cup-continue-returns-to-events-once','passed':True,'game':game,'menu':menu})
+
+
 async def run(args):
     args.evidence.mkdir(parents=True,exist_ok=False)
-    report={'passed':False,'pid':args.pid,'hand':args.hand}
+    report={'passed':False,'pid':args.pid,'hand':args.hand,'final_round':args.final_round}
     params=StdioServerParameters(command=sys.executable,args=[str(ROOT/'mcp-server/openxr_simulator_mcp.py')],env={**os.environ,'SIMXR_DATA_DIR':str(args.data_dir.resolve())})
     async with stdio_client(params) as streams:
         async with ClientSession(*streams) as session:
@@ -98,4 +124,5 @@ if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--pid',type=int,required=True);p.add_argument('--data-dir',type=Path,required=True)
     p.add_argument('--evidence',type=Path,required=True);p.add_argument('--hand',choices=('left','right'),default='right')
+    p.add_argument('--final-round',action='store_true',help='The cup is on its last round; Continue must return to the event browser')
     asyncio.run(run(p.parse_args()))
