@@ -13,10 +13,45 @@ import uuid
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from flatout_frontend_e2e import Frontend, ROOT, quad_pixel
+from flatout_frontend_e2e import Frontend, ROOT, RAY_OFFSET, quad_pixel
+from flatout_livery_e2e import world_pixel, ui_surface
 
 
 class Reward(Frontend):
+    async def return_controls(self):
+        menu=await self.query('menu.get_state')
+        assert menu['current_menu']=='MAIN MENU' and menu['is_3d'],menu
+        native=await self.query('vr.targets')
+        assert 'vr_frame' in native,('Reward return did not restore the spatial menu frame',native)
+        item=next(i for i in menu['items'] if i['title']=='OPTIONS')
+        capture=await self.capture('reward-return-options-source')
+        frame={**native['vr_frame'],'panel':{**menu['spatial_layout'],'origin':item['rendered_position']},
+               'panel_width':1.,'panel_height':1.}
+        state={'vr':{'frame':frame}}
+        x,y=world_pixel(state,capture,item['rendered_position'],'left')
+        w,h=capture['image_size']
+        assert 0<=x<w and 0<=y<h,('Returned Options label is outside the view',item,x,y)
+        aim={'capture_id':capture['capture_id'],'x':float(x),'y':float(y),'hand':self.args.hand,
+             'origin_mode':'hand','surface':ui_surface(state),'ray_offset':RAY_OFFSET,'dwell_frames':30}
+        hovered=await self.tool('hover_ui_at',aim,'reward-return-options-hover')
+        assert hovered['status']=='input_delivered',hovered
+        assert (await self.query('menu.get_state'))['selection_index']==item['index']
+        args={**aim,'hold_frames':45,'timeout':30,'command_id':uuid.uuid4().hex}
+        receipt=await self.tool('click_ui_at',args,'reward-return-options-click')
+        assert receipt['status']=='input_delivered',receipt
+        assert (await self.query('options.get_state'))['open'],'Returned main-menu ray could not open Options'
+        retry=await self.tool('click_ui_at',args,'reward-return-options-retry')
+        assert retry['delivery']['sync_id']==receipt['delivery']['sync_id']
+        self.cases.append({'case':'reward-return-spatial-options-held-click-and-retry','passed':True,'hand':self.args.hand})
+        await self.options_comfort()
+        cancel=next(t['name'] for t in (await self.query('vr.targets'))['targets'] if t['name'].startswith('helper.Cancel.'))
+        await self.click(cancel)
+        returned=await self.query('menu.get_state')
+        assert returned['current_menu']=='MAIN MENU' and returned['is_open'],returned
+        assert 'vr_frame' in await self.query('vr.targets'),'Options Back lost the spatial frame'
+        await self.capture('reward-return-main-usable')
+        self.cases.append({'case':'reward-return-options-back-restores-main','passed':True})
+
     async def run_reward(self):
         for _ in range(150):
             state=await self.query('ui.reward_state')
@@ -100,6 +135,7 @@ class Reward(Frontend):
         assert state['credits']==self.args.expected_credits,('Presentation preview changed progression',state)
         self.cases.append({'case':'reward-continue-and-retry-return-once-without-granting-credits','passed':True,'menu':menu,'state':state})
         await self.capture('reward-dismissed')
+        await self.return_controls()
 
 
 async def run(args):
