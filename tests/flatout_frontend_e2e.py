@@ -663,6 +663,11 @@ class Frontend:
         preview = await self.query("menu.get_state")
         assert preview["current_menu"]=="FLATOUT_MODE" and "career" not in preview and preview["item_count"]==1, preview
         await self.ray_buttons()
+        await self.reading_comfort("career-cup-preview")
+        labels=(await self.query("hud.rects",{"root":"menu","max_depth":12}))["nodes"]
+        captions=[n["text"] for n in labels if n["visible"] and n["path"].endswith("/RayActionLabel")]
+        assert "Start" in captions and "Confirm" not in captions,("Cup preview must name its Start action",captions)
+        self.cases.append({"case":"career-cup-preview-names-start-action","passed":True,"captions":captions})
         reference = (await self.query("vr.targets"))["targets"][0]
         l,t,r,b = reference["rect"]
         for x,y in ((100,260),(960,900)):
@@ -718,10 +723,16 @@ class Frontend:
         menu = await self.query("menu.get_state")
         assert menu["current_menu"]=="FLATOUT" and not menu["is_3d"] and menu["item_count"]==3
         assert all(i["title"].strip() for i in menu["items"]), "Career class cards need names in the menu model"
+        await self.reading_comfort("career-class-selection")
+        labels=(await self.query("hud.rects",{"root":"menu","max_depth":12}))["nodes"]
+        captions=[n["text"] for n in labels if n["visible"] and n["path"].endswith("/RayActionLabel")]
+        assert "Select" in captions and "Confirm" not in captions,("Class selection must name its Select action",captions)
+        self.cases.append({"case":"career-class-selection-names-select-action","passed":True,"captions":captions})
         for index,car_class in ((1,"classic"),(2,"allstars")):
             await self.capture("career-class-scene-before-"+car_class)
             source_capture = self.last_capture
-            source_frame = (await self.query("vr.targets"))["vr_frame"]
+            source_frame = (await self.query("vr.targets")).get("vr_frame")
+            assert source_capture["geometry"]["surfaces"] or source_frame,"Class selection has no reading surface"
             before = np.asarray(Image.open(self.last_image_path).convert("RGB")).astype(float)
             await self.click("item."+str(index))
             assert (await self.query("ui.get_message_box"))["open"]
@@ -729,10 +740,11 @@ class Frontend:
             await self.capture("career-wrong-class-"+car_class)
             after = np.asarray(Image.open(self.last_image_path).convert("RGB")).astype(float)
             assert before.shape==after.shape, "Preview resized during class-warning comparison"
-            # Above the dialog, inside the world-space menu quad: detect a
-            # showroom fade left black by opening the popup during transition.
-            state = {"vr":{"frame":source_frame}}
-            (x0,y0),(x1,y1) = [screenshot_pixel(state,source_capture,x,y) for x,y in ((600,120),(1320,210))]
+            # Above the dialog on its actual reading carrier: detect a scene
+            # fade left black by opening the popup during a menu transition.
+            state = {"vr":{"frame":source_frame}} if source_frame else None
+            (x0,y0),(x1,y1) = [quad_pixel(source_capture,(x,y,x,y)) if source_capture["geometry"]["surfaces"]
+                             else screenshot_pixel(state,source_capture,x,y) for x,y in ((600,120),(1320,210))]
             roi = (slice(math.floor(min(y0,y1)),math.ceil(max(y0,y1))),
                    slice(math.floor(min(x0,x1)),math.ceil(max(x0,x1))))
             source,actual = before[roi],after[roi]

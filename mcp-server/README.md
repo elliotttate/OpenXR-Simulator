@@ -521,7 +521,9 @@ python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory>
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --spatial-locked-only
 # From Career's cup/event grid: check visible page controls, card spacing, every series and locked events.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-only
-# From the grid with an unlocked cup: verify preview Back, blank-area safety and a confirmed race start.
+# From class selection or a Career grid/preview: check standing head-height placement, both eyes and world locking.
+python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --reading-comfort-only
+# From the grid with an unlocked cup: verify readable placement, Start/Back, blank-area safety and a confirmed race start.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-cup-only
 # From the Career hub with an active isolated test cup: cancel abandonment, then confirm it.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-cancel-only
