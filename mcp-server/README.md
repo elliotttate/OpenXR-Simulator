@@ -543,6 +543,8 @@ python tests/flatout_career_results_e2e.py --pid <game-pid> --data-dir <ipc-dire
 # The Main-menu preview also checks the restored spatial frame, ray entry into Options, both-eye comfort and ray Back.
 python tests/flatout_reward_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --expected-credits <unchanged-balance>
 # Stage another preview, then append --hand left --hold-frames 45 to check a held press with the other ray.
+# Preview car/driver artwork with ui.preview_reward parameters {"kind":"car","index":0} or {"kind":"driver","index":0}.
+# These use installed content indices and display-only descriptors; append --reward-kind car or --reward-kind driver to assert the actual artwork.
 # From the Career hub with an active isolated test cup: cancel abandonment, then confirm it.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-cancel-only
 # From class selection with the isolated Derby car: preserve scenery during both class warnings, then open filtered cars after OK.

@@ -67,6 +67,13 @@ class Reward(Frontend):
             await self.reading_comfort('reward',hover_target='helper.Validate.0')
             await self.audit('reward-action-spacing')
             nodes=(await self.query('hud.rects',{'root':'menu','max_depth':24}))['nodes']
+            artwork={'money':'/Results/Menu_Icons_Main/Custom_Money',
+                     'car':'/Results/Car/','driver':'/Results/Opponent/'}[self.args.reward_kind]
+            actual_art=[n for n in nodes if n['visible'] and n['kind']=='panel' and artwork in n['path']
+                        and n['rect'][2]>n['rect'][0] and n['rect'][3]>n['rect'][1]]
+            names=[n['text'] for n in nodes if n['visible'] and n['path'].endswith('/Results/TXT_Name')]
+            assert actual_art and names and all(names),('Expected reward artwork or name missing',self.args.reward_kind,actual_art,names)
+            self.cases.append({'case':'reward-'+self.args.reward_kind+'-artwork-and-name','passed':True,'artwork':actual_art,'names':names})
             captions=[n['text'] for n in nodes if n['visible'] and n['path'].endswith('/RayActionLabel')]
             self.cases.append({'case':'reward-action-names-continue','passed':captions==['Continue'],'captions':captions})
             assert captions==['Continue'],('Reward needs a clear Continue action',captions)
@@ -140,7 +147,7 @@ class Reward(Frontend):
 
 async def run(args):
     args.evidence.mkdir(parents=True,exist_ok=False)
-    report={'passed':False,'pid':args.pid,'hand':args.hand,'closing_only':args.closing_only,'hold_frames':args.hold_frames}
+    report={'passed':False,'pid':args.pid,'hand':args.hand,'reward_kind':args.reward_kind,'closing_only':args.closing_only,'hold_frames':args.hold_frames}
     params=StdioServerParameters(command=sys.executable,args=[str(ROOT/'mcp-server/openxr_simulator_mcp.py')],env={**os.environ,'SIMXR_DATA_DIR':str(args.data_dir.resolve())})
     async with stdio_client(params) as streams:
         async with ClientSession(*streams) as session:
@@ -165,6 +172,7 @@ if __name__=='__main__':
     p.add_argument('--pid',type=int,required=True);p.add_argument('--data-dir',type=Path,required=True)
     p.add_argument('--evidence',type=Path,required=True);p.add_argument('--hand',choices=('left','right'),default='right')
     p.add_argument('--expected-credits',type=int,required=True)
+    p.add_argument('--reward-kind',choices=('money','car','driver'),default='money',help='Assert the actual loaded artwork for the staged presentation variant')
     p.add_argument('--hold-frames',type=int,default=1)
     p.add_argument('--closing-only',action='store_true')
     asyncio.run(run(p.parse_args()))
