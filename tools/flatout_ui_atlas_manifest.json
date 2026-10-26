@@ -1,0 +1,461 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "main",
+      "title": "Main Menu",
+      "group": "Main",
+      "route": [],
+      "expect": [
+        "MAIN MENU"
+      ],
+      "expand": "items",
+      "source_enums": [
+        "ROOT"
+      ]
+    },
+    {
+      "id": "options",
+      "title": "Options",
+      "group": "Options",
+      "route": [
+        {
+          "goto": "options"
+        }
+      ],
+      "expect": [
+        "OPTIONS"
+      ],
+      "expand": "options",
+      "source_enums": [
+        "E_OPTIONS",
+        "E_OPTIONS_GAMEPLAY",
+        "E_OPTIONS_VIDEO",
+        "E_OPTIONS_AUDIO",
+        "E_OPTIONS_INPUT"
+      ]
+    },
+    {
+      "id": "challenge",
+      "title": "FlatOut Mode",
+      "group": "FlatOut Mode",
+      "route": [
+        {
+          "goto": "challenge"
+        }
+      ],
+      "expect": [
+        "INSANITY"
+      ],
+      "expand": "pages",
+      "next": "challenge.page.next",
+      "source_enums": [
+        "E_CHALLENGE"
+      ]
+    },
+    {
+      "id": "quick",
+      "title": "Quick Play",
+      "group": "Quick Play",
+      "route": [
+        {
+          "goto": "single_events"
+        }
+      ],
+      "expect": [
+        "QUICK EVENTS"
+      ],
+      "expand": "quick",
+      "source_enums": [
+        "E_SINGLE_EVENTS"
+      ]
+    },
+    {
+      "id": "multiplayer",
+      "title": "Multiplayer",
+      "group": "Multiplayer",
+      "route": [
+        {
+          "goto": "multiplayer"
+        }
+      ],
+      "expect": [
+        "MULTIPLAYER"
+      ],
+      "expand": "items",
+      "source_enums": [
+        "E_MULTIPLAYER"
+      ]
+    },
+    {
+      "id": "party",
+      "title": "Party player count",
+      "group": "Party",
+      "route": [
+        {
+          "goto": "party_game"
+        }
+      ],
+      "expect": [
+        "OFFLINE"
+      ],
+      "source_enums": [
+        "E_PARTY_GAME"
+      ]
+    },
+    {
+      "id": "party-stunts",
+      "title": "Party stunt selection",
+      "group": "Party",
+      "route": [
+        {
+          "goto": "party_game"
+        },
+        {
+          "ray": "players.2"
+        }
+      ],
+      "expect": [
+        "OFFLINE"
+      ],
+      "expand": "pages",
+      "next": "stunts.page.next",
+      "source_enums": [
+        "E_MULTIPLAYER_STUNT"
+      ]
+    },
+    {
+      "id": "party-drivers",
+      "title": "Party driver selection",
+      "group": "Party",
+      "route": [
+        {
+          "party_drivers": 8
+        }
+      ],
+      "expect": [
+        "DRIVERS"
+      ],
+      "expand": "items",
+      "source_enums": [
+        "E_DRIVERS"
+      ]
+    },
+    {
+      "id": "extra",
+      "title": "Extras",
+      "group": "Extras",
+      "route": [
+        {
+          "goto": "extra"
+        }
+      ],
+      "expand": "items",
+      "source_enums": [
+        "E_EXTRA"
+      ]
+    },
+    {
+      "id": "statistics",
+      "title": "Statistics",
+      "group": "Extras",
+      "route": [
+        {
+          "goto": "statistics"
+        }
+      ],
+      "expand": "pages",
+      "next": "stats.scroll.down",
+      "source_enums": [
+        "E_STATISTICS"
+      ]
+    },
+    {
+      "id": "credits",
+      "title": "Credits",
+      "group": "Extras",
+      "route": [
+        {
+          "goto": "credits"
+        }
+      ],
+      "source_enums": [
+        "E_CREDITS"
+      ]
+    },
+    {
+      "id": "career",
+      "title": "Career",
+      "group": "Career",
+      "route": [
+        {
+          "goto": "career"
+        }
+      ],
+      "expand": "items",
+      "source_enums": [
+        "E_CAREER"
+      ]
+    },
+    {
+      "id": "career-class",
+      "title": "Career class selection",
+      "group": "Career",
+      "route": [
+        {
+          "goto": "class_selection"
+        }
+      ],
+      "expand": "items",
+      "source_enums": [
+        "E_CLASS_SELECTION"
+      ]
+    },
+    {
+      "id": "career-events",
+      "title": "Career event grid",
+      "group": "Career",
+      "fixtures": [
+        "career"
+      ],
+      "route": [
+        {
+          "goto": "class_selection"
+        },
+        {
+          "select": 0
+        }
+      ],
+      "expand": "pages",
+      "next": "page.next",
+      "source_enums": [
+        "E_EVENT_SELECTION"
+      ]
+    },
+    {
+      "id": "cars",
+      "title": "Browse Cars",
+      "group": "Garage",
+      "route": [
+        {
+          "goto": "cars"
+        }
+      ],
+      "expand": "items",
+      "source_enums": [
+        "E_CARS"
+      ],
+      "fixtures": [
+        "showroom"
+      ]
+    },
+    {
+      "id": "garage",
+      "title": "Garage",
+      "group": "Garage",
+      "fixtures": [
+        "showroom"
+      ],
+      "route": [
+        {
+          "goto": "garage"
+        }
+      ],
+      "expand": "items",
+      "source_enums": [
+        "E_GARAGE"
+      ]
+    },
+    {
+      "id": "upgrade",
+      "title": "Upgrades",
+      "group": "Garage",
+      "fixtures": [
+        "showroom"
+      ],
+      "route": [
+        {
+          "goto": "upgrade"
+        }
+      ],
+      "expand": "items",
+      "source_enums": [
+        "E_UPGRADE"
+      ]
+    },
+    {
+      "id": "customization",
+      "title": "Customization",
+      "group": "Garage",
+      "fixtures": [
+        "showroom"
+      ],
+      "route": [
+        {
+          "goto": "customization"
+        }
+      ],
+      "source_enums": [
+        "E_CUSTOMIZATION"
+      ]
+    },
+    {
+      "id": "livery",
+      "title": "Livery editor",
+      "group": "Livery",
+      "fixtures": [
+        "showroom"
+      ],
+      "route": [
+        {
+          "goto": "livery"
+        }
+      ],
+      "expand": "livery",
+      "source_enums": [
+        "E_LIVERY"
+      ]
+    },
+    {
+      "id": "filter",
+      "title": "Online filters",
+      "group": "Online",
+      "route": [
+        {
+          "goto": "filter"
+        }
+      ],
+      "source_enums": [
+        "E_FILTER"
+      ]
+    },
+    {
+      "id": "online-setup",
+      "title": "Online game setup",
+      "group": "Online",
+      "fixtures": [
+        "network"
+      ],
+      "route": [
+        {
+          "goto": "online"
+        }
+      ],
+      "source_enums": [
+        "E_ONLINE"
+      ]
+    },
+    {
+      "id": "game-browser",
+      "title": "Server browser",
+      "group": "Online",
+      "route": [
+        {
+          "goto": "game_browser"
+        }
+      ],
+      "source_enums": [
+        "E_GAMEBROWSER"
+      ]
+    },
+    {
+      "id": "lobby",
+      "title": "Race lobby",
+      "group": "Online",
+      "status": "blocked",
+      "reason": "Requires a real private lobby/host fixture; atlas does not create or join network rooms",
+      "source_enums": [
+        "E_LOBBY"
+      ]
+    },
+    {
+      "id": "friends-lobby",
+      "title": "Party lobby",
+      "group": "Online",
+      "status": "blocked",
+      "reason": "Requires an existing network party fixture",
+      "source_enums": [
+        "E_FRIENDSLOBBY",
+        "E_MULTIPLAYER_ONLINE"
+      ]
+    },
+    {
+      "id": "leaderboards",
+      "title": "Leaderboard",
+      "group": "Leaderboard",
+      "source_enums": [
+        "E_LEADERBOARDS"
+      ],
+      "route": [
+        {
+          "goto": "challenge"
+        }
+      ],
+      "expand": "leaderboard"
+    },
+    {
+      "id": "cup-preview",
+      "title": "Cup preview",
+      "group": "Career",
+      "status": "blocked",
+      "reason": "Requires an unlocked cup selected in a Career fixture",
+      "source_enums": [
+        "E_CUP_PRESENTATION"
+      ]
+    },
+    {
+      "id": "cup-ranking",
+      "title": "Cup standings",
+      "group": "Career",
+      "status": "blocked",
+      "reason": "Requires an active/completed cup fixture",
+      "source_enums": [
+        "E_CUP_RANKING"
+      ]
+    },
+    {
+      "id": "single-car",
+      "title": "Event car preview",
+      "group": "Garage",
+      "status": "blocked",
+      "reason": "Requires an event-specific car configuration",
+      "source_enums": [
+        "E_SINGLE_CAR"
+      ]
+    },
+    {
+      "id": "reward",
+      "title": "Reward presentation",
+      "group": "Rewards",
+      "source_enums": [
+        "E_REWARD"
+      ],
+      "expand": "rewards",
+      "route": []
+    },
+    {
+      "id": "race-ui",
+      "title": "Race instructions, pause, results and standings",
+      "group": "Race",
+      "status": "blocked",
+      "reason": "Run atlas from a race fixture; front-end sweep never starts a race"
+    },
+    {
+      "id": "livery-modal",
+      "title": "Livery edit-only dialogs",
+      "group": "Livery",
+      "status": "blocked",
+      "reason": "Needs a selected-layer fixture. Keyboard/store are captured by the clean-document livery route."
+    },
+    {
+      "id": "wreck-run",
+      "title": "Wreck Run",
+      "group": "Deferred",
+      "status": "deferred",
+      "reason": "Explicitly deferred by the user",
+      "source_enums": [
+        "E_WRECK_RUN"
+      ]
+    }
+  ]
+}

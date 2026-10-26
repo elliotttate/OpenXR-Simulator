@@ -113,7 +113,10 @@ static XrResult XRAPI_PTR xrSyncActions_runtime(XrSession, const XrActionsSyncIn
             const auto& path=rt::g_pathStrings[b.binding];
             if (p.action=="hover") {
                 if (path.find("/input/aim/pose")!=std::string::npos) observed[hand]=true;
+            } else if (p.action=="scroll") {
+                if (path.find("/input/thumbstick")!=std::string::npos && path.find("/click")==std::string::npos) observed[hand]=true;
             } else if ((p.button=="primary" && (path.find("/input/a/click")!=std::string::npos || path.find("/input/x/click")!=std::string::npos)) ||
+                       (p.button=="secondary" && (path.find("/input/b/click")!=std::string::npos || path.find("/input/y/click")!=std::string::npos)) ||
                        (p.button=="menu" && path.find("/input/menu/click")!=std::string::npos) ||
                        ((p.button=="trigger" || p.button=="select") && (path.find("/input/trigger/")!=std::string::npos || path.find("/input/select/")!=std::string::npos))) observed[hand]=true;
         }

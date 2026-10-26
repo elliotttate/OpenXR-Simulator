@@ -24,6 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 from ui_targeting import UiAutomation, annotate_target
+from atomic_json_file import atomic_json
+from ui_comfort import guidelines as ui_comfort_guidelines, analyze_visibility, annotate_visibility, tool_specs as ui_comfort_tool_specs
 
 # MCP SDK imports
 try:
@@ -370,10 +372,7 @@ def analyze_openxr_issue(symptoms: str) -> dict[str, Any]:
 def _write_json_command(path: Path, payload: dict[str, Any]) -> None:
     """Atomically write a JSON command file the simulator polls for."""
     ensure_simulator_dir()
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(payload, f)
-    tmp.replace(path)
+    atomic_json(path,payload)
 
 
 def _deg(rad: float) -> float:
@@ -520,11 +519,14 @@ def ui_interaction_tools() -> list[Tool]:
         "y": {"type": "number", "description": "Pixel y in the returned image, top-left origin"},
         "hand": {"type": "string", "enum": ["left", "right"], "default": "right"},
         "origin_mode": {"type": "string", "enum": ["hand", "eye"], "default": "hand",
-                        "description": "hand requires a quad or explicit surface; eye uses the captured view ray"},
+                        "description": "hand requires a quad or explicit surface and keeps a normal controller origin. eye starts at the captured eye camera; the beam can collapse to a dot in that eye while remaining visible in the other."},
         "surface_id": {"type": "integer", "description": "Optional quad ID from screenshot geometry"},
         "surface": surface,
-        "ray_offset": {**surface["properties"]["pose"], "additionalProperties": False,
-            "description": "Optional application ray calibration in XR world axes: app origin = aim position + position; app direction = orientation applied to aim direction. Metres, unit quaternion [x,y,z,w]. Omit for unmodified XR aim."},
+        "ray_offset": {**surface["properties"]["pose"],
+            "properties": {**surface["properties"]["pose"]["properties"],
+                "position_space": {"type": "string", "enum": ["world", "aim"], "default": "world"}},
+            "additionalProperties": False,
+            "description": "Application ray calibration: origin offset in world or rotating aim axes, plus world-space direction rotation. Metres, unit quaternion [x,y,z,w]. Use aim for controller-shell emitters; omit for unmodified native aim."},
         "dwell_frames": {"type": "integer", "minimum": 1, "maximum": 90, "default": 2},
         "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 30, "default": 5},
         "command_id": {"type": "string", "description": "Optional alphanumeric idempotency key; reuse for retries"}}
@@ -533,9 +535,18 @@ def ui_interaction_tools() -> list[Tool]:
              inputSchema={"type": "object", "properties": common, "required": ["capture_id", "x", "y"], "additionalProperties": False}),
         Tool(name="click_ui_at", description="Aim at a screenshot pixel, dwell, press once, release, and capture the result. Application feedback confirms activation; delivery alone does not.",
              inputSchema={"type": "object", "properties": {**common,
-                 "button": {"type": "string", "enum": ["trigger", "select", "primary", "menu"], "default": "trigger"},
+                 "button": {"type": "string", "enum": ["trigger", "select", "primary", "secondary", "menu"], "default": "trigger"},
                  "hold_frames": {"type": "integer", "minimum": 1, "maximum": 90, "default": 2}},
                  "required": ["capture_id", "x", "y"], "additionalProperties": False}),
+        Tool(name="hold_ui_at", description="Press and hold at a screenshot pixel, or move an already held ray without another press. Supports independent left/right hands for two-handed gestures. Refresh within 10 seconds and finish each hand with release_ui_pointer; focus loss or expiry releases it automatically.",
+             inputSchema={"type": "object", "properties": {**common,
+                 "button": {"type": "string", "enum": ["trigger", "select", "primary", "secondary", "menu"], "default": "trigger"}},
+                 "required": ["capture_id", "x", "y"], "additionalProperties": False}),
+        Tool(name="scroll_ui_at", description="Aim a controller ray at a screenshot pixel and deflect its thumbstick for a bounded number of action syncs. Positive Y scrolls up; negative Y scrolls down. The stick returns to neutral before capture, without pressing any button.",
+             inputSchema={"type": "object", "properties": {**common,
+                 "stick": {"type": "array", "items": {"type": "number", "minimum": -1, "maximum": 1}, "minItems": 2, "maxItems": 2},
+                 "hold_frames": {"type": "integer", "minimum": 1, "maximum": 90, "default": 30}},
+                 "required": ["capture_id", "x", "y", "stick"], "additionalProperties": False}),
         Tool(name="release_ui_pointer", description="Release all injected buttons and return this controller to normal input.",
              inputSchema={"type": "object", "properties": {k: common[k] for k in ("capture_id", "hand", "timeout", "command_id")},
                           "required": ["capture_id"], "additionalProperties": False})]
@@ -545,7 +556,7 @@ def ui_interaction_tools() -> list[Tool]:
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available tools."""
-    return ui_interaction_tools() + [
+    return ui_interaction_tools() + [Tool(**spec) for spec in ui_comfort_tool_specs()] + [
         Tool(
             name="capture_screenshot",
             description="Capture a screenshot of the current OpenXR frame being rendered. "
@@ -860,8 +871,10 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
 
-    if name in ("hover_ui_at", "click_ui_at", "release_ui_pointer"):
-        action = {"hover_ui_at": "hover", "click_ui_at": "click", "release_ui_pointer": "release"}[name]
+    if name in ("hover_ui_at", "click_ui_at", "hold_ui_at", "scroll_ui_at", "release_ui_pointer"):
+        action = {"hover_ui_at": "hover", "click_ui_at": "click", "hold_ui_at": "hold", "scroll_ui_at": "scroll", "release_ui_pointer": "release"}[name]
+        if action == "scroll":
+            arguments.setdefault("hold_frames", 30)
         try:
             async with ui_automation.lock:
                 result, pixels = await ui_automation.interact(action, **arguments)
@@ -873,6 +886,30 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                             ImageContent(type="image", data=base64.b64encode(annotate_target(reference, arguments["x"], arguments["y"])).decode(), mimeType="image/jpeg")]
             return content
         except (ValueError, TimeoutError, OSError) as error:
+            return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(error)}))]
+
+    if name == "get_ui_comfort_guidelines":
+        return [TextContent(type="text", text=json.dumps(ui_comfort_guidelines(), indent=2))]
+
+    if name == "analyze_ui_visibility":
+        try:
+            capture_id = arguments["capture_id"]
+            async with ui_automation.lock:
+                capture = ui_automation.captures.get(capture_id)
+                if capture is None:
+                    raise ValueError("Unknown capture_id; capture a screenshot in this MCP session")
+                result = analyze_visibility(capture, targets=arguments.get("targets"), profile=arguments.get("profile"),
+                                            reference_mode=arguments.get("reference_mode", "level_head"),
+                                            reference_pose=arguments.get("reference_pose"))
+                content = [TextContent(type="text", text=json.dumps(result, indent=2, allow_nan=False))]
+                if arguments.get("include_overlay", True):
+                    source = ui_automation.images.get(capture_id)
+                    if source is None:
+                        raise ValueError("Original pixels are unavailable; use include_overlay=false for geometry only")
+                    overlay = annotate_visibility(source, capture, result)
+                    content.append(ImageContent(type="image", data=base64.b64encode(overlay).decode(), mimeType="image/png"))
+                return content
+        except (ValueError, KeyError, TypeError, OSError) as error:
             return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(error)}))]
 
     if name == "capture_screenshot":

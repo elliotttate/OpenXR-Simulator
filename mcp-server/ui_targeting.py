@@ -13,6 +13,7 @@ from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, ImageDraw
+from atomic_json_file import atomic_json
 
 
 def rotate(q, v):
@@ -120,25 +121,41 @@ def resolve_target(capture, x, y, hand="right", origin_mode="hand", surface_id=N
     # The supplied translation and rotation are independently applied in XR world
     # axes: app_origin = pose.position + offset.position;
     # app_direction = rotate(offset.orientation, rotate(pose.orientation, -Z)).
-    offset_p, offset_q = [0, 0, 0], [0, 0, 0, 1]
+    offset_p, offset_q, position_space = [0, 0, 0], [0, 0, 0, 1], "world"
     if ray_offset is not None:
         try:
             offset_p, offset_q = ray_offset["position"], ray_offset["orientation"]
+            position_space = ray_offset.get("position_space", "world")
             valid = (len(offset_p) == 3 and len(offset_q) == 4 and
+                     position_space in ("world", "aim") and
                      all(math.isfinite(v) for v in [*offset_p, *offset_q]) and
                      abs(sum(v*v for v in offset_q)-1) < .001)
         except (KeyError, TypeError, ValueError):
             valid = False
         if not valid:
             raise ValueError("ray_offset requires finite position[3] and unit orientation[4]")
-    aim_origin = ([a-b for a, b in zip(origin, offset_p)] if origin_mode == "eye"
-                  else g["hands"][0 if hand == "left" else 1])
-    app_origin = [a+b for a, b in zip(aim_origin, offset_p)]
-    app_direction = direction if target is None else normalized([a-b for a, b in zip(target, app_origin)])
-    aim_direction = rotate([-offset_q[0], -offset_q[1], -offset_q[2], offset_q[3]], app_direction)
+    inverse_q = [-offset_q[0], -offset_q[1], -offset_q[2], offset_q[3]]
+    aim_origin = origin if origin_mode == "eye" else g["hands"][0 if hand == "left" else 1]
+    aim_q = aim_orientation(rotate(inverse_q, direction))
+    # A controller emitter moves with its aim rotation. Solve that small
+    # offset rather than treating its previous world-space position as fixed.
+    for _ in range(32):
+        translation = rotate(aim_q, offset_p) if position_space == "aim" else offset_p
+        if origin_mode == "eye":
+            aim_origin = [a-b for a,b in zip(origin, translation)]
+        app_origin = [a+b for a,b in zip(aim_origin, translation)]
+        app_direction = direction if target is None else normalized([a-b for a,b in zip(target,app_origin)])
+        next_q = aim_orientation(rotate(inverse_q,app_direction))
+        if max(abs(a-b) for a,b in zip(aim_q,next_q)) < 1e-10:
+            aim_q = next_q
+            break
+        aim_q = next_q
+    translation = rotate(aim_q,offset_p) if position_space == "aim" else offset_p
+    app_origin = [a+b for a,b in zip(aim_origin,translation)]
+    app_direction = rotate(offset_q,rotate(aim_q,[0,0,-1]))
     return {"eye": eye["eye"], "raw_pixel": [raw_x, raw_y], "ray_origin": origin,
             "ray_direction": direction, "target_point": target, "surface_id": chosen,
-            "aim_pose": {"position": aim_origin, "orientation": aim_orientation(aim_direction)},
+            "aim_pose": {"position": aim_origin, "orientation": aim_q},
             "origin_mode": origin_mode, "ray_offset": ray_offset,
             "application_ray": {"position": app_origin, "direction": app_direction}}
 
@@ -153,12 +170,6 @@ def validate_surface(surface):
         valid = False
     if not valid:
         raise ValueError("surface requires position[3], unit orientation[4], and positive size[2]")
-
-
-def atomic_json(path, payload):
-    tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    tmp.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
-    tmp.replace(path)
 
 
 class UiAutomation:
@@ -189,8 +200,10 @@ class UiAutomation:
         capture_id = uuid.uuid4().hex
         atomic_json(self.directory/"screenshot_request.json", {
             "capture_id": capture_id, "eye": eye, "layer": "all", "after_sync": after_sync})
-        status = await self.wait_json(self.directory/"screenshot_status.json",
+        status_path = self.directory/f"screenshot_status.{capture_id}.json"
+        status = await self.wait_json(status_path,
                                       lambda s: s.get("capture_id") == capture_id, timeout)
+        status_path.unlink(missing_ok=True)
         raw_path = self.directory/f"screenshot.{capture_id}.bmp"
         with Image.open(raw_path) as source:
             image = source.convert("RGB")
@@ -247,15 +260,21 @@ class UiAutomation:
 
     async def interact(self, action, capture_id, x=0, y=0, hand="right", button="trigger",
                        origin_mode="hand", surface_id=None, surface=None, dwell_frames=2,
-                       hold_frames=2, timeout=5.0, command_id=None, ray_offset=None):
-        if action not in ("hover", "click", "release"):
+                       hold_frames=2, timeout=5.0, command_id=None, ray_offset=None, stick=None):
+        if action not in ("hover", "click", "hold", "release", "scroll"):
             raise ValueError("Unknown UI interaction")
-        if hand not in ("left", "right") or button not in ("trigger", "primary", "menu", "select"):
+        if hand not in ("left", "right") or button not in ("trigger", "primary", "secondary", "menu", "select"):
             raise ValueError("Invalid hand or button")
         if not all(isinstance(n, int) and 1 <= n <= 90 for n in (dwell_frames, hold_frames)):
             raise ValueError("dwell_frames and hold_frames must be integers in 1..90")
         if not 0 < timeout <= 30:
             raise ValueError("timeout must be in 0..30 seconds")
+        if action == "scroll":
+            if not isinstance(stick, (list, tuple)) or len(stick) != 2 or not all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and -1 <= v <= 1 for v in stick):
+                raise ValueError("stick requires two finite axes in -1..1")
+        elif stick is not None:
+            raise ValueError("stick is only valid for scroll")
         capture = self.captures.get(capture_id)
         if capture is None:
             raise ValueError("Unknown capture_id; take a screenshot in this MCP session")
@@ -265,6 +284,8 @@ class UiAutomation:
                    "hand": 0 if hand == "left" else 1, "button": button,
                    "dwell_frames": dwell_frames, "hold_frames": hold_frames,
                    "surface_id": target.get("surface_id", -1), "lease_ms": 10000}
+        if action == "scroll":
+            payload.update(stick_x=stick[0], stick_y=stick[1])
         if target:
             p = target["aim_pose"]
             payload.update(dict(zip(("px", "py", "pz"), p["position"])))

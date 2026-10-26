@@ -7133,6 +7133,29 @@ static void consumeCompletedPreviewFrame(rt::Session& s) {
     paintPreviewComposite(s, f);
 }
 
+// Rasterize a projection image per eye through the same linear-alpha compositor
+// as quads. The image already contains stereo depth: never reuse one eye's image
+// for the other. Its view pose and asymmetric FOV define the image-plane corners.
+static void renderProjectionOverlay(rt::Session& s, const XrCompositionLayerProjection& projection) {
+    if (!projection.views) return;
+    for (uint32_t eye = 0; eye < (std::min)(projection.viewCount, 2u); ++eye) {
+        const auto& view = projection.views[eye];
+        const float left = tanf(view.fov.angleLeft), right = tanf(view.fov.angleRight);
+        const float down = tanf(view.fov.angleDown), up = tanf(view.fov.angleUp);
+        XrCompositionLayerQuad image{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        image.layerFlags = projection.layerFlags;
+        image.space = projection.space;
+        image.eyeVisibility = eye == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
+        image.subImage = view.subImage;
+        image.pose = view.pose;
+        const XrVector3f offset = rt::RotateVectorByQuaternion(view.pose.orientation,
+            XrVector3f{(left + right) * .5f, (up + down) * .5f, -1.f});
+        image.pose.position.x += offset.x; image.pose.position.y += offset.y; image.pose.position.z += offset.z;
+        image.size = {right - left, up - down};
+        renderQuadLayer(s, &image);
+    }
+}
+
 static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* info) {
     // Reentrance guard: when our preview swapchain calls Present(), Steam's overlay
     // (gameoverlayrenderer64) hooks it, which can trigger UEVR to re-submit frames
@@ -7252,11 +7275,10 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
                                info->layerCount);
 
     // Determine if we need to defer Present for overlay layers
-    bool hasOverlays = (quadCount > 0 || cylinderCount > 0);
     g_presentPending = false;
 
-    // Second pass: render projection layers (background)
-    // If there are overlays, skip Present until after they're rendered
+    // Record the primary projection for screenshot geometry. Foreground stereo
+    // layers must not replace the world view or resize the preview mid-composite.
     for (uint32_t i = 0; i < info->layerCount; ++i) {
         const XrCompositionLayerBaseHeader* base = info->layers[i];
         if (!base) continue;
@@ -7295,42 +7317,60 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
                 mcp::g_lastProjEntry = e;
             }
 
-            presentProjection(rt::g_session, *proj, hasOverlays || mcp::g_screenshotRequested);
+            if (proj->views && proj->viewCount) {
+                uint32_t width = 0, height = 0;
+                for (uint32_t eye = 0; eye < (std::min)(proj->viewCount, 2u); ++eye) {
+                    auto chain = rt::g_swapchains.find(proj->views[eye].subImage.swapchain);
+                    if (chain == rt::g_swapchains.end()) continue;
+                    const auto rect = rt::ResolveSubImageRect(proj->views[eye].subImage.imageRect,
+                        chain->second.width, chain->second.height, "primary projection");
+                    width = (std::max)(width, rect.w); height = (std::max)(height, rect.h);
+                }
+                if (width && height) {
+                    const auto oldW = rt::g_sourceWidth.exchange(width), oldH = rt::g_sourceHeight.exchange(height);
+                    if (rt::g_session.hwnd && (oldW != width || oldH != height)) rt::FitWindowToContentAspect(rt::g_session.hwnd);
+                }
+            }
+            break;
         }
     }
     LARGE_INTEGER afterProjection{};
     QueryPerformanceCounter(&afterProjection);
 
-    // No projection layer this frame - the app is on a 2D-only screen. Bring the
-    // preview up ourselves (nothing else will) and clear it, so the overlay pass
-    // below has somewhere to composite instead of bailing out at its
-    // !previewSwapchain && !previewRT12 guard.
-    if (projectionCount == 0) {
+    // OpenXR layer order is authoritative; layer type does not reorder the stack.
+    // The common opaque-first projection already sizes and clears the preview.
+    // Only bootstrap here when another kind of layer starts the frame, avoiding
+    // an extra full-screen clear / RTV creation on the ordinary game path.
+    bool drewLayer = false;
+    const auto prepareForOverlay = [&]() {
+        if (drewLayer) return;
         ensurePreviewWithoutProjection(rt::g_session);
-        if (!g_previewDueThisFrame) {
-            // Nothing paints this frame, so there is nothing to wipe either.
-        } else if (!rt::g_session.usesD3D12) {
-            clearPreviewToBlack(rt::g_session);
-        } else if (!hasOverlays) {
-            // D3D12 normally clears as part of opening the render target, which whichever
-            // layer pass runs first does - so the black and the layers over it reach the
-            // window in one repaint. A frame carrying no layers at all has no such pass,
-            // so open and close the target here to wipe the last 3D frame off the mirror.
-            if (rt::PreviewFrame12* slot = beginPreviewSlot(rt::g_session)) {
-                beginPreviewRT(rt::g_session, *slot);
-            }
+        if (g_previewDueThisFrame) {
+            if (!rt::g_session.usesD3D12) clearPreviewToBlack(rt::g_session);
+            else if (rt::PreviewFrame12* slot = beginPreviewSlot(rt::g_session)) beginPreviewRT(rt::g_session, *slot);
         }
-    }
-
-    // Third pass: render overlay layers (quad, cylinder) on top of the projection
+    };
     for (uint32_t i = 0; i < info->layerCount; ++i) {
         const XrCompositionLayerBaseHeader* base = info->layers[i];
         if (!base) continue;
 
         switch (base->type) {
+            case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
+                const auto& projection = *reinterpret_cast<const XrCompositionLayerProjection*>(base);
+                if (!drewLayer && rt::BlendForLayerFlags(projection.layerFlags) == rt::LayerBlend::Opaque)
+                    presentProjection(rt::g_session, projection, true);
+                else {
+                    prepareForOverlay();
+                    renderProjectionOverlay(rt::g_session, projection);
+                }
+                drewLayer = true;
+                break;
+            }
             case XR_TYPE_COMPOSITION_LAYER_QUAD: {
+                prepareForOverlay();
                 const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(base);
                 renderQuadLayer(rt::g_session, quad);
+                drewLayer = true;
                 break;
             }
             case (XrStructureType)37: {
@@ -7341,6 +7381,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
                 break;
         }
     }
+    if (!drewLayer) prepareForOverlay();
+    if (g_previewDueThisFrame && drewLayer && !rt::g_session.usesD3D12) g_presentPending = true;
     LARGE_INTEGER afterOverlays{};
     QueryPerformanceCounter(&afterOverlays);
     if (g_previewDueThisFrame || !ui_auto::g_captures.empty()) ui_auto::g_frame = BuildUiFrame(info, (uint64_t)frameCount);

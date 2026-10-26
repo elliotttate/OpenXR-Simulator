@@ -55,6 +55,7 @@ struct Surface {
     XrEyeVisibility visibility = XR_EYE_VISIBILITY_BOTH;
     XrPosef pose = Identity();
     float width = 0, height = 0;
+    const char* role = nullptr;
 };
 struct Frame {
     std::string session;
@@ -66,7 +67,38 @@ struct Frame {
     XrVector3f hands[2]{};
     std::vector<Eye> eyes, projectionEyes;
     std::vector<Surface> surfaces;
+    std::vector<Surface> decorations;
 };
+// Keep the actual compositor geometry for diagnostics without allowing a
+// one-texel controller ribbon to intercept screenshot-based UI targeting.
+inline void AddQuadSurface(Frame& frame, int id, const XrCompositionLayerQuad& quad, XrPosef worldPose) {
+    const float narrow = (std::min)(quad.size.width,quad.size.height);
+    const float length = (std::max)(quad.size.width,quad.size.height);
+    const bool ribbon = quad.subImage.imageRect.extent.width==1 && quad.subImage.imageRect.extent.height==1 &&
+                        narrow>0 && narrow<=.004f && length>=.05f && length/narrow>=12.f;
+    // Some runtimes require stereo foreground images to be submitted as two
+    // eye-specific quads. A quad matching an entire eye frustum is an image
+    // carrier, not a menu hit plane. Keep normal stereo menu quads targetable.
+    bool eyeImage = false;
+    if (quad.layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) {
+        for (const auto& eye : frame.projectionEyes) {
+            if (quad.eyeVisibility != (eye.eye ? XR_EYE_VISIBILITY_RIGHT : XR_EYE_VISIBILITY_LEFT)) continue;
+            const auto relative = Compose(Inverse(eye.pose), worldPose);
+            const float distance = -relative.position.z;
+            if (distance <= 0) continue;
+            const float l = std::tan(eye.fov.angleLeft), r = std::tan(eye.fov.angleRight);
+            const float b = std::tan(eye.fov.angleDown), t = std::tan(eye.fov.angleUp);
+            const XrPosef expected{{0,0,0,1},{(l+r)*.5f*distance,(t+b)*.5f*distance,-distance}};
+            const float tolerance = .0001f*(std::max)(1.f,distance);
+            if (NearPose(relative,expected,tolerance) &&
+                std::fabs(quad.size.width-(r-l)*distance)<tolerance &&
+                std::fabs(quad.size.height-(t-b)*distance)<tolerance) eyeImage=true;
+        }
+    }
+    auto& destination = ribbon || eyeImage ? frame.decorations : frame.surfaces;
+    destination.push_back({id,quad.eyeVisibility,worldPose,quad.size.width,quad.size.height,
+                          eyeImage ? "stereo_eye_image" : ribbon ? "one_texel_ribbon" : nullptr});
+}
 struct SavedCapture { Frame geometry; ULONGLONG savedAt = 0; };
 inline std::string g_session;
 inline uint64_t g_sync = 0;
@@ -79,12 +111,37 @@ struct Pointer {
     std::string id, session, captureId, requestDigest, action, button = "trigger";
     int surfaceId = -1;
     bool down = false;
+    XrVector2f stick{};
     // 0=dwell, 1=pressed, 2=released/settling; advanced after action snapshots.
     int phase = 0, cycles = 0, dwell = 2, hold = 2;
     uint64_t appliedFrame = 0;
     ULONGLONG expires = 0;
 };
 inline Pointer g_pointer[2];
+
+inline bool NeedsPrepressValidation(const Pointer& p) {
+    // Hold publishes button-down immediately, unlike a click's unpressed
+    // dwell. Once a bound action snapshot observed it, closing its carrier is
+    // valid application feedback and must not turn delivery into an error.
+    return p.pending && p.phase==0 && !(p.action=="hold" && p.cycles>0);
+}
+
+// Called only after action snapshots are published. An unobserved sync must
+// neither advance delivery nor imply that the application saw a held press.
+inline bool AdvancePointerAfterSync(Pointer& p, bool observed) {
+    if (!p.owned || !p.pending || !observed) return false;
+    if (++p.cycles < (p.phase==0 ? p.dwell : p.phase==1 ? p.hold : 2)) return false;
+    p.cycles=0;
+    if (p.action=="hover" || p.action=="hold") return true;
+    if (p.phase==0) { p.down=p.action!="scroll"; p.phase=1; }
+    else if (p.phase==1) { p.down=false; p.phase=2; }
+    else return true;
+    return false;
+}
+
+inline XrVector2f PointerThumbstick(const Pointer& p) {
+    return p.owned && p.action=="scroll" && p.phase==1 ? p.stick:XrVector2f{0,0};
+}
 
 inline bool ValidId(const std::string& s) {
     if (s.empty() || s.size() > 80) return false;
@@ -119,6 +176,12 @@ inline void WriteGeometry(FILE* f, const Frame& g) {
     for (size_t i=0; i<g.surfaces.size(); ++i) {
         const auto& s=g.surfaces[i];
         fprintf(f, "%s{\"id\":%d,\"visibility\":%d,\"size\":[%.9g,%.9g],\"pose\":",i ? "," : "",s.id,(int)s.visibility,s.width,s.height);
+        WritePose(f,s.pose); fprintf(f,"}");
+    }
+    fprintf(f,"],\"decorations\":[");
+    for (size_t i=0; i<g.decorations.size(); ++i) {
+        const auto& s=g.decorations[i];
+        fprintf(f, "%s{\"id\":%d,\"role\":\"%s\",\"visibility\":%d,\"size\":[%.9g,%.9g],\"pose\":",i ? "," : "",s.id,s.role ? s.role : "decoration",(int)s.visibility,s.width,s.height);
         WritePose(f,s.pose); fprintf(f,"}");
     }
     fprintf(f,"]}");

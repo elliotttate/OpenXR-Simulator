@@ -74,10 +74,9 @@ static ui_auto::Frame BuildUiFrame(const XrFrameEndInfo* info, uint64_t frame) {
     for (uint32_t i=0;i<info->layerCount;++i) {
         const auto* layer=info->layers[i]; if (!layer) continue;
         if (layer->type==XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+            if (!g.projectionEyes.empty()) continue; // Keep the world view; overlay projections are not UI surfaces.
             const auto& p=*(const XrCompositionLayerProjection*)layer;
             if (!p.views || p.viewCount>2) { g.supported=false; continue; }
-            // Several overlapping projections are ambiguous to an image-only target.
-            if (!g.projectionEyes.empty()) g.supported=false;
             for (const auto& viewport:g.eyes) {
                 if ((uint32_t)viewport.eye>=p.viewCount) continue;
                 auto eye=viewport; const auto& v=p.views[eye.eye];
@@ -102,7 +101,7 @@ static ui_auto::Frame BuildUiFrame(const XrFrameEndInfo* info, uint64_t frame) {
             }
         } else if (layer->type==XR_TYPE_COMPOSITION_LAYER_QUAD) {
             const auto& q=*(const XrCompositionLayerQuad*)layer;
-            g.surfaces.push_back({(int)i,q.eyeVisibility,rt::QuadWorldPose(q,rt::g_headYaw,rt::g_headPitch,rt::g_headRoll),q.size.width,q.size.height});
+            AddQuadSurface(g,(int)i,q,rt::QuadWorldPose(q,rt::g_headYaw,rt::g_headPitch,rt::g_headRoll));
         } else {
             g.supported=false;
         }
@@ -127,8 +126,8 @@ static void WriteUiResult(ui_auto::Pointer& p, bool success, const char* error="
 
 static void ClearUiButtons(int hand) {
     auto& ctrl=hand ? rt::g_rightController:rt::g_leftController;
-    ctrl.triggerPressed=ctrl.primaryPressed=ctrl.menuPressed=false;
-    ctrl.triggerValue=0;
+    ctrl.triggerPressed=ctrl.primaryPressed=ctrl.secondaryPressed=ctrl.menuPressed=false;
+    ctrl.triggerValue=0; ctrl.thumbstick={0,0};
 }
 
 static void ReleaseUiPointers(const char* reason) {
@@ -195,7 +194,7 @@ static void PollUiPointerCommand() {
     }
     for (int h=0;h<2;++h) {
         auto& p=g_pointer[h];
-        if (!p.pending || p.phase!=0) continue;
+        if (!NeedsPrepressValidation(p)) continue;
         const auto capture=g_captures.find(p.captureId);
         if (capture==g_captures.end() || !CompatibleCapture(capture->second.geometry,p.surfaceId)) {
             ClearUiButtons(h); p.down=false; p.owned=false;
@@ -227,13 +226,16 @@ static void PollUiPointerCommand() {
         if (p.pending) WriteUiResult(p,false,"Pointer released");
         WriteUiResult(incoming,true); return;
     }
-    if (incoming.action!="hover" && incoming.action!="click") { WriteUiResult(incoming,false,"Invalid action"); return; }
-    if (incoming.button!="trigger" && incoming.button!="select" && incoming.button!="primary" && incoming.button!="menu") {
+    if (incoming.action!="hover" && incoming.action!="click" && incoming.action!="hold" && incoming.action!="scroll") { WriteUiResult(incoming,false,"Invalid action"); return; }
+    if (incoming.button!="trigger" && incoming.button!="select" && incoming.button!="primary" && incoming.button!="secondary" && incoming.button!="menu") {
         WriteUiResult(incoming,false,"Invalid button"); return;
     }
     if (p.pending) {
         if (p.id==incoming.id) return;
         WriteUiResult(incoming,false,"Controller already has a pending interaction"); return;
+    }
+    if (p.owned && p.down && (incoming.action!="hold" || incoming.button!=p.button)) {
+        WriteUiResult(incoming,false,"Release the held pointer before changing interaction or button"); return;
     }
     auto capture=g_captures.find(o.string("capture_id"));
     if (capture==g_captures.end() || GetTickCount64()-capture->second.savedAt>30000 ||
@@ -248,11 +250,17 @@ static void PollUiPointerCommand() {
     if (!std::isfinite(norm) || std::fabs(norm-1)>0.001f || !std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z)) {
         WriteUiResult(incoming,false,"Invalid aim pose"); return;
     }
+    incoming.stick={o.number("stick_x",0.f),o.number("stick_y",0.f)};
+    if (!std::isfinite(incoming.stick.x) || !std::isfinite(incoming.stick.y) ||
+        std::fabs(incoming.stick.x)>1.f || std::fabs(incoming.stick.y)>1.f) {
+        WriteUiResult(incoming,false,"Invalid thumbstick vector"); return;
+    }
     incoming.dwell=o.number("dwell_frames",2); incoming.hold=o.number("hold_frames",2);
     if (incoming.dwell<1 || incoming.dwell>90 || incoming.hold<1 || incoming.hold>90) {
         WriteUiResult(incoming,false,"Invalid sync-cycle duration"); return;
     }
     incoming.owned=true; incoming.pending=true;
+    incoming.down=incoming.action=="hold";
     incoming.captureId=o.string("capture_id"); incoming.surfaceId=o.number("surface_id",-1);
     incoming.appliedFrame=mcp::g_runtimeFrameCount.load()+1;
     incoming.expires=GetTickCount64()+10000;
@@ -266,22 +274,16 @@ static void ApplyUiPointerButtons() {
         ctrl.triggerPressed=p.down && (p.button=="trigger" || p.button=="select");
         ctrl.triggerValue=ctrl.triggerPressed ? 1.0f:0.0f;
         ctrl.primaryPressed=p.down && p.button=="primary";
+        ctrl.secondaryPressed=p.down && p.button=="secondary";
         ctrl.menuPressed=p.down && p.button=="menu";
-        ctrl.gripPressed=ctrl.secondaryPressed=ctrl.thumbstickPressed=false;
-        ctrl.gripValue=0; ctrl.thumbstick={0,0};
+        ctrl.gripPressed=ctrl.thumbstickPressed=false;
+        ctrl.gripValue=0; ctrl.thumbstick=ui_auto::PointerThumbstick(p);
     }
 }
 
 static void AdvanceUiPointersAfterSync(const bool observed[2]) {
     for (int hand=0;hand<2;++hand) {
         auto& p=ui_auto::g_pointer[hand];
-        if (!p.owned || !p.pending) continue;
-        if (!observed[hand]) continue;
-        if (++p.cycles < (p.phase==0 ? p.dwell : p.phase==1 ? p.hold : 2)) continue;
-        p.cycles=0;
-        if (p.action=="hover") WriteUiResult(p,true);
-        else if (p.phase==0) { p.down=true; p.phase=1; }
-        else if (p.phase==1) { p.down=false; p.phase=2; }
-        else WriteUiResult(p,true);
+        if (ui_auto::AdvancePointerAfterSync(p,observed[hand])) WriteUiResult(p,true);
     }
 }
