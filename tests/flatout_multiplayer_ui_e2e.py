@@ -38,6 +38,15 @@ class MultiplayerUI(Frontend):
             assert 80<=l<r<=1840 and b<=952, ('Action dock lacks canvas margins',action)
         for a,b in zip(actions,actions[1:]):
             assert b['rect'][0]-a['rect'][2]>=19.5, ('Adjacent actions are crowded',a,b)
+        menu=await self.query('menu.get_state')
+        captions=[n for n in await self.labels() if n['path'].endswith('/RayActionLabel')]
+        for action in actions:
+            item=menu['items'][int(action['name'].split('.')[1])]
+            assert item['title'].strip(), item
+            l,t,r,b=action['rect']
+            assert any(n['text']==item['title'] and n['rect'][0]>=l-1 and n['rect'][2]<=r+1 and
+                       n['rect'][1]>=t-1 and n['rect'][3]<=b+1 for n in captions), (
+                           'Action must show its localized model title',item,action,captions)
         footer=[t for t in targets if t['name'].startswith('helper.')]
         assert all(t['rect'][1]-max(a['rect'][3] for a in actions)>=24 for t in footer),footer
         await self.audit('multiplayer-action-spacing')
@@ -101,11 +110,86 @@ class MultiplayerUI(Frontend):
     async def run_multiplayer(self):
         menu=await self.query('menu.get_state')
         assert menu['is_open'] and not menu['is_3d'],menu
-        await self.reading_comfort(self.args.surface)
-        await self.dock()
+        titles=[i['title'] for i in menu['items']]
         if self.args.surface=='browser':
+            assert len(titles)==4 and titles[3]=='Enter Code',('Start in Browse Games',menu)
+        elif self.args.surface=='party-lobby':
+            assert 'Browse Games' in titles and 'Create Private' in titles,('Start in the player party lobby',menu)
+        elif self.args.surface=='race-lobby':
+            net=await self.query('net.get_state')
+            assert net['state']=='InLobby' and net['private'] and net['is_host'] and net['connected_players']==1,net
+        else:
+            assert 'setup' in menu,('Start in lobby setup',menu)
+        await self.reading_comfort(self.args.surface)
+        if self.args.surface=='online-setup':
+            return await self.setup()
+        await self.dock()
+        if self.args.surface=='browser' and not self.args.dock_only:
             assert menu['current_menu']=='ONLINE',menu
             await self.keypad()
+
+    async def setup_layout(self):
+        setup=(await self.query('menu.get_state'))['setup']
+        targets=(await self.query('vr.targets'))['targets']
+        labels=await self.labels()
+        for row in setup['rows']:
+            if not row['visible']:
+                continue
+            for text in (row['label'],row['value']):
+                assert any(n['text']==text for n in labels),('Missing localized setting text',row,text)
+            for side,available in (('prev',row['previous']),('next',row['next'])):
+                name=f"setup.{row['index']}.{side}"
+                arrow=next((t for t in targets if t['name']==name),None)
+                assert bool(arrow)==available,(row,name,arrow)
+                if arrow:
+                    l,t,r,b=arrow['rect']
+                    assert r-l>=80 and b-t>=80 and b<=928,('Cramped setting arrow',arrow)
+            pair=[t for t in targets if t['name'].startswith(f"setup.{row['index']}.")]
+            if len(pair)==2:
+                pair.sort(key=lambda t:t['rect'][0])
+                assert pair[1]['rect'][0]-pair[0]['rect'][2]>=19.5,pair
+        assert not any(re.fullmatch(r'setup\.\d+',t['name']) for t in targets),'Legacy row-sized targets remain'
+        await self.audit('online-setup-spaced-controls')
+        return setup
+
+    async def setup(self):
+        initial=await self.setup_layout()
+        assert 'Create Private Lobby' in initial['actions'] or 'Apply Setup' in initial['actions'],initial['actions']
+        for row in initial['rows']:
+            if not row['visible']:
+                continue
+            index=row['index']
+            current=(await self.query('menu.get_state'))['setup']['rows'][index]
+            direction='next' if current['next'] else 'prev'
+            if not current['next'] and not current['previous']:
+                continue
+            name=f'setup.{index}.{direction}'
+            values=[r['value'] for r in (await self.query('menu.get_state'))['setup']['rows']]
+            await self.hover(name)
+            assert [r['value'] for r in (await self.query('menu.get_state'))['setup']['rows']]==values,'Hover changed a setting'
+            await self.click(name)
+            changed=(await self.query('menu.get_state'))['setup']['rows'][index]
+            assert changed['value']!=current['value'],('Setting arrow did not change its row',current,changed)
+            await self.click(f"setup.{index}."+('prev' if direction=='next' else 'next'))
+            restored=(await self.query('menu.get_state'))['setup']['rows'][index]
+            assert restored['value']==current['value'],('Opposite arrow did not restore its row',current,restored)
+            self.cases.append({'case':'lobby-setting-round-trip','passed':True,'row':index,'value':current['value']})
+        await self.setup_layout()
+        await self.tool('capture_screenshot',{'eye':'both','max_width':2048},'online-setup-both-eyes')
+        if self.args.create_private:
+            setup=(await self.query('menu.get_state'))['setup']
+            assert 'Create Private Lobby' in setup['actions'] and setup['can_continue'],setup
+            net=await self.query('net.get_state')
+            assert net['connected_players']==1,net
+            validate=next(t['name'] for t in (await self.query('vr.targets'))['targets'] if t['name'].startswith('helper.Validate.'))
+            await self.click(validate)
+            for _ in range(80):
+                net=await self.query('net.get_state')
+                if net['state']=='InLobby':
+                    break
+                await asyncio.sleep(.25)
+            assert net['state']=='InLobby' and net['private'] and net['connected_players']==1,net
+            self.cases.append({'case':'create-private-lobby-once','passed':True})
 
 
 async def run(args):
@@ -117,7 +201,12 @@ async def run(args):
         async with ClientSession(*streams) as session:
             await session.initialize();test=MultiplayerUI(args,session)
             try:
-                await test.run_multiplayer();result['passed']=True
+                assert (await test.query('game.errors'))['total']==0,'Start with a clean native error queue'
+                await test.run_multiplayer()
+                errors=await test.query('game.errors',{'count':128})
+                result['native_errors']=errors
+                assert errors['total']==0,errors
+                result['passed']=True
             except Exception as error:
                 result['error']=repr(error);raise
             finally:
@@ -132,6 +221,8 @@ if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--pid',type=int,required=True);p.add_argument('--data-dir',type=Path,required=True)
     p.add_argument('--evidence',type=Path,required=True)
-    p.add_argument('--surface',choices=('browser','party-lobby','race-lobby'),default='browser')
+    p.add_argument('--surface',choices=('browser','party-lobby','race-lobby','online-setup'),default='browser')
+    p.add_argument('--dock-only',action='store_true',help='Recheck reading position and action captions without repeating local code-entry tests')
+    p.add_argument('--create-private',action='store_true',help='From private setup: create the isolated one-player lobby after checking settings')
     p.add_argument('--hand',choices=('left','right'),default='right')
     asyncio.run(run(p.parse_args()))

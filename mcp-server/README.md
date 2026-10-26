@@ -689,3 +689,10 @@ entry, verifies its title/Close spacing, types and deletes a local code through
 held/retried ray clicks, rejects disabled keys and background clicks, and closes
 back to the browser. It never joins a room. Use `--surface party-lobby` or
 `--surface race-lobby` to check the corresponding reading surface and action dock.
+
+Lobby setup uses `--surface online-setup` to verify every setting's visible arrow
+pair, localized label/value, hover safety and held-click/opposite-arrow round
+trip. From private creation setup, `--create-private` additionally activates
+Create Private Lobby once and verifies a private host lobby with one human
+player. `--dock-only` rechecks the browser's reading surface and captions without
+repeating code entry. No test joins a public room.
