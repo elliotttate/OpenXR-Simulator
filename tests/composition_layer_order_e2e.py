@@ -19,6 +19,7 @@ async def run(args):
         view_mode='both', asymmetric_fov=True, zoom_mode='fill', window_width=1024, window_height=512, preview_fps=-1)))
     env = {**os.environ, 'SIMXR_DATA_DIR': str(out), 'SIMXR_AUTOMATION_ONLY': '1',
            'SIMXR_RUNTIME_DLL': str(args.runtime.resolve()), 'XR_UI_BACKEND': args.backend}
+    if args.stereo_quads: env['XR_UI_STEREO_QUADS']='1'
     result = {'passed': False, 'eyes': {}}
     with (out/'probe.log').open('w') as log:
         proc = subprocess.Popen([str(args.probe.resolve())], env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -36,6 +37,9 @@ async def run(args):
                     for eye in ('left', 'right'):
                         info, image = await call(session, 'capture_screenshot', {'eye':eye,'max_width':640}, out, eye)
                         assert len(info['geometry']['projection_eyes']) == 2, 'Foreground projection replaced or duplicated the primary view metadata'
+                        if args.stereo_quads:
+                            assert len(info['geometry']['surfaces'])==2, 'Foreground eye images intercepted UI targeting'
+                            assert len([d for d in info['geometry']['decorations'] if d['role']=='stereo_eye_image'])==2
                         r,g,b = image[:,:,:3].transpose(2,0,1)
                         foreground = (g>230)&(b<30)&((r<30) if eye=='left' else (r>230))
                         red = (r>230)&(g<30)&(b<30)
@@ -64,5 +68,6 @@ if __name__=='__main__':
     p.add_argument('--probe',type=Path,required=True)
     p.add_argument('--runtime',type=Path,required=True)
     p.add_argument('--backend',choices=('d3d11','d3d12'),default='d3d11')
+    p.add_argument('--stereo-quads',action='store_true')
     p.add_argument('--evidence',type=Path,required=True)
     asyncio.run(run(p.parse_args()))

@@ -67,6 +67,7 @@ async def run(args):
     result = {'passed':False,'eyes':{}}
     original = game(args.pid,'vr.controller_overlay')
     assert original['available'], 'Build has no controller overlay resources'
+    assert original.get('composition')=='stereo_quads', 'Controller overlay must use per-eye quad composition on SteamVR'
     assert game(args.pid,'menu.get_state')['current_menu']=='OPTIONS', 'Start in Options'
     env = {**os.environ,'SIMXR_DATA_DIR':str(args.data_dir.resolve())}
     params = StdioServerParameters(command=sys.executable,args=[str(ROOT/'mcp-server/openxr_simulator_mcp.py')],env=env)
@@ -97,6 +98,7 @@ async def run(args):
                     native = game(args.pid,'vr.get_state')
                     status = game(args.pid,'vr.controller_overlay')
                     assert status['rendered_eye_mask']==(3 if enabled else 0), status
+                    assert status['submitted_layers']==(2 if enabled else 0), status
                     (args.evidence/(tag+'-native.json')).write_text(json.dumps({'vr':native,'overlay':status},indent=2))
                     for eye in ('left','right'):
                         capture,image = await call(session,'capture_screenshot',{'eye':eye,'max_width':1600},args.evidence,tag+'-'+eye)

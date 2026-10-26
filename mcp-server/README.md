@@ -217,6 +217,10 @@ python tests/composition_layer_order_e2e.py --probe bin/xr_layer_order.exe --run
 python tests/composition_layer_order_e2e.py --probe bin/xr_layer_order.exe --runtime bin/openxr_simulator.dll --evidence build-ui-automation/order-d3d12 --backend d3d12
 ```
 
+Add `--stereo-quads` to either order test to exercise the eye-specific quad
+carrier used for SteamVR compatibility. It also verifies these carriers remain
+decorations rather than intercepting screenshot-based UI rays.
+
 For Fox, launch a Release build with an isolated test profile, open Options, and
 keep the simulator head level and facing forward. Run:
 
@@ -226,14 +230,18 @@ python tests/flatout_controller_overlay_e2e.py --pid GAME_PID --data-dir SIMULAT
 
 This compares actual rendered controller pixels with the native diagnostic
 `vr.controller_overlay` disabled/enabled in the same build, in both eyes. It
-restores the original controller poses and switch. The foreground projection
-retains native per-eye cameras, controller materials and self-depth; it is not
-a mono controller image pasted onto the menu.
+restores the original controller poses and switch. The foreground uses two eye-specific quad layers with native per-eye cameras,
+controller materials and self-depth. This avoids SteamVR ordering quads above
+a projection layer submitted later; neither eye is copied from the other.
+Full-frustum eye-image carriers are reported as decorations, not UI hit planes.
+When launching Fox with an explicit simulator manifest, its non-Retail builds
+also accept `PLAYALL_OPENXR_RUNTIME_JSON`. The Fox simulator launch recipes set
+this alongside `XR_RUNTIME_JSON`, preserving the selected runtime if Steam
+startup changes the latter. Verify the actual `vr.get_state.runtime` after launch.
 
 For GPU inspection, run `tests/flatout_controller_overlay_gpu.py` in RenderDoc's
 Python environment with `FOX_CONTROLLER_GPU_JOB` naming a JSON file containing
-`capture`, `native_state`, and `result` paths. `native_state` is a JSON response
-from `vr.get_state`. The check requires separate color/depth targets per eye,
+`capture`, `native_state`, and `result` paths. `native_state` contains the `vr.get_state` result under a top-level `vr` key. The check requires separate color/depth targets per eye,
 matching eye cameras, transparent clear pixels, actual controller pixel history,
 and no duplicate world-pass draws. Compare performance in the same Release
 build, without capture/replay or builds running during the sample.
@@ -360,6 +368,20 @@ so back up their `Liveries` folder separately. Start with no unsaved edits:
 ```powershell
 python tests/flatout_livery_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory>
 ```
+
+For the current side-console layout, start in Livery with an unlocked sticker in
+an isolated profile and run:
+
+```powershell
+python tests/flatout_livery_workspace_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory>
+```
+
+This turns the simulated head between the car and its left-hand console, checks
+both-eye clearance with the panel level, and uses real ray input for paint,
+tool selection, two-hand sticker manipulation and Roof/Studio views. A captured
+drag may cross the car silhouette without losing its grab. A single Undo must
+restore the entire gesture; the successful run leaves the document unchanged.
+It saves both-eye car and console screenshots for visual inspection.
 
 With an unlocked layer available, add `--dual-hands-only` to verify real
 left/right car grabs, scaling, rotation, hand release, continuing movement,

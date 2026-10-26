@@ -55,6 +55,7 @@ struct Surface {
     XrEyeVisibility visibility = XR_EYE_VISIBILITY_BOTH;
     XrPosef pose = Identity();
     float width = 0, height = 0;
+    const char* role = nullptr;
 };
 struct Frame {
     std::string session;
@@ -75,8 +76,28 @@ inline void AddQuadSurface(Frame& frame, int id, const XrCompositionLayerQuad& q
     const float length = (std::max)(quad.size.width,quad.size.height);
     const bool ribbon = quad.subImage.imageRect.extent.width==1 && quad.subImage.imageRect.extent.height==1 &&
                         narrow>0 && narrow<=.004f && length>=.05f && length/narrow>=12.f;
-    auto& destination = ribbon ? frame.decorations : frame.surfaces;
-    destination.push_back({id,quad.eyeVisibility,worldPose,quad.size.width,quad.size.height});
+    // Some runtimes require stereo foreground images to be submitted as two
+    // eye-specific quads. A quad matching an entire eye frustum is an image
+    // carrier, not a menu hit plane. Keep normal stereo menu quads targetable.
+    bool eyeImage = false;
+    if (quad.layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) {
+        for (const auto& eye : frame.projectionEyes) {
+            if (quad.eyeVisibility != (eye.eye ? XR_EYE_VISIBILITY_RIGHT : XR_EYE_VISIBILITY_LEFT)) continue;
+            const auto relative = Compose(Inverse(eye.pose), worldPose);
+            const float distance = -relative.position.z;
+            if (distance <= 0) continue;
+            const float l = std::tan(eye.fov.angleLeft), r = std::tan(eye.fov.angleRight);
+            const float b = std::tan(eye.fov.angleDown), t = std::tan(eye.fov.angleUp);
+            const XrPosef expected{{0,0,0,1},{(l+r)*.5f*distance,(t+b)*.5f*distance,-distance}};
+            const float tolerance = .0001f*(std::max)(1.f,distance);
+            if (NearPose(relative,expected,tolerance) &&
+                std::fabs(quad.size.width-(r-l)*distance)<tolerance &&
+                std::fabs(quad.size.height-(t-b)*distance)<tolerance) eyeImage=true;
+        }
+    }
+    auto& destination = ribbon || eyeImage ? frame.decorations : frame.surfaces;
+    destination.push_back({id,quad.eyeVisibility,worldPose,quad.size.width,quad.size.height,
+                          eyeImage ? "stereo_eye_image" : ribbon ? "one_texel_ribbon" : nullptr});
 }
 struct SavedCapture { Frame geometry; ULONGLONG savedAt = 0; };
 inline std::string g_session;
@@ -160,7 +181,7 @@ inline void WriteGeometry(FILE* f, const Frame& g) {
     fprintf(f,"],\"decorations\":[");
     for (size_t i=0; i<g.decorations.size(); ++i) {
         const auto& s=g.decorations[i];
-        fprintf(f, "%s{\"id\":%d,\"role\":\"one_texel_ribbon\",\"visibility\":%d,\"size\":[%.9g,%.9g],\"pose\":",i ? "," : "",s.id,(int)s.visibility,s.width,s.height);
+        fprintf(f, "%s{\"id\":%d,\"role\":\"%s\",\"visibility\":%d,\"size\":[%.9g,%.9g],\"pose\":",i ? "," : "",s.id,s.role ? s.role : "decoration",(int)s.visibility,s.width,s.height);
         WritePose(f,s.pose); fprintf(f,"}");
     }
     fprintf(f,"]}");

@@ -33,5 +33,25 @@ int main() {
     ui_auto::AddQuadSurface(frame,6,q,ui_auto::Identity());
     check(frame.surfaces.size()==4,
           "short strips are not silently classified; the ray producer must suppress near-hand ribbons");
+    ui_auto::Eye eye;
+    eye.eye=1; eye.fov={-.7f,.9f,.8f,-.6f};
+    eye.pose={{0,.258819f,0,.9659258f},{.032f,1.7f,0}};
+    frame.projectionEyes.push_back(eye);
+    const float l=std::tan(eye.fov.angleLeft), r=std::tan(eye.fov.angleRight);
+    const float b=std::tan(eye.fov.angleDown), t=std::tan(eye.fov.angleUp);
+    const XrPosef local{{0,0,0,1},{(l+r)*.5f,(t+b)*.5f,-1}};
+    q.eyeVisibility=XR_EYE_VISIBILITY_RIGHT;
+    q.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    q.subImage.imageRect.extent={1280,1400}; q.size={r-l,t-b};
+    const auto world=ui_auto::Compose(eye.pose,local);
+    ui_auto::AddQuadSurface(frame,7,q,world);
+    check(frame.surfaces.size()==4 && frame.decorations.size()==3,
+          "an asymmetric stereo foreground image must not intercept menu rays");
+    q.size.width*=.9f;
+    ui_auto::AddQuadSurface(frame,8,q,world);
+    check(frame.surfaces.size()==5, "an ordinary eye-specific menu stays targetable");
+    q.size.width=r-l; q.layerFlags=0;
+    ui_auto::AddQuadSurface(frame,9,q,world);
+    check(frame.surfaces.size()==6, "opaque full-view panels are not controller overlays");
     return failures ? 1 : 0;
 }

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <vector>
 #include <string>
 #include <openxr/openxr.h>
@@ -24,6 +25,7 @@ using Microsoft::WRL::ComPtr;
 int main() {
     setvbuf(stdout,nullptr,_IONBF,0);
     if (!InitDirectRuntime()) return 1;
+    const bool stereoQuads=getenv("XR_UI_STEREO_QUADS")!=nullptr;
     const bool d12=getenv("XR_UI_BACKEND") && strcmp(getenv("XR_UI_BACKEND"),"d3d12")==0;
     const char* ext=d12?XR_KHR_D3D12_ENABLE_EXTENSION_NAME:XR_KHR_D3D11_ENABLE_EXTENSION_NAME;
     XrInstanceCreateInfo ci{XR_TYPE_INSTANCE_CREATE_INFO};
@@ -117,8 +119,24 @@ int main() {
             for(int e=0;e<2;++e){pv[i][e].type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;pv[i][e].pose=views[e].pose;pv[i][e].fov=views[e].fov;pv[i][e].subImage={chains[i?2:0],{{0,0},{128,128}},uint32_t(e)};}}
         XrCompositionLayerQuad q{XR_TYPE_COMPOSITION_LAYER_QUAD};q.space=space;q.eyeVisibility=XR_EYE_VISIBILITY_BOTH;q.pose={{0,0,0,1},{0,1.7f,-2}};q.size={6,6};q.subImage={chains[1],{{0,0},{128,128}},0};
         XrCompositionLayerQuad top=q;top.size={.12f,.12f};top.subImage.swapchain=chains[0];
-        const XrCompositionLayerBaseHeader* layers[]{(XrCompositionLayerBaseHeader*)&projection[0],(XrCompositionLayerBaseHeader*)&q,(XrCompositionLayerBaseHeader*)&projection[1],(XrCompositionLayerBaseHeader*)&top};
-        XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=frame.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;end.layerCount=4;end.layers=layers;CHECK(xrEndFrame(session,&end));
+        XrCompositionLayerQuad eyeImages[2]{};
+        for(int e=0;e<2;++e){
+            const auto& view=views[e]; auto& image=eyeImages[e];
+            image.type=XR_TYPE_COMPOSITION_LAYER_QUAD;image.space=space;
+            image.layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            image.eyeVisibility=e?XR_EYE_VISIBILITY_RIGHT:XR_EYE_VISIBILITY_LEFT;
+            image.subImage=pv[1][e].subImage;image.pose=view.pose;
+            const float l=std::tan(view.fov.angleLeft),r=std::tan(view.fov.angleRight);
+            const float b=std::tan(view.fov.angleDown),t=std::tan(view.fov.angleUp);
+            // Fixture head is identity; actual game regression also turns the head.
+            image.pose.position.x+=(l+r)*.5f;image.pose.position.y+=(t+b)*.5f;image.pose.position.z-=1;
+            image.size={r-l,t-b};
+        }
+        std::vector<const XrCompositionLayerBaseHeader*> layers{(XrCompositionLayerBaseHeader*)&projection[0],(XrCompositionLayerBaseHeader*)&q};
+        if(stereoQuads){for(auto& image:eyeImages)layers.push_back((XrCompositionLayerBaseHeader*)&image);}
+        else layers.push_back((XrCompositionLayerBaseHeader*)&projection[1]);
+        layers.push_back((XrCompositionLayerBaseHeader*)&top);
+        XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=frame.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;end.layerCount=(uint32_t)layers.size();end.layers=layers.data();CHECK(xrEndFrame(session,&end));
         if(f==5)printf("READY\n");
     }
     CHECK(xrEndSession(session));for(auto chain:chains)CHECK(xrDestroySwapchain(chain));CHECK(xrDestroySpace(space));CHECK(xrDestroySession(session));CHECK(xrDestroyInstance(instance));if(fenceEvent)CloseHandle(fenceEvent);return 0;
