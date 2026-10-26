@@ -123,10 +123,23 @@ def runtime_is_live() -> bool:
     log filename; PID reuse can in principle produce a false positive.
     """
     log = current_log_file()
-    if log is None:
+    pid = log_owner_pid(log) if log is not None else None
+    if pid is not None and _pid_alive(pid):
+        return True
+    # Diagnostic logging can be disabled or live outside an isolated exchange
+    # directory. A recent immutable capture identifies the actual runtime owner;
+    # require its live PID and a fresh heartbeat in this same directory as well.
+    age = status_age_seconds()
+    if age is None or not 0 <= age <= 2:
         return False
-    pid = log_owner_pid(log)
-    return _pid_alive(pid) if pid is not None else False
+    for capture in sorted(ui_automation.captures.values(), key=lambda c: c.get("created_at", 0), reverse=True):
+        if not 0 <= time.time() - capture.get("created_at", 0) <= 30:
+            continue
+        geometry = capture.get("geometry", {})
+        match = re.fullmatch(r"(\d+)-\d+-\d+", geometry.get("session_id", ""))
+        if geometry.get("supported") and match:
+            return _pid_alive(int(match.group(1)))
+    return False
 
 
 def status_age_seconds() -> Optional[float]:

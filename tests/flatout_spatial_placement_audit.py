@@ -70,7 +70,10 @@ def audit(source):
             'elevation_bounds':{t['name']:t['angular_bounds_deg']['elevation'] for t in analysis['targets']}})
     assert observed==expected,('Missing ordinary spatial menus',expected-observed)
     assert report_file.read_bytes()==original
-    return {'passed':bool(cases) and all(c['passed'] for c in cases),
+    heights=[h for c in cases for h in c['placement']['label_height_m']]
+    height_spread=max(heights)-min(heights)
+    return {'passed':bool(cases) and all(c['passed'] for c in cases) and height_spread<.002,
+        'cross_menu_label_height_spread_m':height_spread,
         'scope':'Main, Multiplayer, Extras and Career native label-layout/Back placement; no collider/ink inference',
         'source_report':str(report_file),'source_report_sha256':hashlib.sha256(original).hexdigest(),
         'runtime_access':False,'cases':cases,'source_unchanged':True}

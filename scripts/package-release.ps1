@@ -89,7 +89,7 @@ foreach ($file in $commonFiles) {
 
 $mcpDir = Join-Path $packageDir 'mcp-server'
 New-Item -ItemType Directory $mcpDir | Out-Null
-foreach ($file in @('openxr_simulator_mcp.py', 'pyproject.toml', 'README.md')) {
+foreach ($file in @('openxr_simulator_mcp.py', 'ui_targeting.py', 'ui_comfort.py', 'atomic_json_file.py', 'ui_comfort.md', 'pyproject.toml', 'requirements.txt', 'README.md')) {
     Copy-Item -LiteralPath (Join-Path $root "mcp-server\$file") -Destination $mcpDir
 }
 
@@ -138,7 +138,11 @@ try {
         'openxr_simulator-32.json',
         'Activate Simulator.cmd',
         'Deactivate Simulator.cmd',
-        'mcp-server\openxr_simulator_mcp.py'
+        'mcp-server\openxr_simulator_mcp.py',
+        'mcp-server\ui_targeting.py',
+        'mcp-server\ui_comfort.py',
+        'mcp-server\atomic_json_file.py',
+        'mcp-server\requirements.txt'
     )
     foreach ($file in $required) {
         if (-not (Test-Path -LiteralPath (Join-Path $verificationDir $file))) {
@@ -162,7 +166,12 @@ try {
 }
 finally {
     if (Test-Path -LiteralPath $verificationDir) {
-        Remove-Item -LiteralPath $verificationDir -Recurse -Force
+        $resolvedVerification = [IO.Path]::GetFullPath($verificationDir)
+        $resolvedOutput = [IO.Path]::GetFullPath($output).TrimEnd('\') + '\'
+        if (-not $resolvedVerification.StartsWith($resolvedOutput, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Verification directory must remain inside the release output directory'
+        }
+        Remove-Item -LiteralPath $resolvedVerification -Recurse -Force
     }
 }
 

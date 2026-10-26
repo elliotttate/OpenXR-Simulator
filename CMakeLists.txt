@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(OpenXR-Simulator VERSION 1.0.0 LANGUAGES CXX)
+project(OpenXR-Simulator VERSION 1.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -133,6 +133,19 @@ if(BUILD_TESTING)
             add_test(NAME ui_e2e_secondary_${hand} COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/ui_automation_e2e.py
                 --probe $<TARGET_FILE:xr_ui_probe> --hand ${hand} --activation-button secondary --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
             set_tests_properties(ui_e2e_secondary_${hand} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+        endforeach()
+        foreach(backend d3d11 d3d12)
+            foreach(mode projection stereo_quads)
+                set(layer_args)
+                if(mode STREQUAL "stereo_quads")
+                    list(APPEND layer_args --stereo-quads)
+                endif()
+                add_test(NAME composition_order_${backend}_${mode}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/composition_layer_order_e2e.py
+                        --probe $<TARGET_FILE:xr_layer_order> --runtime $<TARGET_FILE:openxr_simulator>
+                        --backend ${backend} ${layer_args} --evidence ${CMAKE_BINARY_DIR}/layer-evidence)
+                set_tests_properties(composition_order_${backend}_${mode} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+            endforeach()
         endforeach()
     endif()
     add_executable(action_state_tests tests/action_state_tests.cpp)

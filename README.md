@@ -10,6 +10,12 @@ A lightweight OpenXR runtime that enables VR applications to run in a desktop wi
 
 ## 🎯 Features
 
+- **OpenXR Correctness** - Validated frame and swapchain lifecycles, unique swapchain handles, relative-space transforms, and stable action snapshots
+- **Cylinder Layers** - Curved UI layers render alongside projection and quad layers in submission order
+- **Godot Compatibility** - VIEW-space head tracking, array-texture readback, aligned controller yaw, and a static C++ runtime
+- **Input Polling** - Choose preview-only, application-foreground, or background input; the preview has its own responsive UI thread
+- **UI Automation and Diagnostics** - Screenshot-based controller targeting, spatial-comfort tools, D3D11 composed-frame bursts, and per-eye freshness metadata
+- **Windows Packages** - Portable x64 and x86 runtimes with automated build, test, and release packaging
 - **Multi-API Support** - Supports D3D11, D3D12, Vulkan and OpenGL graphics backends
 - **Desktop VR Preview** - Run VR applications in a resizable desktop window with side-by-side stereo view
 - **Live XR Performance** - Title-bar FPS and frametime are measured from stereo `xrEndFrame` submissions, not window repaints; press F3 for rolling p50/p95 frametimes
@@ -55,10 +61,22 @@ Once registered, any OpenXR application will automatically use the simulator:
    - **Mouse**: Look around (hold right-click)
    - **WASD**: Move forward/backward/strafe
    - **Q/E**: Move up/down
+   - **IJKL**: Left controller thumbstick for application locomotion
+   - **Arrow Keys**: Right controller thumbstick
+   - **M**: Toggle automatic controller animation
    - **Shift**: Hold to move faster
    - **, / .**: Slower/faster movement
    - **ESC**: Release mouse capture
    - **F3**: Show detailed XR p50/p95 frametime statistics in the title bar
+
+### Godot
+
+Use Godot's Compatibility (OpenGL3) renderer for the Godot compatibility path.
+Enable OpenXR in the project and keep its XR startup node in the main scene.
+IJKL drives the left thumbstick, so XRTools locomotion can apply its normal
+collision rules; WASD moves the simulated head directly. VIEW reference spaces
+track the head, stereo array textures honor each submitted slice, and the static
+C++ runtime avoids depending on the host application's MSVCP140.dll version.
 
 ### Uninstallation
 
@@ -153,7 +171,8 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 - ✅ D3D11 graphics binding (`XR_KHR_D3D11_enable`)
 - ✅ D3D12 graphics binding (`XR_KHR_D3D12_enable`)
 - ✅ Vulkan graphics binding (`XR_KHR_vulkan_enable` and `XR_KHR_vulkan_enable2`)
-- ✅ OpenGL graphics binding (`XR_KHR_opengl_enable`)
+- ✅ OpenGL graphics binding (`XR_KHR_opengl_enable`) and stereo array swapchains
+- ✅ Cylinder composition layers (`XR_KHR_composition_layer_cylinder`)
 - ✅ Win32 time conversion (`XR_KHR_win32_convert_performance_counter_time`)
 - ✅ Multiple swapchain formats (sRGB, UNORM, HDR, typeless, depth)
 - ✅ Mutable format swapchains (typeless backing for sRGB/non-sRGB views)

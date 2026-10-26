@@ -7,13 +7,14 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import uuid
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from ui_automation_e2e import ROOT, call
 
 
 async def run(args):
-    out = args.evidence.resolve()
+    out = args.evidence.resolve()/uuid.uuid4().hex
     out.mkdir(parents=True, exist_ok=False)
     (out/'settings.json').write_text(json.dumps(dict(headset_profile='quest3', layout='side_by_side',
         view_mode='both', asymmetric_fov=True, zoom_mode='fill', window_width=1024, window_height=512, preview_fps=-1)))
@@ -60,7 +61,8 @@ async def run(args):
         finally:
             (out/'result.json').write_text(json.dumps(result,indent=2))
             (out/'layer_probe_stop').touch()
-            proc.wait(timeout=15)
+            code=proc.wait(timeout=15)
+            assert code==0, f"Composition probe failed ({code}); see {out/'probe.log'}"
 
 
 if __name__=='__main__':

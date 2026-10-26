@@ -139,5 +139,5 @@ int main() {
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=frame.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;end.layerCount=(uint32_t)layers.size();end.layers=layers.data();CHECK(xrEndFrame(session,&end));
         if(f==5)printf("READY\n");
     }
-    CHECK(xrEndSession(session));for(auto chain:chains)CHECK(xrDestroySwapchain(chain));CHECK(xrDestroySpace(space));CHECK(xrDestroySession(session));CHECK(xrDestroyInstance(instance));if(fenceEvent)CloseHandle(fenceEvent);return 0;
+    CHECK(xrRequestExitSession(session)); CHECK(xrEndSession(session));for(auto chain:chains)CHECK(xrDestroySwapchain(chain));CHECK(xrDestroySpace(space));CHECK(xrDestroySession(session));CHECK(xrDestroyInstance(instance));if(fenceEvent)CloseHandle(fenceEvent);return 0;
 }

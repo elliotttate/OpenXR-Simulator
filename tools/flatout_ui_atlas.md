@@ -200,3 +200,21 @@ to describe the required turn. A placement advisory alone is not a defect in
 that workspace. Ordinary menus retain the forward-gaze review policy.
 See `mcp-server/ui_comfort.md` for sources and profile applicability. Integration
 contracts run with `python -m unittest discover -s tests -p test_flatout_atlas_comfort.py -v`.
+
+Compare immutable reports with `tools/flatout_ui_consistency_audit.py --report
+<older-report-directory> --report <newer-report-directory> --output <new-directory>`.
+Later cases replace earlier ones. The report measures perpendicular plane depth,
+eye-relative height and physical control dimensions, including Back. It preserves
+native images and records source hashes. It does not infer visual styling or
+certify states absent from the source reports.
+
+Ordinary spatial navigation (Main, Multiplayer, Extras and Career hub) shares
+a 3 m rest plane, the same type scale and a column centre 1 m below the eye height
+captured at entry. The complete column includes Back. The retained plane is upright
+and world-locked; head movement must not continuously recenter it. Reading screens
+use their wider reading surface. Showroom/car-clearance layouts and livery are
+separate task families, whose exceptions need an explicit reason.
+`tests/flatout_spatial_placement_audit.py` checks saved native geometry against that
+policy. `tests/flatout_spatial_consistency_e2e.py` checks seated/standing entry,
+both-eye coverage, world locking and both-hand physical hover on a disposable
+owned-car fixture. Wreck Run remains excluded.

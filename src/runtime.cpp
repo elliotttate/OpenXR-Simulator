@@ -162,9 +162,13 @@ static const bool g_logVerbose = []() {
 static void EnsureLogFile() {
     if (g_LogFile) return;
     char base[MAX_PATH]{};
-    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
     char path[MAX_PATH]{};
-    if (len > 0 && len < sizeof(base)) {
+    const DWORD overrideLen = GetEnvironmentVariableA("SIMXR_DATA_DIR", base, (DWORD)sizeof(base));
+    if (overrideLen > 0 && overrideLen < sizeof(base)) {
+        CreateDirectoryA(base, nullptr);
+        snprintf(path, sizeof(path), "%s\\openxr_simulator.%lu.log", base, GetCurrentProcessId());
+    } else if (const DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
+               len > 0 && len < sizeof(base)) {
         snprintf(path, sizeof(path), "%s\\OpenXR-Simulator", base);
         CreateDirectoryA(path, nullptr);
         snprintf(path, sizeof(path), "%s\\OpenXR-Simulator\\openxr_simulator.%lu.log", base, GetCurrentProcessId());
@@ -919,9 +923,9 @@ static void GetControllerPose(const ControllerState& ctrl, XrPosef* outPose) {
     // Simple rotation of offset by head yaw
     float cosY = cosf(g_headYaw);
     float sinY = sinf(g_headYaw);
-    outPose->position.x = g_headPos.x + ctrl.posOffset.x * cosY - ctrl.posOffset.z * sinY;
+    outPose->position.x = g_headPos.x + ctrl.posOffset.x * cosY + ctrl.posOffset.z * sinY;
     outPose->position.y = g_headPos.y + ctrl.posOffset.y;
-    outPose->position.z = g_headPos.z + ctrl.posOffset.x * sinY + ctrl.posOffset.z * cosY;
+    outPose->position.z = g_headPos.z - ctrl.posOffset.x * sinY + ctrl.posOffset.z * cosY;
 }
 
 // Helper function to create quaternion from yaw and pitch
@@ -3247,7 +3251,7 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
 static XrResult XRAPI_PTR xrGetInstanceProperties_runtime(XrInstance instance, XrInstanceProperties* props) {
     if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     if (!props || props->type != XR_TYPE_INSTANCE_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
-    props->runtimeVersion = kRuntimeApiVersion;
+    props->runtimeVersion = XR_MAKE_VERSION(1, 6, 0);
     strncpy(props->runtimeName, "OpenXR Simulator Runtime", XR_MAX_RUNTIME_NAME_SIZE - 1);
     props->runtimeName[XR_MAX_RUNTIME_NAME_SIZE - 1] = '\0';
     Log("[SimXR] xrGetInstanceProperties: returning OpenXR Simulator Runtime");
@@ -4021,7 +4025,7 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession session, const XrS
             Logf("[SimXR] Created GL texture[%u]: %u (format=0x%X, valid=%d)", i, tex, glInternalFormat, isValid);
 
             // DEBUG: Immediately read back the texture to verify it has the correct content
-            if (!isDepthFormat && EnsureGLFramebufferFuncs()) {
+            if (chain.arraySize <= 1 && !isDepthFormat && EnsureGLFramebufferFuncs()) {
                 GLuint verifyFBO = 0;
                 g_glGenFramebuffers(1, &verifyFBO);
                 g_glBindFramebuffer(GL_FRAMEBUFFER, verifyFBO);
@@ -4278,7 +4282,7 @@ static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const 
         // Verbose-only: the probe below runs glFinish plus a full-texture readback,
         // a periodic multi-millisecond stall no ordinary session should pay for.
         if (g_logVerbose &&
-            ch.backend == rt::Swapchain::Backend::OpenGL && !ch.imagesGL.empty() && ch.lastReleased < ch.imagesGL.size()) {
+            ch.backend == rt::Swapchain::Backend::OpenGL && ch.arraySize <= 1 && !ch.imagesGL.empty() && ch.lastReleased < ch.imagesGL.size()) {
             GLuint glTex = ch.imagesGL[ch.lastReleased];
 
             // Check and log current GL context
@@ -4585,13 +4589,13 @@ static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) {
         std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
         if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
         wasStopping = rt::g_session.state == XR_SESSION_STATE_STOPPING;
+        if (!wasStopping) return XR_ERROR_SESSION_NOT_STOPPING;
         rt::g_session.running = false;
         exitRequested = rt::g_session.exitRequested;
         rt::g_session.exitRequested = false;
         rt::g_session.frameLifecycle.Reset();
     }
     rt::g_session.frameCondition.notify_all();
-    if (!wasStopping) return XR_ERROR_SESSION_NOT_STOPPING;
     ReleaseUiPointers("Session ended");
     rt::PushState(s, XR_SESSION_STATE_IDLE);
     if (exitRequested) rt::PushState(s, XR_SESSION_STATE_EXITING);
@@ -8354,6 +8358,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
 
     bool compositionStarted = false;
     bool projectionComposed = false;
+    bool primaryProjectionRecorded = false;
     LONGLONG projectionTicks = 0;
     LONGLONG overlayTicks = 0;
 
@@ -8385,9 +8390,17 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
             case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
                 const auto* projection =
                     reinterpret_cast<const XrCompositionLayerProjection*>(base);
-                RecordProjectionSubmission(*projection, (uint64_t)frameCount);
+                if (!primaryProjectionRecorded) {
+                    RecordProjectionSubmission(*projection, (uint64_t)frameCount);
+                    primaryProjectionRecorded = true;
+                }
                 if (composition_render::HasPixels(*projection)) {
-                    presentProjection(rt::g_session, *projection, true, !compositionStarted);
+                    if (!compositionStarted && rt::BlendForLayerFlags(projection->layerFlags)==rt::LayerBlend::Opaque)
+                        presentProjection(rt::g_session, *projection, true, true);
+                    else {
+                        if (!compositionStarted) prepareOverlayCanvas(true);
+                        renderProjectionOverlay(rt::g_session, *projection);
+                    }
                     compositionStarted = true;
                     projectionComposed = true;
                 }
