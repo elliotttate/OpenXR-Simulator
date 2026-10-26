@@ -716,3 +716,27 @@ Orbit must expose only Return to selection, keep that action at a level reading
 position in both eyes after head movement, and return without changing the
 selected item. Use `--orbit-only` from Cars or Drivers to check their same return
 path. The test navigates previews without buying or equipping items.
+
+### Spatial menu leveling and upgrade previews
+
+From Career's spatial hub, verify the drawn row positions, level basis and real
+hand hovers, while retaining the authored position, yaw and nonuniform scale:
+
+```powershell
+python tests/flatout_spatial_level_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --menu FLATOUT --reference-layout <prior-layout-json>
+```
+
+Omit the reference for a standalone world-up check. The test saves `layout.json`
+before asserting, so a failing baseline can supply the reference for the fixed
+build. Use the same scene and menu state when comparing authored placement.
+
+From Career > Garage > Upgrades, check stable hover previews and dialog recovery:
+
+```powershell
+python tests/flatout_upgrade_ui_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --hand left
+```
+
+Hovering different parts must change their rendered stat gauges without moving
+the committed selection or opening a dialog. Activating a tile opens its existing
+purchase or insufficient-cash dialog; the test cancels a purchase or acknowledges
+the cash error, checks padding and exclusive modal input, and never buys a part.
