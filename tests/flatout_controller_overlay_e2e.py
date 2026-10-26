@@ -23,7 +23,7 @@ from flatout_livery_e2e import quaternion_matrix
 
 
 def game(pid, method, params=None):
-    assert method in ('vr.controller_overlay', 'vr.get_state', 'menu.get_state', 'game.errors', 'renderdoc.capture')
+    assert method in ('vr.controller_overlay', 'vr.get_state', 'menu.get_state', 'options.get_state', 'game.errors', 'renderdoc.capture')
     payload = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params or {}}).encode()
     with open(r'\\.\pipe\FlatoutMCP_'+str(pid), 'r+b', buffering=0) as pipe:
         pipe.write(struct.pack('<I',len(payload))+payload)
@@ -68,7 +68,7 @@ async def run(args):
     original = game(args.pid,'vr.controller_overlay')
     assert original['available'], 'Build has no controller overlay resources'
     assert original.get('composition')=='stereo_quads', 'Controller overlay must use per-eye quad composition on SteamVR'
-    assert game(args.pid,'menu.get_state')['current_menu']=='OPTIONS', 'Start in Options'
+    assert game(args.pid,'options.get_state')['open'], 'Start in front-end or in-race Options'
     env = {**os.environ,'SIMXR_DATA_DIR':str(args.data_dir.resolve())}
     params = StdioServerParameters(command=sys.executable,args=[str(ROOT/'mcp-server/openxr_simulator_mcp.py')],env=env)
     restore = []
