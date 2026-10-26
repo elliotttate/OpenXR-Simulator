@@ -525,6 +525,10 @@ python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory>
 python tests/flatout_challenge_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --preview-round-trip --hand left
 # From a page containing a locked Challenge card: verify stable hover bounds and inert held/retried clicks.
 python tests/flatout_challenge_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --locked-only --hand left
+# From a populated Steam leaderboard at rank 1: check separate row bands, grey Up and one held/retried page step each way.
+python tests/flatout_leaderboard_scroll_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --navigation-only
+# From a populated Friends list: verify the list-position range separately from players' global ranks.
+python tests/flatout_leaderboard_scroll_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --layout-only
 # From class selection or a Career grid/preview: check standing head-height placement, both eyes and world locking.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --reading-comfort-only
 # From the grid with an unlocked cup: verify readable placement, Start/Back, blank-area safety and a confirmed race start.
