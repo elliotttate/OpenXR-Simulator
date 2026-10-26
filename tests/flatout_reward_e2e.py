@@ -58,16 +58,32 @@ class Reward(Frontend):
             self.cases.append({'case':'reward-blank-area-held-click-and-retry-inert','passed':True})
             await self.tool('capture_screenshot',{'eye':'both','max_width':2048},'reward-ready-both-eyes')
         before,hovered,aim=await self.hover('helper.Validate.0')
-        args={**aim,'hold_frames':1,'timeout':30,'command_id':uuid.uuid4().hex}
-        receipt=await self.tool('click_ui_at',args,'reward-continue-once')
+        args={**aim,'hold_frames':self.args.hold_frames,'timeout':30,'command_id':uuid.uuid4().hex}
+        samples=[]
+        observing=True
+        async def observe_outro():
+            while observing:
+                current=await self.query('ui.reward_state')
+                native=await self.query('vr.targets')
+                samples.append({'state':current,'clicks':native['clicks'],'targets':native['targets']})
+                await asyncio.sleep(.005)
+        observer=asyncio.create_task(observe_outro())
+        try:
+            receipt=await self.tool('click_ui_at',args,'reward-continue-once')
+        finally:
+            observing=False
+            await observer
         assert receipt['status']=='input_delivered',receipt
         closing=await self.query('ui.reward_state')
         native=await self.query('vr.targets')
         assert native['clicks']==before['clicks']+1,(before,native)
-        if closing['open']:
-            stale=[t for t in native['targets'] if t['name'].startswith('helper.Validate.')]
-            self.cases.append({'case':'closing-reward-retires-continue','passed':not stale,'state':closing,'targets':native['targets']})
-            assert not stale,('Continue remains active during reward dismissal',native)
+        outro=[s for s in samples if s['state']['open'] and s['clicks']==before['clicks']+1]
+        # The first observation can straddle the press frame; the next sampled
+        # native update must already have retired the previous helper target.
+        assert len(outro)>=2,('No observable native outro interval',samples)
+        stale=[s for s in outro[1:] if any(t['name'].startswith('helper.Validate.') for t in s['targets'])]
+        self.cases.append({'case':'closing-reward-retires-continue','passed':not stale,'samples':outro})
+        assert not stale,('Continue remains active during reward dismissal',stale)
         retry=await self.tool('click_ui_at',args,'reward-continue-retry')
         assert retry['delivery']['sync_id']==receipt['delivery']['sync_id']
         assert (await self.query('vr.targets'))['clicks']==native['clicks'],'Retry activated Continue twice'
@@ -88,7 +104,7 @@ class Reward(Frontend):
 
 async def run(args):
     args.evidence.mkdir(parents=True,exist_ok=False)
-    report={'passed':False,'pid':args.pid,'hand':args.hand,'closing_only':args.closing_only}
+    report={'passed':False,'pid':args.pid,'hand':args.hand,'closing_only':args.closing_only,'hold_frames':args.hold_frames}
     params=StdioServerParameters(command=sys.executable,args=[str(ROOT/'mcp-server/openxr_simulator_mcp.py')],env={**os.environ,'SIMXR_DATA_DIR':str(args.data_dir.resolve())})
     async with stdio_client(params) as streams:
         async with ClientSession(*streams) as session:
@@ -113,5 +129,6 @@ if __name__=='__main__':
     p.add_argument('--pid',type=int,required=True);p.add_argument('--data-dir',type=Path,required=True)
     p.add_argument('--evidence',type=Path,required=True);p.add_argument('--hand',choices=('left','right'),default='right')
     p.add_argument('--expected-credits',type=int,required=True)
+    p.add_argument('--hold-frames',type=int,default=1)
     p.add_argument('--closing-only',action='store_true')
     asyncio.run(run(p.parse_args()))
