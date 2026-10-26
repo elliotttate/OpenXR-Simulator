@@ -545,6 +545,9 @@ python tests/flatout_reward_e2e.py --pid <game-pid> --data-dir <ipc-directory> -
 # Stage another preview, then append --hand left --hold-frames 45 to check a held press with the other ray.
 # Preview car/driver artwork with ui.preview_reward parameters {"kind":"car","index":0} or {"kind":"driver","index":0}.
 # These use installed content indices and display-only descriptors; append --reward-kind car or --reward-kind driver to assert the actual artwork.
+# For a transition test, stage {"sequence":[{"kind":"money"},{"kind":"car","index":0},{"kind":"driver","index":0}]}.
+# The sequence is validated before queueing and shown in request order (1–8 entries). ui.reward_state reports its native presentation id and intro/ready/outro/closed phase.
+# Append --sequence money,car,driver to keep the trigger held over each following ready Continue button, then verify release and a fresh press.
 # From the Career hub with an active isolated test cup: cancel abandonment, then confirm it.
 python tests/flatout_frontend_e2e.py --pid <game-pid> --data-dir <ipc-directory> --evidence <new-output-directory> --career-cancel-only
 # From class selection with the isolated Derby car: preserve scenery during both class warnings, then open filtered cars after OK.

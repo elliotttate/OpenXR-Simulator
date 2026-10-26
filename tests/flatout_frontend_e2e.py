@@ -480,6 +480,26 @@ class Frontend:
         assert (await self.query("options.get_state"))["open"],"Start in Options"
         return await self.reading_comfort("options")
 
+    async def observed_head_pose(self, label, pose):
+        # set_head_pose queues an asynchronous command. Observe its rendered
+        # pose before projecting another ray; a fixed sleep can capture the old view.
+        response=await self.session.call_tool("set_head_pose",pose)
+        assert not response.isError,response
+        yaw,pitch,roll=(math.radians(pose.get(k,0)) for k in ("yaw_deg","pitch_deg","roll_deg"))
+        cy,sy=math.cos(yaw),math.sin(yaw);cp,sp=math.cos(pitch),math.sin(pitch);cr,sr=math.cos(roll),math.sin(roll)
+        expected=np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]])@np.array([[1,0,0],[0,cp,-sp],[0,sp,cp]])@np.array([[cr,-sr,0],[sr,cr,0],[0,0,1]])
+        deadline=asyncio.get_running_loop().time()+6
+        attempt=0
+        while asyncio.get_running_loop().time()<deadline:
+            capture=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},label+"-"+str(attempt))
+            self.last_capture=capture
+            actual=capture["geometry"]["head"]
+            if np.allclose(actual["position"],[pose[k] for k in ("x","y","z")],atol=1e-5) and np.allclose(quaternion_matrix(actual["orientation"]),expected,atol=1e-5):
+                return capture
+            attempt+=1
+            await asyncio.sleep(.05)
+        raise AssertionError(("Queued head pose did not reach the rendered frame",pose,actual))
+
     async def reading_comfort(self, label, hover_target=None):
         before=await self.query("vr.targets")
         capture=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},label+"-head-height")
@@ -512,18 +532,13 @@ class Frontend:
                         assert index*w/2<=px<(index+1)*w/2 and 0<=py<h,(label+" control clipped in an eye",eye["eye"],target,px,py)
         visible(capture,surface)
         try:
-            response=await self.session.call_tool("set_head_pose",{"x":.1,"y":head["position"][1]+.12,"z":.05,"yaw_deg":6,"pitch_deg":-4,"roll_deg":2})
-            assert not response.isError
-            await asyncio.sleep(.3)
-            moved=await self.tool("capture_screenshot",{"eye":"both","max_width":2048},label+"-head-moved")
-            self.last_capture=moved
+            moved=await self.observed_head_pose(label+"-head-moved",{"x":.1,"y":head["position"][1]+.12,"z":.05,"yaw_deg":6,"pitch_deg":-4,"roll_deg":2})
             current=surface_for(moved,await self.query("vr.targets"))
             assert np.allclose(current["pose"]["position"],surface["pose"]["position"],atol=1e-4),label+" followed head translation"
             assert np.allclose(current["pose"]["orientation"],surface["pose"]["orientation"],atol=1e-4),label+" followed head rotation"
             visible(moved,current)
         finally:
-            await self.session.call_tool("set_head_pose",{"x":head["position"][0],"y":head["position"][1],"z":head["position"][2],"yaw_deg":0,"pitch_deg":0,"roll_deg":0})
-            await asyncio.sleep(.3)
+            await self.observed_head_pose(label+"-head-restored",{"x":head["position"][0],"y":head["position"][1],"z":head["position"][2],"yaw_deg":0,"pitch_deg":0,"roll_deg":0})
         action=hover_target or next(t["name"] for t in before["targets"] if t["name"].startswith("helper.Cancel."))
         await self.hover(action)
         self.cases.append({"case":label+"-world-locked-both-eye-controls-and-ray-hover","passed":True,"hand":self.args.hand})
