@@ -2,6 +2,7 @@
 // MCP Integration - Screenshot capture and status reporting for OpenXR Simulator
 #pragma once
 #include "submission_cadence.h"
+#include "latest_value_worker.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -497,27 +498,31 @@ inline void CaptureScreenshotGL(const uint8_t* leftPixels, const uint8_t* rightP
     g_screenshotRequested = false;
 }
 
-// Write frame status JSON for MCP
-inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t height,
-                              const char* format, const char* sessionState,
-                              float headYaw, float headPitch, float headRoll,
-                              float headX, float headY, float headZ,
-                              const perf::SubmissionCadenceSnapshot& cadence) {
-    // Rate-limited by wall clock, not by frame count: this is a status file an MCP client
-    // polls, so twice a second is as useful as ninety times a second, and each write is a
-    // create/format/flush that also trips the directory watch RefreshCommandsDue uses.
-    static ULONGLONG lastWriteMs = 0;
-    const ULONGLONG nowMs = GetTickCount64();
-    if (lastWriteMs != 0 && nowMs - lastWriteMs < 500) return;
-    lastWriteMs = nowMs;
-
-    std::string path = GetSimulatorDataPath() + "\\runtime_status.json";
+// A bounded worker owns status-file I/O. The frame thread only snapshots state;
+// publishing a complete temporary file also prevents readers seeing partial JSON.
+struct FrameStatusSnapshot {
+    uint32_t frameCount{}, width{}, height{};
+    std::string format, sessionState;
+    float headYaw{}, headPitch{}, headRoll{}, headX{}, headY{}, headZ{};
+    perf::SubmissionCadenceSnapshot cadence;
+    SYSTEMTIME timestamp{};
+};
+inline perf::LatestValueWorker<FrameStatusSnapshot> g_statusWriter;
+inline ULONGLONG g_lastStatusWriteMs = 0;
+inline void PersistFrameStatus(const FrameStatusSnapshot& snapshot) {
+    const auto frameCount = snapshot.frameCount, width = snapshot.width, height = snapshot.height;
+    const auto* format = snapshot.format.c_str();
+    const auto* sessionState = snapshot.sessionState.c_str();
+    const auto headYaw = snapshot.headYaw, headPitch = snapshot.headPitch, headRoll = snapshot.headRoll;
+    const auto headX = snapshot.headX, headY = snapshot.headY, headZ = snapshot.headZ;
+    const auto& cadence = snapshot.cadence;
+    const std::string path = GetSimulatorDataPath() + "\\runtime_status.json";
+    const std::string temporary = path + "." + std::to_string(GetCurrentProcessId()) + ".tmp";
     FILE* file = nullptr;
-    if (fopen_s(&file, path.c_str(), "w") != 0 || !file) return;
+    if (fopen_s(&file, temporary.c_str(), "w") != 0 || !file) return;
 
     // Get current timestamp
-    SYSTEMTIME st;
-    GetLocalTime(&st);
+    const SYSTEMTIME& st = snapshot.timestamp;
 
     fprintf(file, "{\n");
     fprintf(file, "  \"timestamp\": \"%04d-%02d-%02dT%02d:%02d:%02d\",\n",
@@ -543,7 +548,31 @@ inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t heigh
     fprintf(file, "    \"roll\": %.3f\n", headRoll);
     fprintf(file, "  }\n");
     fprintf(file, "}\n");
-    fclose(file);
+    const bool written = ferror(file) == 0;
+    const bool closed = fclose(file) == 0;
+    if (written && closed) MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+
+inline void StartStatusWriter() {
+    g_lastStatusWriteMs = 0;
+    g_statusWriter.Start(PersistFrameStatus);
+}
+inline void StopStatusWriter() { g_statusWriter.Stop(); }
+
+// Wall-clock throttling is unchanged; slow storage replaces one pending snapshot
+// rather than blocking xrEndFrame or accumulating an unbounded queue.
+inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t height,
+                              const char* format, const char* sessionState,
+                              float headYaw, float headPitch, float headRoll,
+                              float headX, float headY, float headZ,
+                              const perf::SubmissionCadenceSnapshot& cadence) {
+    const ULONGLONG nowMs = GetTickCount64();
+    if (g_lastStatusWriteMs != 0 && nowMs - g_lastStatusWriteMs < 500) return;
+    g_lastStatusWriteMs = nowMs;
+    FrameStatusSnapshot snapshot{frameCount, width, height, format ? format : "unknown",
+        sessionState ? sessionState : "unknown", headYaw, headPitch, headRoll, headX, headY, headZ, cadence};
+    GetLocalTime(&snapshot.timestamp);
+    g_statusWriter.Submit(std::move(snapshot));
 }
 
 // Get session state name

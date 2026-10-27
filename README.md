@@ -332,6 +332,23 @@ reg query "HKLM\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit"
 
 ### Performance issues
 
+Status reporting keeps one in-flight write and the newest pending snapshot on a
+background worker. The frame thread does not open, flush, or replace the status
+file. Readers continue to receive complete `runtime_status.json` snapshots at up
+to two updates per second; slow storage can delay a snapshot. Instance teardown
+drains the pending snapshot and joins the worker before the runtime can unload.
+
+For submission-stall diagnosis, set `SIMXR_END_FRAME_TRACE=1` before launching
+the application. The runtime retains the newest 256 submissions taking at least
+5 ms, with QPC boundaries for validation, locking, composition, status writes,
+command handling, readback, Present, title updates, logging, and lifecycle work.
+Normal session teardown writes `end_frame_trace.jsonl` in the simulator data
+directory (`SIMXR_DATA_DIR` when set). The trace performs no per-frame disk writes
+and is disabled by default. Its metadata includes the QPC frequency and phase
+names; differences between adjacent boundaries give phase durations. Invalid or
+reentrant early returns are not retained. Shutdown trace export is outside the
+recorded submission intervals.
+
 - Turn **Tools → Mirror Rate** down, or **Off**. Mirroring the eyes to the window is
   the only per-frame work the runtime does that scales with resolution.
 - Leave `SIMXR_VERBOSE` unset. Setting it makes the runtime log every frame, and each

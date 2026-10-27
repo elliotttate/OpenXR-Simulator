@@ -3183,6 +3183,11 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
         enabledExtensions.emplace_back(requested);
         Logf("[SimXR]   enabledExt[%u]=%s", i, requested);
     }
+    try { mcp::StartStatusWriter(); }
+    catch (const std::system_error& error) {
+        Logf("[SimXR] Status worker creation failed: %s", error.what());
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
     rt::g_instance.enabledExtensions = std::move(enabledExtensions);
     // A new instance starts with no requirements calls on record.
     rt::g_instance.d3d11RequirementsCalled = false;
@@ -3208,6 +3213,8 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
         if (rt::g_session.handle != XR_NULL_HANDLE) {
             xrDestroySession_runtime(rt::g_session.handle);
         }
+        // No runtime locks held while joining the I/O worker; it must finish before DLL unload.
+        mcp::StopStatusWriter();
         rt::g_instance = {};
         rt::g_actionSets.clear();
         rt::g_attachedActionSets.clear();
@@ -3561,6 +3568,49 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
 }
 
 
+// Opt-in submission attribution: retain bounded slow-frame samples in memory.
+// Export only at session teardown, never from the measured submission path.
+namespace end_frame_trace {
+constexpr size_t PointCount = 13;
+struct Sample { LONGLONG ticks[PointCount]{}; uint64_t frame{}; bool preview{}; };
+static Sample samples[256]{};
+static uint64_t retainedCount = 0;
+static bool Enabled() {
+    static const bool enabled = []() { char value[8]{}; return GetEnvironmentVariableA("SIMXR_END_FRAME_TRACE", value, sizeof(value)) == 1 && value[0] == '1'; }();
+    return enabled;
+}
+static LONGLONG Frequency() {
+    static const LONGLONG frequency = []() { LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); return value.QuadPart; }();
+    return frequency;
+}
+struct Capture {
+    Sample sample{};
+    bool enabled = Enabled();
+    void Mark(size_t point) { if (enabled) { LARGE_INTEGER now{}; QueryPerformanceCounter(&now); sample.ticks[point] = now.QuadPart; } }
+    void Keep(uint64_t frame, bool preview) {
+        if (!enabled || (sample.ticks[PointCount-1] - sample.ticks[0]) * 1000.0 / Frequency() < 5.0) return;
+        sample.frame = frame; sample.preview = preview;
+        samples[retainedCount++ % 256] = sample;
+    }
+};
+static void Dump() {
+    if (!Enabled()) return;
+    const std::string path = mcp::GetSimulatorDataPath() + "\\end_frame_trace.jsonl";
+    FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "w") != 0 || !file) return;
+    fprintf(file, "{\"schema\":1,\"qpc_frequency\":%lld,\"slow_frames_observed\":%llu,\"capacity\":256,\"threshold_ms\":5,\"phase_names\":[\"validation\",\"control_lock\",\"prepare\",\"layers\",\"paint\",\"status_write\",\"command_dump\",\"readback\",\"present\",\"title\",\"aggregate_log\",\"lifecycle\"]}\n", Frequency(), static_cast<unsigned long long>(retainedCount));
+    const uint64_t first = retainedCount > 256 ? retainedCount - 256 : 0;
+    for (uint64_t i = first; i < retainedCount; ++i) {
+        const auto& sample = samples[i % 256];
+        fprintf(file, "{\"frame\":%llu,\"preview\":%s,\"qpc\":[", static_cast<unsigned long long>(sample.frame), sample.preview ? "true" : "false");
+        for (size_t point = 0; point < PointCount; ++point) fprintf(file, "%s%lld", point ? "," : "", sample.ticks[point]);
+        fprintf(file, "]}\n");
+    }
+    fclose(file);
+    retainedCount = 0;
+}
+}
+
 static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     Logf("[SimXR] xrDestroySession called (handle=%llu)", (unsigned long long)s);
@@ -3569,6 +3619,7 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
              (unsigned long long)rt::g_session.handle);
         return XR_ERROR_HANDLE_INVALID;
     }
+    end_frame_trace::Dump();
     { std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex); rt::ResetControllerInputHistory(); }
     ReleaseUiPointers("Session ended");
     {
@@ -4623,6 +4674,7 @@ static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) {
         rt::g_session.frameLifecycle.Reset();
     }
     rt::g_session.frameCondition.notify_all();
+    end_frame_trace::Dump();
     { std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex); rt::ResetControllerInputHistory(); }
     ReleaseUiPointers("Session ended");
     rt::PushState(s, XR_SESSION_STATE_IDLE);
@@ -8230,6 +8282,8 @@ static void RecordProjectionSubmission(const XrCompositionLayerProjection& proje
 }
 
 static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEndInfo* info) {
+    end_frame_trace::Capture trace;
+    trace.Mark(0);
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (!info || info->type != XR_TYPE_FRAME_END_INFO) return XR_ERROR_VALIDATION_FAILURE;
     {
@@ -8254,9 +8308,11 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         return XR_SUCCESS;
     }
 
+    trace.Mark(1);
     LARGE_INTEGER endFrameStart{};
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     QueryPerformanceCounter(&endFrameStart);
+    trace.Mark(2);
 
     static int frameCount = 0;
     frameCount++;
@@ -8379,6 +8435,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         }
     };
 
+    trace.Mark(3);
     // OpenXR uses a painter's algorithm: each layer is composited over all earlier array
     // entries. Keep one traversal so a projection submitted after a quad actually remains
     // above that quad, and defer the desktop Present until the traversal is complete.
@@ -8439,6 +8496,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     if (!compositionStarted) prepareOverlayCanvas(false);
     LARGE_INTEGER afterLayers{};
     QueryPerformanceCounter(&afterLayers);
+    trace.Mark(4);
     if (g_previewDueThisFrame || !ui_auto::g_captures.empty()) ui_auto::g_frame = BuildUiFrame(info, (uint64_t)frameCount);
 
     // Every layer of this frame has now been recorded, so hand the slot to the painter and
@@ -8452,6 +8510,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     }
     LARGE_INTEGER afterDetectionAndPaint{};
     QueryPerformanceCounter(&afterDetectionAndPaint);
+    trace.Mark(5);
 
     // MCP Integration - write frame status BEFORE Present (Present may block on D3D12)
     mcp::WriteFrameStatus(frameCount, rt::g_session.previewWidth, rt::g_session.previewHeight,
@@ -8460,12 +8519,14 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
                           rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z,
                           rt::g_submissionCadence.Snapshot());
 
+    trace.Mark(6);
     // Drain MCP projection-log dump request if pending.
     if (mcp::g_commandsDue && mcp::CheckProjLogDumpRequest()) {
         mcp::DumpProjectionLog();
     }
     // Every command file has been looked at for this change notification.
     mcp::g_commandsDue = false;
+    trace.Mark(7);
 
     // Consume older D3D11 staging slots without flushing or waiting, then queue this
     // xrEndFrame's fully composed two-eye backbuffer before flip-model Present makes its
@@ -8498,6 +8559,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     }
 
 
+    trace.Mark(8);
     // Now Present after all layers are rendered (D3D11/GL only; D3D12 uses GDI in blit function)
     if (g_presentPending) {
         auto& s = rt::g_session;
@@ -8514,6 +8576,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         g_presentPending = false;
     }
 
+    trace.Mark(9);
     // Keep the measurement visible without drawing into the eye images (and
     // therefore without contaminating screenshots or flicker/color analysis).
     // F3 / Tools > Show Statistics adds p50/p95 and the rolling sample count.
@@ -8523,6 +8586,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         ui::UpdateWindowTitle(rt::g_session.hwnd, &stats);
     }
 
+    trace.Mark(10);
     if (shouldLog && (quadCount > 0 || cylinderCount > 0)) {
         Logf("[SimXR] xrEndFrame: proj=%d quad=%d cyl=%d other=%d",
              projectionCount, quadCount, cylinderCount, otherCount);
@@ -8556,7 +8620,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         remainderMs += elapsedMs(afterDetectionAndPaint, endFrameFinish);
         totalMs += elapsedMs(endFrameStart, endFrameFinish);
         if (++timingFrames == 300) {
-            Logf("[SimXR] xrEndFrame timing avg300: total=%.3fms projection=%.3f overlay=%.3f detectPaint=%.3f status=%.3f",
+            LogVf("[SimXR] xrEndFrame timing avg300: total=%.3fms projection=%.3f overlay=%.3f detectPaint=%.3f status=%.3f",
                  totalMs / timingFrames, projectionMs / timingFrames,
                  overlayMs / timingFrames, detectPaintMs / timingFrames,
                  remainderMs / timingFrames);
@@ -8565,6 +8629,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         }
     }
 
+    trace.Mark(11);
     XrResult result;
     {
         std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
@@ -8572,6 +8637,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
             ? rt::g_session.frameLifecycle.End()
             : XR_ERROR_SESSION_NOT_RUNNING;
     }
+    trace.Mark(12);
+    trace.Keep(static_cast<uint64_t>(frameCount), g_previewDueThisFrame);
     inEndFrame.clear(std::memory_order_release);
     return result;
 }
