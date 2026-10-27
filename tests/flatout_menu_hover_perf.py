@@ -101,9 +101,9 @@ async def run(a):
     async with stdio_client(server) as streams:
         async with ClientSession(*streams) as session:
             await session.initialize()
-            t = ShowroomProfile(a,session) if a.menu in ('garage','cars','drivers','upgrades','customization','career') else ChallengeStyle(a, session)
+            t = ShowroomProfile(a,session) if a.menu in ('garage','cars','drivers','upgrades','customization','career','classes','events') else ChallengeStyle(a, session)
             t.frames = []
-            menus = {'options': 'OPTIONS', 'challenge': 'INSANITY', 'quick': 'QUICK EVENTS', 'garage':'GARAGE', 'cars':'CARS','drivers':'DRIVERS','upgrades':'UPGRADES','customization':'SKINS','career':'FLATOUT'}
+            menus = {'options': 'OPTIONS', 'challenge': 'INSANITY', 'quick': 'QUICK EVENTS', 'garage':'GARAGE', 'cars':'CARS','drivers':'DRIVERS','upgrades':'UPGRADES','customization':'SKINS','career':'FLATOUT','classes':'FLATOUT','events':'FLATOUT_MODE'}
             assert (await t.query('menu.get_state'))['current_menu'] == menus[a.menu]
             await t.park()
             points = {}
@@ -118,6 +118,8 @@ async def run(a):
                 'upgrades': ('upgrades.item.0', 'upgrades.item.1', 'helper.Cancel.UpgradeBack'),
                 'customization': ('custom.item.0', 'custom.item.1', 'helper.Cancel.CustomBack'),
                 'career': ('career.hero', 'career.garage', 'helper.Cancel.CareerBack'),
+                'classes': ('item.0', 'item.1', 'helper.Cancel.ClassBack'),
+                'events': ('tile.0.0', 'tile.0.1', 'helper.Cancel.EventsBack'),
             }
             names = targets_by_menu[a.menu]
             for name in names:
@@ -174,11 +176,16 @@ async def run(a):
                         await t.hover(names[0])
                         await asyncio.sleep(1.2)
                         frame = await t.frame('depth-after-hover-stress')
-                        result['physical_depth_after_stress'] = await t.depth(frame.capture) if a.menu in ('garage','cars','drivers','upgrades','customization','career') else assert_hover_lift(frame.capture)
+                        result['physical_depth_after_stress'] = await t.depth(frame.capture) if a.menu in ('garage','cars','drivers','upgrades','customization','career','classes','events') else assert_hover_lift(frame.capture)
                     (a.evidence / 'summary.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
                 assert (await t.query('vr.targets'))['clicks'] == clicks
                 result['native_errors'] = await asyncio.to_thread(call, a.pid, 'game.errors')
                 assert result['native_errors']['total'] == 0, result['native_errors']
+                hitches = sum(window['over_50ms'] for window in result['windows'].values())
+                result['performance_gate'] = {'passed': hitches <= a.max_hitches,
+                    'frames_over_50ms': hitches, 'allowed_frames_over_50ms': a.max_hitches,
+                    'scope': 'Recorded windows only; not hardware or sustained-session qualification'}
+                assert result['performance_gate']['passed'], result['performance_gate']
                 result['completed'] = True
             finally:
                 await asyncio.to_thread(call, a.pid, 'vr.beam', {'off': True})
@@ -194,5 +201,9 @@ if __name__ == '__main__':
     p.add_argument('--data-dir', type=Path, required=True)
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--real-xr', action='store_true')
-    p.add_argument('--menu', choices=('challenge', 'options', 'quick', 'garage', 'cars','drivers','upgrades','customization','career'), default='challenge')
-    asyncio.run(run(p.parse_args()))
+    p.add_argument('--max-hitches', type=int, default=0, help='Allowed recorded frames over 50 ms; default zero')
+    p.add_argument('--menu', choices=('challenge', 'options', 'quick', 'garage', 'cars','drivers','upgrades','customization','career','classes','events'), default='challenge')
+    args = p.parse_args()
+    if args.max_hitches < 0:
+        p.error('--max-hitches must be nonnegative')
+    asyncio.run(run(args))

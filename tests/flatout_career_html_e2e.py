@@ -20,6 +20,55 @@ class CareerTest(Frontend):
     async def nodes(self):
         return (await self.query('hud.rects',{'root':'menu','max_depth':18}))['nodes']
 
+    async def enter_white_career(self,label):
+        menu=await self.query('menu.get_state')
+        assert menu['current_menu']=='MAIN MENU'
+        native=await self.query('vr.targets');capture=await self.capture(label)
+        item=menu['items'][0]
+        assert item['title']=='CAREER'
+        frame={**native['vr_frame'],'panel':{**menu['spatial_layout'],'origin':item['rendered_position']},'panel_width':1.,'panel_height':1.}
+        surface={'vr':{'frame':frame}};x,y=world_pixel(surface,capture,item['rendered_position'],'left')
+        receipt=await self.tool('click_ui_at',{'capture_id':capture['capture_id'],'x':float(x),'y':float(y),'hand':self.args.hand,'origin_mode':'hand',
+            'surface':ui_surface(surface),'ray_offset':RAY_OFFSET,'dwell_frames':30,'hold_frames':45,'command_id':uuid.uuid4().hex},label+'-click')
+        assert receipt['status']=='input_delivered',receipt
+        assert (await self.query('menu.get_state'))['current_menu']=='FLATOUT'
+
+    async def fresh_postures(self):
+        """Opening seated is distinct from crouching under a world-locked board.
+
+        Keep the separate head-drop advisory test; this never changes its limits.
+        """
+        initial=await self.layout('posture-entry')
+        capture=await self.capture('original-opening-pose')
+        head=capture['geometry']['head']
+        assert head['orientation']==[0,0,0,1]
+        original=dict(zip(('x','y','z'),head['position']))
+        posture_violations=[]
+        try:
+            for posture,height in (('standing',1.7),('seated',1.2)):
+                await self.click('helper.Cancel.CareerBack')
+                await self.observed_head_pose(posture+'-before-opening',{**original,'y':height,'yaw_deg':0,'pitch_deg':0,'roll_deg':0})
+                await self.enter_white_career(posture+'-white-career-entry')
+                assert await self.layout(posture+'-fresh-opening')==initial
+                capture=await self.capture(posture+'-fresh-geometry')
+                carrier=max((s for s in capture['geometry']['surfaces'] if s['visibility']==0),key=lambda s:s['size'][0]*s['size'][1])
+                targets=(await self.query('vr.targets'))['targets']
+                review=await self.tool('analyze_ui_visibility',{'capture_id':capture['capture_id'],'reference_mode':'level_head','include_overlay':True,
+                    'targets':[{'name':t['name'],'role':'control','surface':{k:carrier[k] for k in ('pose','size')},
+                                'rect':t['rect'],'canvas_size':[1920,1080]} for t in targets]},posture+'-fresh-visibility')
+                violations=[t for t in review['targets'] if not t['fully_in_both_submitted_eye_frusta'] or
+                    any(a in t['placement_advisories'] for a in ('outside_outer_review_envelope','small_angular_control_target'))]
+                self.cases.append({'case':'fresh-'+posture+'-opening-stereo-and-outer-envelope','passed':not violations,
+                    'summary':review['summary'],'violations':violations})
+                if violations:posture_violations.append({'posture':posture,'targets':violations})
+            assert not posture_violations,posture_violations
+        finally:
+            # Reopen at the original height so the next test inherits its actual
+            # opening anchor, rather than a seated anchor under a standing head.
+            if (await self.query('menu.get_state'))['current_menu']=='FLATOUT':await self.click('helper.Cancel.CareerBack')
+            await self.observed_head_pose('posture-original-restored',{**original,'yaw_deg':0,'pitch_deg':0,'roll_deg':0})
+            await self.enter_white_career('posture-original-career-restored')
+
     async def layout(self,label):
         state=await self.query('menu.get_state');hub=state['career_hub']
         assert state['current_menu']=='FLATOUT'
@@ -155,14 +204,7 @@ class CareerTest(Frontend):
         else:raise AssertionError(('Frontend return did not finish loading',game))
         menu=await self.query('menu.get_state')
         if menu['current_menu']=='MAIN MENU':
-            # The preserved white main menu has actual spatial text colliders.
-            native=await self.query('vr.targets');capture=await self.capture('white-main-menu-after-cup-return')
-            item=menu['items'][0]
-            frame={**native['vr_frame'],'panel':{**menu['spatial_layout'],'origin':item['rendered_position']},'panel_width':1.,'panel_height':1.}
-            surface={'vr':{'frame':frame}};x,y=world_pixel(surface,capture,item['rendered_position'],'left')
-            aim={'capture_id':capture['capture_id'],'x':float(x),'y':float(y),'hand':self.args.hand,'origin_mode':'hand',
-                 'surface':ui_surface(surface),'ray_offset':RAY_OFFSET,'dwell_frames':30,'hold_frames':45,'command_id':uuid.uuid4().hex}
-            await self.tool('click_ui_at',aim,'original-white-career-entry')
+            await self.enter_white_career('white-main-menu-after-cup-return')
         active=await self.layout('active-cup')
         assert active['active_cup'] and active['event_id']==cup['event_id'] and active['round_count']==cup['rounds']
         stable_keys=('wins','owned_cars','progress_percent','credits','car','class_percent')
@@ -188,13 +230,14 @@ class CareerTest(Frontend):
 async def run(args):
     args.evidence.mkdir(parents=True,exist_ok=False)
     server=StdioServerParameters(command=sys.executable,args=[str(ROOT/'mcp-server/openxr_simulator_mcp.py')],env={**os.environ,'SIMXR_DATA_DIR':str(args.data_dir.resolve())})
-    scope='layout only' if args.layout_only else 'Controller takeover' if args.takeover_only else 'Isolated cup Continue/Cancel' if args.cup_flow else 'No-active-cup navigation, hover, artwork and state preservation'
+    scope='Fresh standing and seated opening' if args.fresh_postures else 'layout only' if args.layout_only else 'Controller takeover' if args.takeover_only else 'Isolated cup Continue/Cancel' if args.cup_flow else 'No-active-cup navigation, hover, artwork and state preservation'
     result={'passed':False,'scope':scope}
     async with stdio_client(server) as streams:
         async with ClientSession(*streams) as session:
             await session.initialize();t=CareerTest(args,session)
             try:
-                if args.takeover_only:
+                if args.fresh_postures:await t.fresh_postures()
+                elif args.takeover_only:
                     await t.layout('takeover-entry');await t.takeover()
                 elif args.cup_flow:await t.cup_flow()
                 else:await t.prove()
@@ -209,7 +252,9 @@ if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--pid',type=int,required=True);p.add_argument('--data-dir',type=Path,required=True)
     p.add_argument('--evidence',type=Path,required=True);p.add_argument('--fox',type=Path,required=True)
-    p.add_argument('--hand',default='right',choices=('left','right'));p.add_argument('--layout-only',action='store_true')
-    p.add_argument('--takeover-only',action='store_true')
-    p.add_argument('--cup-flow',action='store_true');p.add_argument('--fixture-slot',type=int)
+    p.add_argument('--hand',default='right',choices=('left','right'))
+    mode=p.add_mutually_exclusive_group()
+    mode.add_argument('--layout-only',action='store_true');mode.add_argument('--takeover-only',action='store_true')
+    mode.add_argument('--fresh-postures',action='store_true');mode.add_argument('--cup-flow',action='store_true')
+    p.add_argument('--fixture-slot',type=int)
     asyncio.run(run(p.parse_args()))

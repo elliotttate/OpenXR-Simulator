@@ -740,7 +740,7 @@ class Frontend:
         assert all(i["title"].strip() for i in menu["items"]), "Career class cards need names in the menu model"
         await self.reading_comfort("career-class-selection")
         labels=(await self.query("hud.rects",{"root":"menu","max_depth":12}))["nodes"]
-        captions=[n["text"] for n in labels if n["visible"] and n["path"].endswith("/RayActionLabel")]
+        captions=[n["text"] for n in labels if n["visible"] and n["path"].endswith(("/RayActionLabel","/ClassContinue/ClassActionLabel"))]
         assert "Select" in captions and "Confirm" not in captions,("Class selection must name its Select action",captions)
         self.cases.append({"case":"career-class-selection-names-select-action","passed":True,"captions":captions})
         for index,car_class in ((1,"classic"),(2,"allstars")):

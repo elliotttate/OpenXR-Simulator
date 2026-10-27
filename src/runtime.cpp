@@ -4629,6 +4629,23 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (!s || s->type != XR_TYPE_FRAME_STATE ||
         (info && info->type != XR_TYPE_FRAME_WAIT_INFO)) return XR_ERROR_VALIDATION_FAILURE;
+    // Distinguish an actual pacing wait from message dispatch, command polling,
+    // or lock contention when the host profiler reports a long xrWaitFrame.
+    // Stack-only and allocation-free; ordinary frames do not write a log.
+    struct WaitTiming {
+        ULONGLONG start = GetTickCount64(), last = start, phases[7]{};
+        void Mark(unsigned phase) {
+            const ULONGLONG now = GetTickCount64();
+            phases[phase] += now - last; last = now;
+        }
+        ~WaitTiming() {
+            const ULONGLONG total = GetTickCount64() - start;
+            if (total >= 40) {
+                Logf("[SimXR] xrWaitFrame slow: total=%llums lifecycle=%llu preview=%llu messages=%llu controlLock=%llu inputCommands=%llu pointer=%llu pacing=%llu thread=%lu",
+                    total, phases[0], phases[1], phases[2], phases[3], phases[4], phases[5], phases[6], GetCurrentThreadId());
+            }
+        }
+    } timing;
     {
         std::unique_lock<std::mutex> lock(rt::g_session.frameMutex);
         if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
@@ -4639,6 +4656,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         const XrResult result = rt::g_session.frameLifecycle.MarkWaited();
         if (XR_FAILED(result)) return result;
     }
+    timing.Mark(0);
     if (!rt::g_session.hwnd) {
         ensurePreviewWithoutProjection(rt::g_session);
         if (rt::g_session.hwnd) {
@@ -4646,10 +4664,12 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
                  GetWindowThreadProcessId(rt::g_session.hwnd, nullptr), GetCurrentThreadId());
         }
     }
+    timing.Mark(1);
 
     // Not the preview window -- that has its own thread. This drains whatever host windows
     // happen to live on the render thread, which the runtime has always done from here.
     PumpMessages(nullptr);
+    timing.Mark(2);
     static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
     static double periodSec = 1.0 / 90.0;
     static long long periodNs = (long long)(periodSec * 1e9);
@@ -4658,6 +4678,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     // Handle WASD keyboard input for movement (relative to head orientation).
     //
     std::unique_lock<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    timing.Mark(3);
     // The PID check is what makes AppForeground the default: the runtime is in-process with
     // the host, so the game's own window counts as ours. PreviewFocused was once the only
     // behaviour and left WASD dead in any game that takes the foreground on launch.
@@ -5047,9 +5068,11 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         }
     }
 
+    timing.Mark(4);
     PollUiPointerCommand();
     ApplyUiPointerButtons();
     controlLock.unlock();
+    timing.Mark(5);
 
     // Pace on a high-resolution waitable timer. Plain Sleep() rounds up to the
     // system timer interval â€” as much as 15.6ms when the host never raised it â€”
@@ -5084,6 +5107,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     if ((double)now.QuadPart - nextTick > periodSec * (double)freq.QuadPart) {
         nextTick = (double)now.QuadPart;
     }
+    timing.Mark(6);
     // Exact integer conversion - the same math xrConvertWin32PerformanceCounterToTimeKHR
     // performs, so predicted display times and converted times agree for one instant.
     const XrTime nowTime = QpcToNs(now.QuadPart, freq.QuadPart);
