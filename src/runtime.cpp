@@ -115,6 +115,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <loader_interfaces.h>
 #include "mcp_integration.h"
 #include "projection_timing.h"
+#include "input_timing.h"
 #include "ui_enhancements.h"
 
 using Microsoft::WRL::ComPtr;
@@ -680,24 +681,32 @@ struct ControllerState {
     XrVector2f thumbstick; // -1.0 to 1.0 thumbstick position
 
     // Velocity tracking for motion detection
-    XrVector3f prevPosWorld;    // Previous frame world position
     XrVector3f linearVelocity;  // m/s in world space
     XrVector3f angularVelocity; // rad/s
-    float prevYaw;              // Previous yaw for angular velocity
-    float prevPitch;            // Previous pitch for angular velocity
+    perf::InputVelocityHistory<5> velocityHistory; // World xyz, pitch, yaw
 };
 static ControllerState g_leftController = {
     {-0.2f, -0.3f, -0.4f}, 0.0f, -0.3f, true,  // Position/orientation
     false, false, false, false, false, false,   // Button states
     0.0f, 0.0f, {0.0f, 0.0f},                   // Analog values
-    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f  // Velocity tracking
+    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {}  // Velocity tracking
 };
 static ControllerState g_rightController = {
     {0.2f, -0.3f, -0.4f}, 0.0f, -0.3f, true,   // Position/orientation
     false, false, false, false, false, false,   // Button states
     0.0f, 0.0f, {0.0f, 0.0f},                   // Analog values
-    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f  // Velocity tracking
+    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {}  // Velocity tracking
 };
+
+static long long g_previousInputTick = 0;
+static void ResetControllerInputHistory() {
+    g_previousInputTick = 0;
+    for (ControllerState* controller : {&g_leftController, &g_rightController}) {
+        controller->velocityHistory.Reset();
+        controller->linearVelocity = {0.0f, 0.0f, 0.0f};
+        controller->angularVelocity = {0.0f, 0.0f, 0.0f};
+    }
+}
 
 // Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
 struct ActionSpace { int hand; XrAction action; XrPosef offset; };
@@ -3211,6 +3220,7 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
              (unsigned long long)rt::g_session.handle);
         return XR_ERROR_HANDLE_INVALID;
     }
+    rt::ResetControllerInputHistory();
     ReleaseUiPointers("Session ended");
     
     // Transfer window and swapchain to global persistent storage
@@ -4088,6 +4098,7 @@ static XrResult XRAPI_PTR xrPollEvent_runtime(XrInstance, XrEventDataBuffer* b) 
 static void ensurePreviewWithoutProjection(rt::Session& s);
 
 static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeginInfo*) { 
+    { std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex); rt::ResetControllerInputHistory(); }
     Log("[SimXR] ============================================");
     Logf("[SimXR] xrBeginSession called (session=%llu)", (unsigned long long)s);
     Log("[SimXR] Session started - moving to SYNCHRONIZED/VISIBLE states");
@@ -4114,16 +4125,20 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
     rt::PushState(s, XR_SESSION_STATE_FOCUSED);
     return XR_SUCCESS; 
 }
-static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) { Log("[SimXR] xrEndSession"); ReleaseUiPointers("Session ended"); rt::PushState(s, XR_SESSION_STATE_STOPPING); rt::PushState(s, XR_SESSION_STATE_IDLE); return XR_SUCCESS; }
+static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) { { std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex); rt::ResetControllerInputHistory(); } Log("[SimXR] xrEndSession"); ReleaseUiPointers("Session ended"); rt::PushState(s, XR_SESSION_STATE_STOPPING); rt::PushState(s, XR_SESSION_STATE_IDLE); return XR_SUCCESS; }
 static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) { rt::PushState(s, XR_SESSION_STATE_EXITING); return XR_SUCCESS; }
 static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*, XrFrameState* s) {
     if (!s) return XR_ERROR_VALIDATION_FAILURE;
     // Message pump so the preview window stays responsive
     MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
-    static double periodSec = 1.0 / 90.0;
-    static long long periodNs = (long long)(periodSec * 1e9);
-    static double nextTick = [](){ LARGE_INTEGER t; QueryPerformanceCounter(&t); return (double)t.QuadPart; }();
+    static LARGE_INTEGER freq = [](){
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        Log("[SimXR] XR frame pacing: uncapped; nominal display period remains 90 Hz");
+        return f;
+    }();
+    // This is the simulated display prediction interval, not an application FPS cap.
+    constexpr long long periodNs = 1000000000LL / 90;
+    LARGE_INTEGER inputTick; QueryPerformanceCounter(&inputTick);
     
     // Handle WASD keyboard input for movement (relative to head orientation).
     //
@@ -4143,6 +4158,11 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
     // fixes that. Note: FH5 also binds W/S/A/D to throttle/brake/steer, so while the game window is
     // focused these keys additionally drive the car — park the car when isolating head-only translation.
     std::unique_lock<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    const double inputSampleSeconds = perf::InputSampleSeconds(
+        inputTick.QuadPart, rt::g_previousInputTick, freq.QuadPart);
+    const float inputDeltaSeconds = perf::InputDeltaSeconds(
+        inputTick.QuadPart, rt::g_previousInputTick, freq.QuadPart);
+    rt::g_previousInputTick = inputTick.QuadPart;
     const HWND foregroundWindow = GetForegroundWindow();
     bool previewWindowFocused = false;
     if (foregroundWindow != nullptr) {
@@ -4161,7 +4181,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
         // one with focus (see above).
         const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         const float moveSpeed = ui::GetMoveSpeed(shiftHeld);  // meters per second
-        float deltaTime = (float)periodSec;
+        const float deltaTime = inputDeltaSeconds;
 
         XrQuaternionf headQ = rt::QuatFromYawPitch(rt::g_headYaw, rt::g_headPitch);
         XrVector3f fwd = rt::RotateVectorByQuaternion(headQ, XrVector3f{0.0f, 0.0f, -1.0f});
@@ -4337,41 +4357,18 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
         rt::GetControllerPose(rt::g_rightController, &rightPose);
         rt::GetControllerPose(rt::g_leftController, &leftPose);
 
-        // Calculate linear velocity from position delta
-        if (deltaTime > 0.0f) {
-            // Right controller velocity
-            rt::g_rightController.linearVelocity.x = (rightPose.position.x - rt::g_rightController.prevPosWorld.x) / deltaTime;
-            rt::g_rightController.linearVelocity.y = (rightPose.position.y - rt::g_rightController.prevPosWorld.y) / deltaTime;
-            rt::g_rightController.linearVelocity.z = (rightPose.position.z - rt::g_rightController.prevPosWorld.z) / deltaTime;
-
-            // Left controller velocity
-            rt::g_leftController.linearVelocity.x = (leftPose.position.x - rt::g_leftController.prevPosWorld.x) / deltaTime;
-            rt::g_leftController.linearVelocity.y = (leftPose.position.y - rt::g_leftController.prevPosWorld.y) / deltaTime;
-            rt::g_leftController.linearVelocity.z = (leftPose.position.z - rt::g_leftController.prevPosWorld.z) / deltaTime;
-
-            // Angular velocity from yaw/pitch delta
-            float totalRightYaw = rt::g_headYaw + rt::g_rightController.yawOffset;
-            float totalRightPitch = rt::g_headPitch + rt::g_rightController.pitchOffset;
-            rt::g_rightController.angularVelocity.x = (totalRightPitch - rt::g_rightController.prevPitch) / deltaTime;
-            rt::g_rightController.angularVelocity.y = (totalRightYaw - rt::g_rightController.prevYaw) / deltaTime;
-            rt::g_rightController.angularVelocity.z = 0.0f;
-
-            float totalLeftYaw = rt::g_headYaw + rt::g_leftController.yawOffset;
-            float totalLeftPitch = rt::g_headPitch + rt::g_leftController.pitchOffset;
-            rt::g_leftController.angularVelocity.x = (totalLeftPitch - rt::g_leftController.prevPitch) / deltaTime;
-            rt::g_leftController.angularVelocity.y = (totalLeftYaw - rt::g_leftController.prevYaw) / deltaTime;
-            rt::g_leftController.angularVelocity.z = 0.0f;
-
-            // Update previous state for next frame
-            rt::g_rightController.prevPosWorld = rightPose.position;
-            rt::g_rightController.prevYaw = totalRightYaw;
-            rt::g_rightController.prevPitch = totalRightPitch;
-
-            rt::g_leftController.prevPosWorld = leftPose.position;
-            rt::g_leftController.prevYaw = totalLeftYaw;
-            rt::g_leftController.prevPitch = totalLeftPitch;
-        }
-
+        auto updateVelocity = [&](rt::ControllerState& controller, const XrPosef& pose) {
+            const auto velocity = controller.velocityHistory.Sample(
+                {pose.position.x, pose.position.y, pose.position.z,
+                 rt::g_headPitch + controller.pitchOffset, rt::g_headYaw + controller.yawOffset},
+                inputSampleSeconds);
+            controller.linearVelocity = {velocity[0], velocity[1], velocity[2]};
+            controller.angularVelocity = {velocity[3], velocity[4], 0.0f};
+        };
+        updateVelocity(rt::g_rightController, rightPose);
+        updateVelocity(rt::g_leftController, leftPose);
+    } else {
+        rt::ResetControllerInputHistory();
     }
 
     // MCP commands work regardless of window focus (file-based IPC).
@@ -4511,39 +4508,8 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
     ApplyUiPointerButtons();
     controlLock.unlock();
 
-    // Pace on a high-resolution waitable timer. Plain Sleep() rounds up to the
-    // system timer interval — as much as 15.6ms when the host never raised it —
-    // which quietly turned this 90 Hz cap into a ~60 Hz one. The timer is exact
-    // to a fraction of a millisecond regardless of the global timer resolution,
-    // and a short yield loop closes the remainder.
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-    static HANDLE pacingTimer = CreateWaitableTimerExW(nullptr, nullptr,
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    for (;;) {
-        LARGE_INTEGER now; QueryPerformanceCounter(&now);
-        const double remainingSec = (nextTick - (double)now.QuadPart) / (double)freq.QuadPart;
-        if (remainingSec <= 0.0) break;
-        if (pacingTimer && remainingSec > 0.0008) {
-            LARGE_INTEGER due;
-            due.QuadPart = -(LONGLONG)((remainingSec - 0.0005) * 1.0e7);   // relative, 100ns units
-            if (SetWaitableTimer(pacingTimer, &due, 0, nullptr, nullptr, FALSE)) {
-                WaitForSingleObject(pacingTimer, 20);
-                continue;
-            }
-        }
-        // Final stretch, or Windows before high-resolution timers: yield rather
-        // than risk oversleeping a whole timer interval.
-        Sleep(remainingSec > 0.002 ? 1 : 0);
-    }
-    nextTick += periodSec * (double)freq.QuadPart;
+    // Unpaced diagnostic runtime: return as soon as input/message work completes.
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    // After a stall, re-base instead of letting the app run uncapped while
-    // nextTick catches up one period per call.
-    if ((double)now.QuadPart - nextTick > periodSec * (double)freq.QuadPart) {
-        nextTick = (double)now.QuadPart;
-    }
     // Convert QPC to nanoseconds using double to avoid overflow on MSVC
     XrTime nowTime = (XrTime)((double)now.QuadPart * 1000000000.0 / (double)freq.QuadPart);
     s->type = XR_TYPE_FRAME_STATE; s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
