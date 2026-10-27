@@ -127,6 +127,9 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include "pose_math.h"
 #include "preview_focus.h"
 #include "projection_timing.h"
+#include "input_timing.h"
+#include "preview_lifecycle.h"
+#include "submission_cadence.h"
 #include "swapchain_state.h"
 #include "ui_enhancements.h"
 
@@ -372,8 +375,7 @@ static bool g_adapterLuidSet = false;
 struct PreviewUi {
     std::thread       thread;
     std::atomic<HWND> hwnd{nullptr};
-    std::atomic<bool> finished{false};   // creation attempt is over, successfully or not
-    std::atomic<DWORD> threadId{0};
+    preview_lifecycle::State lifecycle;
 };
 static PreviewUi g_previewUi;
 
@@ -808,24 +810,32 @@ struct ControllerState {
     XrVector2f thumbstick; // -1.0 to 1.0 thumbstick position
 
     // Velocity tracking for motion detection
-    XrVector3f prevPosWorld;    // Previous frame world position
     XrVector3f linearVelocity;  // m/s in world space
     XrVector3f angularVelocity; // rad/s
-    float prevYaw;              // Previous yaw for angular velocity
-    float prevPitch;            // Previous pitch for angular velocity
+    perf::InputVelocityHistory<5> velocityHistory; // World xyz, pitch, yaw
 };
 static ControllerState g_leftController = {
     {-0.2f, -0.3f, -0.4f}, 0.0f, -0.3f, true,  // Position/orientation
     false, false, false, false, false, false,   // Button states
     0.0f, 0.0f, {0.0f, 0.0f},                   // Analog values
-    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f  // Velocity tracking
+    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {}  // Velocity tracking
 };
 static ControllerState g_rightController = {
     {0.2f, -0.3f, -0.4f}, 0.0f, -0.3f, true,   // Position/orientation
     false, false, false, false, false, false,   // Button states
     0.0f, 0.0f, {0.0f, 0.0f},                   // Analog values
-    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f  // Velocity tracking
+    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {}  // Velocity tracking
 };
+
+static long long g_previousInputTick = 0;
+static void ResetControllerInputHistory() {
+    g_previousInputTick = 0;
+    for (ControllerState* controller : {&g_leftController, &g_rightController}) {
+        controller->velocityHistory.Reset();
+        controller->linearVelocity = {0.0f, 0.0f, 0.0f};
+        controller->angularVelocity = {0.0f, 0.0f, 0.0f};
+    }
+}
 
 struct ActionSpace {
     XrAction action{XR_NULL_HANDLE};
@@ -1372,6 +1382,7 @@ static SubImageRect ResolveSubImageRect(const XrRect2Di& rect, uint32_t texW, ui
 }
 
 static perf::ProjectionTimingTracker g_projectionTiming;
+static perf::SubmissionCadence g_submissionCadence;
 
 // Build the stats payload for the title bar (used when "Show Statistics" is on).
 static ui::StatsInfo BuildStatsInfo(rt::Session& s) {
@@ -1618,8 +1629,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hWnd);
             return 0;
         case WM_DESTROY:
-            // DON'T call PostQuitMessage - we're a DLL, not the main app!
-            // PostQuitMessage would tell the host application to exit.
+            // Only the dedicated preview owner may quit its own message queue.
+            if (rt::g_previewUi.lifecycle.OnWindowDestroyed(hWnd)) {
+                rt::g_previewUi.hwnd.store(nullptr);
+            }
             Log("[SimXR] WndProc: WM_DESTROY received");
             return 0;
         case WM_ACTIVATE: {
@@ -3217,18 +3230,18 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
         // DestroyWindow only works from the owning thread. Join before returning: the loader
         // may unload us immediately, and a WndProc left in freed code takes the host down.
         if (rt::g_previewUi.thread.joinable()) {
-            // A thread has no message queue until its first message call, and a WM_QUIT
-            // posted before then is discarded -- which would leave the join below waiting
-            // forever. finished means CreateWindowExW has run, one way or the other.
-            for (int i = 0; i < 2000 && !rt::g_previewUi.finished.load(); ++i) Sleep(1);
-            if (const DWORD uiTid = rt::g_previewUi.threadId.load()) {
-                PostThreadMessageW(uiTid, WM_QUIT, 0, 0);
+            // Window messages reach WndProc even inside a modal loop. Retain stop
+            // state independently of any Quit message a nested pump may consume.
+            const DWORD closeError = rt::g_previewUi.lifecycle.RequestClose();
+            if (closeError != ERROR_SUCCESS) {
+                Logf("[SimXR] Preview close request failed: %lu", closeError);
             }
+            // No UI/window/lifecycle mutex is held while waiting. A live worker
+            // must never be detached or left behind when this DLL can unload.
             rt::g_previewUi.thread.join();
             Log("[SimXR] xrDestroyInstance: Preview UI thread joined");
         }
-        rt::g_previewUi.finished.store(false);
-        rt::g_previewUi.threadId.store(0);
+        rt::g_previewUi.lifecycle.Reset();
         // Also clear session window reference
         if (rt::g_session.hwnd) {
             rt::g_session.hwnd = nullptr;
@@ -3544,6 +3557,7 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
              (unsigned long long)rt::g_session.handle);
         return XR_ERROR_HANDLE_INVALID;
     }
+    { std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex); rt::ResetControllerInputHistory(); }
     ReleaseUiPointers("Session ended");
     {
         std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
@@ -4571,6 +4585,7 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
     }
 
 
+    { std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex); rt::ResetControllerInputHistory(); }
     rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
     rt::PushState(s, XR_SESSION_STATE_VISIBLE);
     // A simulator has no physical HMD focus hand-off. Keep the OpenXR application
@@ -4596,6 +4611,7 @@ static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) {
         rt::g_session.frameLifecycle.Reset();
     }
     rt::g_session.frameCondition.notify_all();
+    { std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex); rt::ResetControllerInputHistory(); }
     ReleaseUiPointers("Session ended");
     rt::PushState(s, XR_SESSION_STATE_IDLE);
     if (exitRequested) rt::PushState(s, XR_SESSION_STATE_EXITING);
@@ -4640,10 +4656,13 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     // Not the preview window -- that has its own thread. This drains whatever host windows
     // happen to live on the render thread, which the runtime has always done from here.
     PumpMessages(nullptr);
-    static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
-    static double periodSec = 1.0 / 90.0;
-    static long long periodNs = (long long)(periodSec * 1e9);
-    static double nextTick = [](){ LARGE_INTEGER t; QueryPerformanceCounter(&t); return (double)t.QuadPart; }();
+    static LARGE_INTEGER freq = [](){
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        Log("[SimXR] XR frame pacing: uncapped; nominal display period remains 90 Hz");
+        return f;
+    }();
+    // Nominal prediction interval only; frame lifecycle waits remain above.
+    constexpr long long periodNs = 1000000000LL / 90;
     
     // Handle WASD keyboard input for movement (relative to head orientation).
     //
@@ -4653,6 +4672,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     // behaviour and left WASD dead in any game that takes the foreground on launch.
     // Note: a game binding W/S/A/D itself will also act on them while it is focused.
     if (rt::g_resetPoseRequested.exchange(false)) {
+        rt::ResetControllerInputHistory();
         rt::g_headPos = {0, 1.7f, 0};
         rt::g_headYaw = rt::g_headPitch = rt::g_headRoll = 0.0f;
     }
@@ -4661,6 +4681,12 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     const float maxPitch = 1.5f;  // ~85 degrees, short of gimbal lock
     rt::g_headPitch = (std::max)(-maxPitch, (std::min)(maxPitch, rt::g_headPitch));
 
+    LARGE_INTEGER inputTick; QueryPerformanceCounter(&inputTick);
+    const double inputSampleSeconds = perf::InputSampleSeconds(
+        inputTick.QuadPart, rt::g_previousInputTick, freq.QuadPart);
+    const float inputDeltaSeconds = perf::InputDeltaSeconds(
+        inputTick.QuadPart, rt::g_previousInputTick, freq.QuadPart);
+    rt::g_previousInputTick = inputTick.QuadPart;
     const ui::InputPolling inputPolling = ui::g_uiState.inputPolling;
     bool inputActive = (inputPolling == ui::InputPolling::Background);
     const HWND foregroundWindow = inputActive ? nullptr : GetForegroundWindow();
@@ -4680,7 +4706,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         // one with focus (see above).
         const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
         const float moveSpeed = ui::GetMoveSpeed(shiftHeld);  // meters per second
-        float deltaTime = (float)periodSec;
+        const float deltaTime = inputDeltaSeconds;
 
         XrQuaternionf headQ = rt::QuatFromYawPitch(rt::g_headYaw, rt::g_headPitch);
         XrVector3f fwd = rt::RotateVectorByQuaternion(headQ, XrVector3f{0.0f, 0.0f, -1.0f});
@@ -4856,41 +4882,18 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         rt::GetControllerPose(rt::g_rightController, &rightPose);
         rt::GetControllerPose(rt::g_leftController, &leftPose);
 
-        // Calculate linear velocity from position delta
-        if (deltaTime > 0.0f) {
-            // Right controller velocity
-            rt::g_rightController.linearVelocity.x = (rightPose.position.x - rt::g_rightController.prevPosWorld.x) / deltaTime;
-            rt::g_rightController.linearVelocity.y = (rightPose.position.y - rt::g_rightController.prevPosWorld.y) / deltaTime;
-            rt::g_rightController.linearVelocity.z = (rightPose.position.z - rt::g_rightController.prevPosWorld.z) / deltaTime;
-
-            // Left controller velocity
-            rt::g_leftController.linearVelocity.x = (leftPose.position.x - rt::g_leftController.prevPosWorld.x) / deltaTime;
-            rt::g_leftController.linearVelocity.y = (leftPose.position.y - rt::g_leftController.prevPosWorld.y) / deltaTime;
-            rt::g_leftController.linearVelocity.z = (leftPose.position.z - rt::g_leftController.prevPosWorld.z) / deltaTime;
-
-            // Angular velocity from yaw/pitch delta
-            float totalRightYaw = rt::g_headYaw + rt::g_rightController.yawOffset;
-            float totalRightPitch = rt::g_headPitch + rt::g_rightController.pitchOffset;
-            rt::g_rightController.angularVelocity.x = (totalRightPitch - rt::g_rightController.prevPitch) / deltaTime;
-            rt::g_rightController.angularVelocity.y = (totalRightYaw - rt::g_rightController.prevYaw) / deltaTime;
-            rt::g_rightController.angularVelocity.z = 0.0f;
-
-            float totalLeftYaw = rt::g_headYaw + rt::g_leftController.yawOffset;
-            float totalLeftPitch = rt::g_headPitch + rt::g_leftController.pitchOffset;
-            rt::g_leftController.angularVelocity.x = (totalLeftPitch - rt::g_leftController.prevPitch) / deltaTime;
-            rt::g_leftController.angularVelocity.y = (totalLeftYaw - rt::g_leftController.prevYaw) / deltaTime;
-            rt::g_leftController.angularVelocity.z = 0.0f;
-
-            // Update previous state for next frame
-            rt::g_rightController.prevPosWorld = rightPose.position;
-            rt::g_rightController.prevYaw = totalRightYaw;
-            rt::g_rightController.prevPitch = totalRightPitch;
-
-            rt::g_leftController.prevPosWorld = leftPose.position;
-            rt::g_leftController.prevYaw = totalLeftYaw;
-            rt::g_leftController.prevPitch = totalLeftPitch;
-        }
-
+        auto updateVelocity = [&](rt::ControllerState& controller, const XrPosef& pose) {
+            const auto velocity = controller.velocityHistory.Sample(
+                {pose.position.x, pose.position.y, pose.position.z,
+                 rt::g_headPitch + controller.pitchOffset, rt::g_headYaw + controller.yawOffset},
+                inputSampleSeconds);
+            controller.linearVelocity = {velocity[0], velocity[1], velocity[2]};
+            controller.angularVelocity = {velocity[3], velocity[4], 0.0f};
+        };
+        updateVelocity(rt::g_rightController, rightPose);
+        updateVelocity(rt::g_leftController, leftPose);
+    } else {
+        rt::ResetControllerInputHistory();
     }
 
     // MCP commands work regardless of window focus (file-based IPC).
@@ -5030,39 +5033,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     ApplyUiPointerButtons();
     controlLock.unlock();
 
-    // Pace on a high-resolution waitable timer. Plain Sleep() rounds up to the
-    // system timer interval â€” as much as 15.6ms when the host never raised it â€”
-    // which quietly turned this 90 Hz cap into a ~60 Hz one. The timer is exact
-    // to a fraction of a millisecond regardless of the global timer resolution,
-    // and a short yield loop closes the remainder.
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-    static HANDLE pacingTimer = CreateWaitableTimerExW(nullptr, nullptr,
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    for (;;) {
-        LARGE_INTEGER now; QueryPerformanceCounter(&now);
-        const double remainingSec = (nextTick - (double)now.QuadPart) / (double)freq.QuadPart;
-        if (remainingSec <= 0.0) break;
-        if (pacingTimer && remainingSec > 0.0008) {
-            LARGE_INTEGER due;
-            due.QuadPart = -(LONGLONG)((remainingSec - 0.0005) * 1.0e7);   // relative, 100ns units
-            if (SetWaitableTimer(pacingTimer, &due, 0, nullptr, nullptr, FALSE)) {
-                WaitForSingleObject(pacingTimer, 20);
-                continue;
-            }
-        }
-        // Final stretch, or Windows before high-resolution timers: yield rather
-        // than risk oversleeping a whole timer interval.
-        Sleep(remainingSec > 0.002 ? 1 : 0);
-    }
-    nextTick += periodSec * (double)freq.QuadPart;
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    // After a stall, re-base instead of letting the app run uncapped while
-    // nextTick catches up one period per call.
-    if ((double)now.QuadPart - nextTick > periodSec * (double)freq.QuadPart) {
-        nextTick = (double)now.QuadPart;
-    }
     // Exact integer conversion - the same math xrConvertWin32PerformanceCounterToTimeKHR
     // performs, so predicted display times and converted times agree for one instant.
     const XrTime nowTime = QpcToNs(now.QuadPart, freq.QuadPart);
@@ -5083,7 +5054,11 @@ static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession session, const XrFrameB
 }
 
 static void previewUiThreadMain(UINT initialClientW, UINT initialClientH) {
-    rt::g_previewUi.threadId.store(GetCurrentThreadId());
+    rt::g_previewUi.lifecycle.OnThreadStarted();
+    if (rt::g_previewUi.lifecycle.StopRequested()) {
+        rt::g_previewUi.lifecycle.PublishCreationComplete();
+        return;
+    }
 
     if (!rt::g_windowClassRegistered) {
         WNDCLASSW wc{};
@@ -5104,7 +5079,15 @@ static void previewUiThreadMain(UINT initialClientW, UINT initialClientH) {
                                 nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) {
         Log("[SimXR] Failed to create preview window!");
-        rt::g_previewUi.finished.store(true);
+        rt::g_previewUi.lifecycle.PublishCreationComplete();
+        return;
+    }
+    // Stop/identity ownership is available before ShowWindow can reenter WndProc;
+    // the frame-facing hwnd remains unpublished until setup is complete.
+    rt::g_previewUi.lifecycle.SetOwnedWindow(hwnd);
+    if (rt::g_previewUi.lifecycle.StopRequested()) {
+        DestroyWindow(hwnd);
+        rt::g_previewUi.lifecycle.PublishCreationComplete();
         return;
     }
 
@@ -5135,16 +5118,15 @@ static void previewUiThreadMain(UINT initialClientW, UINT initialClientH) {
 
     // Published only once the window is fully set up, so the frame thread never sees a
     // half-built window.
-    rt::g_previewUi.hwnd.store(hwnd);
-    rt::g_previewUi.finished.store(true);
+    rt::g_previewUi.hwnd.store(rt::g_previewUi.lifecycle.StopRequested() ? nullptr : hwnd);
+    rt::g_previewUi.lifecycle.PublishCreationComplete();
 
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    const DWORD loopError = rt::g_previewUi.lifecycle.PumpUntilStopped();
+    if (loopError != ERROR_SUCCESS) {
+        Logf("[SimXR] Preview GetMessage failed: %lu", loopError);
     }
-    rt::g_previewUi.hwnd.store(nullptr);
     if (IsWindow(hwnd)) DestroyWindow(hwnd);
+    rt::g_previewUi.hwnd.store(nullptr);
     Log("[SimXR] Preview UI thread exited and destroyed its window");
 }
 
@@ -5186,9 +5168,10 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
     // No persistent window — hand creation to the UI thread and wait for it to publish.
     // Bounded: missing the window costs this frame's preview and is retried on the next.
     if (!rt::g_previewUi.thread.joinable()) {
+        rt::g_previewUi.lifecycle.Reset();
         rt::g_previewUi.thread = std::thread(previewUiThreadMain, initialClientW, initialClientH);
     }
-    for (int i = 0; i < 500 && !rt::g_previewUi.finished.load(); ++i) Sleep(1);
+    rt::g_previewUi.lifecycle.WaitForCreation(std::chrono::milliseconds(500));
     s.hwnd = rt::g_previewUi.hwnd.load();
     if (!s.hwnd) return;
 
@@ -8351,6 +8334,9 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     }
     const auto projectionTimingNow = perf::ProjectionTimingTracker::Clock::now();
     rt::g_projectionTiming.Observe(hasStereoProjection, projectionTimingNow);
+    rt::g_submissionCadence.Observe(hasStereoProjection,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            projectionTimingNow.time_since_epoch()).count());
     flicker::ObserveSubmission((uint64_t)frameCount, (uint32_t)projectionCount,
                                info->layerCount);
 
@@ -8456,7 +8442,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     mcp::WriteFrameStatus(frameCount, rt::g_session.previewWidth, rt::g_session.previewHeight,
                           "RGBA8", mcp::GetSessionStateName((int)rt::g_session.state),
                           rt::g_headYaw, rt::g_headPitch, rt::g_headRoll,
-                          rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z);
+                          rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z,
+                          rt::g_submissionCadence.Snapshot());
 
     // Drain MCP projection-log dump request if pending.
     if (mcp::g_commandsDue && mcp::CheckProjLogDumpRequest()) {

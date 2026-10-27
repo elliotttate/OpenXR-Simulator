@@ -1,5 +1,6 @@
 // MCP Integration - Screenshot capture and status reporting for OpenXR Simulator
 #pragma once
+#include "submission_cadence.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -498,8 +499,9 @@ inline void CaptureScreenshotGL(const uint8_t* leftPixels, const uint8_t* rightP
 // Write frame status JSON for MCP
 inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t height,
                               const char* format, const char* sessionState,
-                              float headYaw = 0, float headPitch = 0, float headRoll = 0,
-                              float headX = 0, float headY = 1.7f, float headZ = 0) {
+                              float headYaw, float headPitch, float headRoll,
+                              float headX, float headY, float headZ,
+                              const perf::SubmissionCadenceSnapshot& cadence) {
     // Rate-limited by wall clock, not by frame count: this is a status file an MCP client
     // polls, so twice a second is as useful as ninety times a second, and each write is a
     // create/format/flush that also trips the directory watch RefreshCommandsDue uses.
@@ -524,8 +526,15 @@ inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t heigh
     fprintf(file, "  \"preview_height\": %u,\n", height);
     fprintf(file, "  \"format\": \"%s\",\n", format ? format : "unknown");
     fprintf(file, "  \"session_state\": \"%s\",\n", sessionState ? sessionState : "unknown");
-    fprintf(file, "  \"target_fps\": 90,\n");
-    fprintf(file, "  \"frame_time_ms\": 11.1,\n");
+    fprintf(file, "  \"timing_schema_version\": 2,\n");
+    fprintf(file, "  \"target_fps\": null, \"frame_limiter_enabled\": false, \"nominal_prediction_hz\": 90,\n");
+    if (cadence.intervalValid) fprintf(file, "  \"frame_time_ms\": %.9f,\n", cadence.frameIntervalMs);
+    else fprintf(file, "  \"frame_time_ms\": null,\n");
+    fprintf(file, "  \"projection_cadence\": {\"stereo_submissions\": %llu, \"last_submission_monotonic_ns\": %lld, \"segment\": %llu, \"interval_valid\": %s, \"last_frame_had_stereo\": %s},\n",
+            static_cast<unsigned long long>(cadence.stereoSubmissions),
+            static_cast<long long>(cadence.lastSubmissionMonotonicNs),
+            static_cast<unsigned long long>(cadence.segment),
+            cadence.intervalValid ? "true" : "false", cadence.lastFrameHadStereo ? "true" : "false");
     fprintf(file, "  \"head_tracking\": {\n");
     fprintf(file, "    \"position\": {\"x\": %.3f, \"y\": %.3f, \"z\": %.3f},\n", headX, headY, headZ);
     fprintf(file, "    \"yaw\": %.3f,\n", headYaw);
