@@ -1,3 +1,4 @@
+#include "host_message_pump.h"
 #include "nominal_refresh.h"
 // Minimal OpenXR Simulator Runtime (D3D11/D3D12/OpenGL)
 // - Implements enough of the runtime interface to let OpenXR apps start and render into runtime-owned swapchains
@@ -204,22 +205,6 @@ static void Logf(const char* fmt, ...) {
     va_end(ap);
     Log(buf);
 }
-// Bounded: this runs on the app's render thread, so a handler that reposts as fast as we
-// drain would wedge the host rather than cost a frame.
-static void PumpMessages(HWND filter) {
-    MSG msg;
-    int drained = 0;
-    while (PeekMessageW(&msg, filter, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-        if (++drained >= 2000) {
-            Logf("[SimXR] PUMP RUNAWAY: bailed after %d messages, last=0x%04X hwnd=%p",
-                 drained, msg.message, msg.hwnd);
-            break;
-        }
-    }
-}
-
 static void LogV(const char* msg) { if (g_logVerbose) Log(msg); }
 static void LogVf(const char* fmt, ...) {
     if (!g_logVerbose) return;
@@ -3611,6 +3596,50 @@ static void Dump() {
 }
 }
 
+// Diagnostic-only wait-path attribution. No file I/O occurs while recording.
+// Samples are bounded and exported at teardown; keep this separate from throughput runs.
+namespace wait_frame_trace {
+constexpr size_t PointCount = 9;
+constexpr size_t Capacity = 512;
+struct Sample { LONGLONG ticks[PointCount]{}; uint64_t frame{}; };
+static Sample samples[Capacity]{};
+static uint64_t retainedCount = 0;
+static std::mutex mutex;
+static bool Enabled() {
+    static const bool enabled = []() { char value[8]{}; return GetEnvironmentVariableA("SIMXR_WAIT_FRAME_TRACE", value, sizeof(value)) == 1 && value[0] == '1'; }();
+    return enabled;
+}
+struct Capture {
+    Sample sample{};
+    bool enabled = Enabled();
+    void Mark(size_t point) { if (enabled) { LARGE_INTEGER now{}; QueryPerformanceCounter(&now); sample.ticks[point] = now.QuadPart; } }
+    void Keep() {
+        if (!enabled || (sample.ticks[PointCount-1] - sample.ticks[0]) * 1000.0 / end_frame_trace::Frequency() < 0.5) return;
+        sample.frame = mcp::g_runtimeFrameCount.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> guard(mutex);
+        samples[retainedCount++ % Capacity] = sample;
+    }
+};
+static void Dump() {
+    if (!Enabled()) return;
+    std::lock_guard<std::mutex> guard(mutex);
+    if (!retainedCount) return; // EndSession followed by DestroySession must retain the first export.
+    const std::string path = mcp::GetSimulatorDataPath() + "\\wait_frame_trace.jsonl";
+    FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "w") != 0 || !file) return;
+    fprintf(file, "{\"schema\":1,\"qpc_frequency\":%lld,\"slow_frames_observed\":%llu,\"capacity\":512,\"threshold_ms\":0.5,\"phase_names\":[\"lifecycle\",\"preview_creation\",\"host_messages\",\"control_lock\",\"input\",\"commands\",\"pointer\",\"prediction\"]}\n", end_frame_trace::Frequency(), static_cast<unsigned long long>(retainedCount));
+    const uint64_t first = retainedCount > Capacity ? retainedCount - Capacity : 0;
+    for (uint64_t i = first; i < retainedCount; ++i) {
+        const auto& sample = samples[i % Capacity];
+        fprintf(file, "{\"previous_submission_frame\":%llu,\"qpc\":[", static_cast<unsigned long long>(sample.frame));
+        for (size_t point = 0; point < PointCount; ++point) fprintf(file, "%s%lld", point ? "," : "", sample.ticks[point]);
+        fprintf(file, "]}\n");
+    }
+    fclose(file);
+    retainedCount = 0;
+}
+}
+
 static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     Logf("[SimXR] xrDestroySession called (handle=%llu)", (unsigned long long)s);
@@ -3620,6 +3649,7 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
         return XR_ERROR_HANDLE_INVALID;
     }
     end_frame_trace::Dump();
+    wait_frame_trace::Dump();
     { std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex); rt::ResetControllerInputHistory(); }
     ReleaseUiPointers("Session ended");
     {
@@ -4675,6 +4705,7 @@ static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) {
     }
     rt::g_session.frameCondition.notify_all();
     end_frame_trace::Dump();
+    wait_frame_trace::Dump();
     { std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex); rt::ResetControllerInputHistory(); }
     ReleaseUiPointers("Session ended");
     rt::PushState(s, XR_SESSION_STATE_IDLE);
@@ -4696,6 +4727,7 @@ static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) {
     return XR_SUCCESS;
 }
 static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWaitInfo* info, XrFrameState* s) {
+    wait_frame_trace::Capture trace; trace.Mark(0);
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (!s || s->type != XR_TYPE_FRAME_STATE ||
         (info && info->type != XR_TYPE_FRAME_WAIT_INFO)) return XR_ERROR_VALIDATION_FAILURE;
@@ -4709,6 +4741,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         const XrResult result = rt::g_session.frameLifecycle.MarkWaited();
         if (XR_FAILED(result)) return result;
     }
+    trace.Mark(1);
     if (!rt::g_session.hwnd) {
         ensurePreviewWithoutProjection(rt::g_session);
         if (rt::g_session.hwnd) {
@@ -4717,9 +4750,12 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         }
     }
 
-    // Not the preview window -- that has its own thread. This drains whatever host windows
-    // happen to live on the render thread, which the runtime has always done from here.
-    PumpMessages(nullptr);
+    // The preview pumps its own UI thread. Let the host own message dispatch;
+    // pumping here duplicates work and can re-enter game callbacks inside xrWaitFrame.
+    trace.Mark(2);
+    if (perf::PumpHostMessagesIfEnabled() == 2000)
+        Log("[SimXR] Compatibility host message pump reached its 2000-message bound");
+    trace.Mark(3);
     static LARGE_INTEGER freq = [](){
         LARGE_INTEGER f; QueryPerformanceFrequency(&f);
         return f;
@@ -4728,12 +4764,14 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     static const long long periodNs = []() {
         const double hz = perf::ConfiguredNominalRefreshHz();
         Logf("[SimXR] XR frame pacing: uncapped; nominal prediction %.3f Hz", hz);
+        Logf("[SimXR] Host message pumping: %s", perf::HostMessagePumpEnabled() ? "compatibility-on" : "off");
         return perf::NominalPeriodNs(hz);
     }();
     
     // Handle WASD keyboard input for movement (relative to head orientation).
     //
     std::unique_lock<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    trace.Mark(4);
     // The PID check is what makes AppForeground the default: the runtime is in-process with
     // the host, so the game's own window counts as ours. PreviewFocused was once the only
     // behaviour and left WASD dead in any game that takes the foreground on launch.
@@ -4966,6 +5004,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     // MCP commands work regardless of window focus (file-based IPC).
     // RefreshCommandsDue keeps this whole block off the frame path until the command
     // directory actually changes; see its comment for why that matters.
+    trace.Mark(5);
     mcp::RefreshCommandsDue();
     if (mcp::g_commandsDue) {
         mcp::HeadPoseCommand cmd = mcp::CheckHeadPoseCommand();
@@ -5096,15 +5135,18 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         }
     }
 
+    trace.Mark(6);
     PollUiPointerCommand();
     ApplyUiPointerButtons();
     controlLock.unlock();
+    trace.Mark(7);
 
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     // Exact integer conversion - the same math xrConvertWin32PerformanceCounterToTimeKHR
     // performs, so predicted display times and converted times agree for one instant.
     const XrTime nowTime = QpcToNs(now.QuadPart, freq.QuadPart);
     s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
+    trace.Mark(8); trace.Keep();
     return XR_SUCCESS;
 }
 static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession session, const XrFrameBeginInfo* info) {
@@ -8787,7 +8829,7 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession session, const XrViewL
         views[i].fov = rt::GetViewFov(i);
     }
     static int locateCount = 0;
-    if (++locateCount % 90 == 1) {  // Log every 90 frames (~1 second)
+    if (g_logVerbose && ++locateCount % 90 == 1) {  // Diagnostic pose logging only.
         Logf("[SimXR] xrLocateViews: pos=(%.2f,%.2f,%.2f) yaw=%.2f pitch=%.2f", 
              rt::g_headPos.x, rt::g_headPos.y, rt::g_headPos.z, 
              rt::g_headYaw, rt::g_headPitch);
