@@ -90,7 +90,9 @@ class RayScroll(Frontend):
         # jump or repeated digital menu-selection events.
         initial={r['name']:r['rect'][1] for r in before['rows']}
         offsets=[initial[r['name']]-r['rect'][1] for s in samples for r in s['rows'] if r['name'] in initial]
-        row_height=51 if self.args.surface=='statistics' else 92
+        tops=sorted({r['rect'][1] for r in before['rows']})
+        assert len(tops)>=2, 'Need adjacent visible rows to measure the native scroll stride'
+        row_height=float(np.median(np.diff(tops)))
         smooth=any(d>1 and abs(d/row_height-round(d/row_height))>.02 for d in offsets)
         self.cases.append(dict(case='fractional-row-motion-from-native-stick',passed=smooth,samples=samples))
         assert smooth, 'Stick over settings did not produce continuous row motion'

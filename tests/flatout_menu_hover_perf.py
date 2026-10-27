@@ -68,11 +68,12 @@ async def run(a):
             await session.initialize()
             t = ChallengeStyle(a, session)
             t.frames = []
-            assert (await t.query('menu.get_state'))['current_menu'] == 'INSANITY'
+            assert (await t.query('menu.get_state'))['current_menu'] == ('OPTIONS' if a.menu == 'options' else 'INSANITY')
             await t.park()
             points = {}
             rects = {x['name']: x['rect'] for x in (await t.query('vr.targets'))['targets']}
-            for name in ('challenge.event.0', 'challenge.event.1', 'helper.Validate.2'):
+            names = ('settings.category.0', 'settings.category.2', 'helper.Cancel.OptionsDone') if a.menu == 'options' else ('challenge.event.0', 'challenge.event.1', 'helper.Validate.2')
+            for name in names:
                 l, top, r, b = rects[name]
                 points[name] = {'x': (l+r)/2, 'y': (top+b)/2}
             clicks = (await t.query('vr.targets'))['clicks']
@@ -82,7 +83,7 @@ async def run(a):
                         await asyncio.to_thread(call, a.pid, 'vr.beam', {'off': True})
                         await t.park()
                         if phase == 'hover':
-                            await t.hover('challenge.event.0')
+                            await t.hover(names[0])
                     else:
                         await asyncio.to_thread(call, a.pid, 'vr.beam', {'x': 10, 'y': 10, 'trigger': 0})
                     duration = 6000 if a.real_xr else 18000
@@ -112,7 +113,7 @@ async def run(a):
                     print(phase, json.dumps(result['windows'][phase]), flush=True)
                     if phase == 'hover':
                         await asyncio.to_thread(call, a.pid, 'vr.beam', {'off': True})
-                        await t.hover('challenge.event.0')
+                        await t.hover(names[0])
                         await asyncio.sleep(1.2)
                         frame = await t.frame('depth-after-hover-stress')
                         result['physical_depth_after_stress'] = assert_hover_lift(frame.capture)
@@ -135,4 +136,5 @@ if __name__ == '__main__':
     p.add_argument('--data-dir', type=Path, required=True)
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--real-xr', action='store_true')
+    p.add_argument('--menu', choices=('challenge', 'options'), default='challenge')
     asyncio.run(run(p.parse_args()))
