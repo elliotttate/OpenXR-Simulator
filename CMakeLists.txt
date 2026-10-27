@@ -51,6 +51,8 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(nominal_refresh_tests tests/nominal_refresh_tests.cpp)
+    add_test(NAME nominal_refresh COMMAND nominal_refresh_tests)
     add_executable(input_timing_tests tests/input_timing_tests.cpp)
     target_include_directories(input_timing_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME input_timing COMMAND input_timing_tests)

@@ -6,6 +6,13 @@
 #include <cstring>
 
 namespace api_validation {
+inline uint32_t MaxSwapchainDimension(bool direct3D, bool otherGraphics) {
+    return direct3D && !otherGraphics ? 16384u : 4096u;
+}
+inline bool SwapchainExtentValid(uint32_t width, uint32_t height, uint32_t limit) {
+    return width > 0 && height > 0 && width <= limit && height <= limit;
+}
+
 
 inline XrResult ValidateApiVersion(XrVersion requested, XrVersion supported) {
     // Patch revisions are fully compatible in OpenXR. Compare the interface-bearing

@@ -1,3 +1,4 @@
+#include "nominal_refresh.h"
 // MCP Integration - Screenshot capture and status reporting for OpenXR Simulator
 #pragma once
 #include "submission_cadence.h"
@@ -527,7 +528,7 @@ inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t heigh
     fprintf(file, "  \"format\": \"%s\",\n", format ? format : "unknown");
     fprintf(file, "  \"session_state\": \"%s\",\n", sessionState ? sessionState : "unknown");
     fprintf(file, "  \"timing_schema_version\": 2,\n");
-    fprintf(file, "  \"target_fps\": null, \"frame_limiter_enabled\": false, \"nominal_prediction_hz\": 90,\n");
+    fprintf(file, "  \"target_fps\": null, \"frame_limiter_enabled\": false, \"nominal_prediction_hz\": %.6f,\n", perf::ConfiguredNominalRefreshHz());
     if (cadence.intervalValid) fprintf(file, "  \"frame_time_ms\": %.9f,\n", cadence.frameIntervalMs);
     else fprintf(file, "  \"frame_time_ms\": null,\n");
     fprintf(file, "  \"projection_cadence\": {\"stereo_submissions\": %llu, \"last_submission_monotonic_ns\": %lld, \"segment\": %llu, \"interval_valid\": %s, \"last_frame_had_stereo\": %s},\n",
