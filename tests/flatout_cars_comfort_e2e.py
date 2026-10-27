@@ -60,5 +60,5 @@ if __name__=='__main__':
     p.add_argument('--data-dir',required=True,type=Path)
     p.add_argument('--evidence',required=True,type=Path)
     p.add_argument('--hand',default='right',choices=('left','right'))
-    p.add_argument('--menu',default='cars',choices=('cars','drivers'))
+    p.add_argument('--menu',default='cars',choices=('cars','drivers','upgrades'))
     asyncio.run(run(p.parse_args()))
