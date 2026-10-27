@@ -10,6 +10,12 @@ A lightweight OpenXR runtime that enables VR applications to run in a desktop wi
 
 ## 🎯 Features
 
+- **OpenXR Correctness** - Validated frame and swapchain lifecycles, unique swapchain handles, relative-space transforms, and stable action snapshots
+- **Cylinder Layers** - Curved UI layers render alongside projection and quad layers in submission order
+- **Godot Compatibility** - VIEW-space head tracking, array-texture readback, aligned controller yaw, and a static C++ runtime
+- **Input Polling** - Choose preview-only, application-foreground, or background input; the preview has its own responsive UI thread
+- **UI Automation and Diagnostics** - Screenshot-based controller targeting, spatial-comfort tools, D3D11 composed-frame bursts, and per-eye freshness metadata
+- **Windows Packages** - Portable x64 and x86 runtimes with automated build, test, and release packaging
 - **Multi-API Support** - Supports D3D11, D3D12, Vulkan and OpenGL graphics backends
 - **Desktop VR Preview** - Run VR applications in a resizable desktop window with side-by-side stereo view
 - **Live XR Performance** - Title-bar FPS and frametime are measured from stereo `xrEndFrame` submissions, not window repaints; press F3 for rolling p50/p95 frametimes
@@ -27,21 +33,23 @@ A lightweight OpenXR runtime that enables VR applications to run in a desktop wi
 
 - Windows 10/11 (64-bit)
 - DirectX 11/12 or OpenGL compatible GPU
-- Visual Studio 2022 (for building from source)
-- CMake 3.20 or later (for building from source)
 
 ### Installation
 
-1. Download the latest release from the [Releases](https://github.com/yourusername/OpenXR-Simulator/releases) page
-2. Extract the archive to your preferred location
-3. Run PowerShell as Administrator
-4. Navigate to the `scripts` folder
-5. Run `.\register-runtime.ps1` to set as active OpenXR runtime
+1. Download the Windows ZIP from the [Releases](https://github.com/elliotttate/OpenXR-Simulator/releases) page.
+2. Extract the entire ZIP to a permanent folder.
+3. Double-click **Activate Simulator.cmd** and approve the administrator prompt.
 
 ```powershell
-cd C:\Path\To\OpenXR-Simulator\scripts
-.\register-runtime.ps1
+cd C:\Path\To\OpenXR-Simulator
+.\activate_simulator.ps1
 ```
+
+Keep the extracted files together and do not move the folder while the simulator
+is active. The package includes the normal 64-bit runtime plus an x86 DLL and
+manifest for 32-bit development tools. To launch a 32-bit application without
+changing the machine-wide runtime, set `XR_RUNTIME_JSON` for that process to the
+full path of `openxr_simulator-32.json`.
 
 ### Usage
 
@@ -53,30 +61,47 @@ Once registered, any OpenXR application will automatically use the simulator:
    - **Mouse**: Look around (hold right-click)
    - **WASD**: Move forward/backward/strafe
    - **Q/E**: Move up/down
+   - **IJKL**: Left controller thumbstick for application locomotion
+   - **Arrow Keys**: Right controller thumbstick
+   - **M**: Toggle automatic controller animation
    - **Shift**: Hold to move faster
    - **, / .**: Slower/faster movement
    - **ESC**: Release mouse capture
    - **F3**: Show detailed XR p50/p95 frametime statistics in the title bar
+
+### Godot
+
+Use Godot's Compatibility (OpenGL3) renderer for the Godot compatibility path.
+Enable OpenXR in the project and keep its XR startup node in the main scene.
+IJKL drives the left thumbstick, so XRTools locomotion can apply its normal
+collision rules; WASD moves the simulated head directly. VIEW reference spaces
+track the head, stereo array textures honor each submitted slice, and the static
+C++ runtime avoids depending on the host application's MSVCP140.dll version.
 
 ### Uninstallation
 
 To restore your previous OpenXR runtime:
 
 ```powershell
-cd C:\Path\To\OpenXR-Simulator\scripts
-.\unregister-runtime.ps1
+cd C:\Path\To\OpenXR-Simulator
+.\deactivate_simulator.ps1
 ```
+
+You can also double-click **Deactivate Simulator.cmd**.
 
 ## 🛠️ Building from Source
 
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/OpenXR-Simulator.git
+git clone https://github.com/elliotttate/OpenXR-Simulator.git
 cd OpenXR-Simulator
 ```
 
 ### Build with CMake
+
+Building from source requires Visual Studio 2022 with the C++ toolchain, CMake
+3.20 or later, and Vulkan headers (normally installed with the Vulkan SDK).
 
 ```bash
 mkdir build
@@ -85,7 +110,49 @@ cmake .. -G "Visual Studio 17 2022" -A x64
 cmake --build . --config Release
 ```
 
-The built runtime will be in `build/bin/Release/openxr_simulator.dll`
+The built runtime will be in `bin/openxr_simulator.dll`.
+
+### Release automation
+
+GitHub Actions builds and tests both x64 and x86 for every push and pull request,
+then assembles one ready-to-extract Windows ZIP containing both runtimes, portable
+manifests, activation helpers, documentation, and the MCP server. To publish a
+release, push a version tag such as `v1.6.0`; after validation passes, the workflow
+uploads the ZIP and its SHA-256 checksum to a GitHub release with generated notes.
+
+## 🔌 MCP Server
+
+The bundled [MCP server](mcp-server/) exposes the simulator to LLM agents
+(Claude Code, and any other Model Context Protocol client) for hands-free
+testing, diagnosis, and driving of VR sessions:
+
+- **Capture** — `capture_screenshot` (stereo or per-eye), `get_frame_info`,
+  `get_projection_log`, `validate_stereo`
+- **Diagnose** — `read_logs`, `get_diagnostics`, `diagnose_issue`,
+  `get_session_state`, `get_head_tracking`, `clear_logs`
+- **Flicker detection** — `get_flicker_status`, `capture_flicker_window`,
+  `get_ui_flicker_status`, `capture_ui_flicker_window` (returns incident
+  contact sheets an agent can review visually)
+- **Control** — `set_head_pose`, `set_fov`, `set_ipd`, `set_headset_profile`,
+  `enable_anaglyph_preview`, `enable_pose_sweep`
+
+Quick start:
+
+```bash
+cd mcp-server
+pip install -e .
+python openxr_simulator_mcp.py
+```
+
+Register it with Claude Code:
+
+```bash
+claude mcp add openxr-simulator --scope user -- python C:/path/to/OpenXR-Simulator/mcp-server/openxr_simulator_mcp.py
+```
+
+Other MCP clients take the same command in their `mcpServers` config.
+
+See the [MCP server README](mcp-server/README.md) for full tool documentation.
 
 ## 📖 Technical Details
 
@@ -104,7 +171,8 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 - ✅ D3D11 graphics binding (`XR_KHR_D3D11_enable`)
 - ✅ D3D12 graphics binding (`XR_KHR_D3D12_enable`)
 - ✅ Vulkan graphics binding (`XR_KHR_vulkan_enable` and `XR_KHR_vulkan_enable2`)
-- ✅ OpenGL graphics binding (`XR_KHR_opengl_enable`)
+- ✅ OpenGL graphics binding (`XR_KHR_opengl_enable`) and stereo array swapchains
+- ✅ Cylinder composition layers (`XR_KHR_composition_layer_cylinder`)
 - ✅ Win32 time conversion (`XR_KHR_win32_convert_performance_counter_time`)
 - ✅ Multiple swapchain formats (sRGB, UNORM, HDR, typeless, depth)
 - ✅ Mutable format swapchains (typeless backing for sRGB/non-sRGB views)
@@ -185,6 +253,25 @@ available for pixel inspection.
 WASD/QE move the head at 3 m/s by default, and holding **Shift** multiplies that
 by 4. Both numbers are set from **Tools → Movement Speed**: presets from 0.5 to
 10 m/s, `,` and `.` to step off them, and a submenu for the Shift multiplier.
+
+### Input Polling
+
+Head and controller keys are read with `GetAsyncKeyState`, which ignores window
+focus, so **Tools → Input Polling** sets how far they reach:
+
+- **Preview or Application Window** (default) — keys work while either the preview
+  or the OpenXR application's own window is in the foreground. The runtime is a DLL
+  inside that application, so both are recognised by process id, and alt-tabbing to
+  an unrelated program stops input.
+- **Preview Window Only** — only the simulator's own preview window. Useful when the
+  application binds the same keys, but note that games which take the foreground on
+  launch or run fullscreen will leave WASD doing nothing.
+- **Background (poll while unfocused)** — keys are read no matter which program is in
+  the foreground, so the head keeps moving while you work in another window. Anything
+  else you type is seen too, including WASD, arrows, Space and Tab.
+
+Mouse look is unaffected: it is driven by window messages and always needs a click on
+the preview window.
 
 ### Mirror Rate
 
@@ -280,9 +367,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/OpenXR-Simulator/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/OpenXR-Simulator/discussions)
-- **Documentation**: [Wiki](https://github.com/yourusername/OpenXR-Simulator/wiki)
+- **Issues**: [GitHub Issues](https://github.com/elliotttate/OpenXR-Simulator/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/elliotttate/OpenXR-Simulator/discussions)
+- **Documentation**: [Wiki](https://github.com/elliotttate/OpenXR-Simulator/wiki)
 
 ## 🗺️ Roadmap
 

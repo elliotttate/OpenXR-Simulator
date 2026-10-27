@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 from PIL import Image
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -190,7 +191,8 @@ class Frontend:
         nodes=(await self.query("hud.rects",{"root":"menu","max_depth":5}))["nodes"]
         text=next(n for n in nodes if n["path"].endswith("/CreditsText"))
         viewport=next(n for n in nodes if n["path"].endswith("/CreditsViewport"))
-        finish_at=-(text["rect"][3]-text["rect"][1]+viewport["rect"][3]-viewport["rect"][1])
+        # Completion occurs when the final text leaves the viewport's top.
+        finish_at=state["position"]-(text["rect"][3]-viewport["rect"][1])
         before,args=await self.point_args("helper.RB.2")
         held=await self.tool("hold_ui_at",args,"credits-full-roll-hold")
         assert held["status"]=="input_delivered",held
@@ -477,6 +479,7 @@ class Frontend:
         # pose before projecting another ray; a fixed sleep can capture the old view.
         response=await self.session.call_tool("set_head_pose",pose)
         assert not response.isError,response
+        assert any(getattr(c,"text","").startswith("Head pose command queued:") for c in response.content),response
         yaw,pitch,roll=(math.radians(pose.get(k,0)) for k in ("yaw_deg","pitch_deg","roll_deg"))
         cy,sy=math.cos(yaw),math.sin(yaw);cp,sp=math.cos(pitch),math.sin(pitch);cr,sr=math.cos(roll),math.sin(roll)
         expected=np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]])@np.array([[1,0,0],[0,cp,-sp],[0,sp,cp]])@np.array([[cr,-sr,0],[sr,cr,0],[0,0,1]])
@@ -1517,7 +1520,7 @@ class Frontend:
                 if np.dot(normal, eyes - rest) < 0:
                     normal = -normal
                 lift = float(np.dot(moved - rest, normal))
-                expected = 0 if observed.get("locked") else .015
+                expected = 0 if observed.get("locked") else HOVER_LIFT_METERS
                 assert abs(lift - expected) < .001, ("Incorrect physical spatial lift", observed["title"], lift)
                 assert np.linalg.norm(moved - rest - normal * lift) < .001, "Spatial hover slid sideways"
                 self.cases.append({"case": "spatial-metric-lift", "passed": True, "title": observed["title"], "meters": lift})
@@ -1569,6 +1572,14 @@ class Frontend:
             assert 0<=px<source["image_size"][0] and 0<=py<source["image_size"][1], (label,[px,py])
             return {"capture_id":source["capture_id"],"x":float(px),"y":float(py),"hand":hand or self.args.hand,
                     "origin_mode":"hand","surface":ui_surface(local_state),"ray_offset":RAY_OFFSET,"dwell_frames":30}
+        # A hand left at a previous menu's world pose can legitimately hover a
+        # different row here. Park it before recording the selection baseline
+        # for the active hand's miss tests; later checks deliberately use both.
+        spare = "left" if self.args.hand=="right" else "right"
+        parked = await aim_at(point(0,-4*half[1]),"spatial-back-initial-spare-away",spare)
+        await self.tool("hover_ui_at",parked,"spatial-back-initial-spare-parked")
+        menu = await self.query("menu.get_state")
+        capture = await self.capture("spatial-back-plate-source")
         # A real secondary button needs an opaque, dark plate around its
         # caption; a floating word over the road is not a visible hit region.
         pixels = np.asarray(Image.open(self.last_image_path).convert("RGB")).astype(float)
@@ -2359,7 +2370,7 @@ if __name__ == "__main__":
     parser.add_argument("--career-wrong-class-only", action="store_true", help="From Career class selection with a Derby car: verify Classic/AllStar warnings, filtered cars and Back without buying")
     parser.add_argument("--options-redesign-layout-only", action="store_true", help="From Options: require a category rail and a single spacious list with separate page controls")
     parser.add_argument("--return-main-only", action="store_true", help="From in-race Options or Pause: use ray Back and confirm Main Menu exactly once")
-    parser.add_argument("--require-physical-lift", action="store_true", help="Require actual 15mm forward travel for enabled spatial labels")
+    parser.add_argument("--require-physical-lift", action="store_true", help="Require actual 20mm forward travel for enabled spatial labels")
     parser.add_argument("--spatial-hover-only", action="store_true", help="From a spatial text menu: screenshot and hover each rendered label, optionally activate one")
     parser.add_argument("--skip-menu-index", action="append", type=int, default=[], help="Exclude an explicitly deferred spatial menu item")
     parser.add_argument("--spatial-back-only", action="store_true", help="From a spatial submenu: check Back in both eyes, reject edge/other-ray presses, verify its chevron and click once; requires --expected-menu")

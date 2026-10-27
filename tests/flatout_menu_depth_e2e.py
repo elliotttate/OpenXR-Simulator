@@ -1,4 +1,4 @@
-"""Screenshot -> real hand hover -> 15 mm submitted face -> one click/retry.
+"""Screenshot -> real hand hover -> 20 mm submitted face -> one click/retry.
 
 Start in the desired non-Wreck menu. No game-side input injection is used.
 The existing game pipe supplies read-only target and presentation diagnostics.
@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from flatout_frontend_e2e import Frontend, ROOT, quad_pixel
@@ -85,13 +86,13 @@ class MenuDepth(Frontend):
             matching = []
             for tile, lift in zip(tiles, lifts):
                 local = quaternion_matrix(tile['pose']['orientation']).T @ (point-np.array(tile['pose']['position']))
-                if abs(lift-.015) < .001 and all(abs(local[i]) <= tile['size'][i]/2+.002 for i in (0, 1)):
+                if abs(lift-HOVER_LIFT_METERS) < .001 and all(abs(local[i]) <= tile['size'][i]/2+.002 for i in (0, 1)):
                     matching.append(tile)
             passed = bool(matching)
             if not passed:
                 self.cases.append({'case': 'physical-hover-' + name, 'passed': False,
                                    'lift_meters': lifts, 'source_rect': target['rect'], 'base': base, 'tiles': tiles})
-            assert passed, (name, 'No 15mm physical lift', lifts)
+            assert passed, (name, 'No 20mm physical lift', lifts)
             assert len(tiles) <= 2, ('Unbounded transient layers', tiles)
             if self.args.gpu_capture:
                 queued = await self.query('renderdoc.capture', {'frames': 1,

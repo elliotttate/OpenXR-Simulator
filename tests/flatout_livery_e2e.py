@@ -22,6 +22,7 @@ from io import BytesIO
 from pathlib import Path
 
 import numpy as np
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 from PIL import Image
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -421,7 +422,7 @@ class LiveryTest:
             assert np.isfinite(center).all() and np.isfinite(size).all(), tile
             assert tile["visibility"] == 0, ("Each lifted face must serve both eyes", tile)
             assert np.linalg.norm(basis-base_basis) < 1e-4, ("Control rotated away from the native panel", tile)
-            assert 0.000002 < center[2] <= .0151, ("Unexpected physical UI lift", center.tolist(), tile)
+            assert 0.000002 < center[2] <= HOVER_LIFT_METERS + .0001, ("Unexpected physical UI lift", center.tolist(), tile)
             assert 0 < size[0] < width and 0 < size[1] < height, ("The base panel must remain world-space", tile)
             left = (.5+(center[0]-size[0]/2)/width)*1920
             right = (.5+(center[0]+size[0]/2)/width)*1920

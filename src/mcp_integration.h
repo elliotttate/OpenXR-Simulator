@@ -16,7 +16,9 @@
 #include <atomic>
 
 #include "json.h"
+#include "command_epochs.h"
 #include "ui_automation.h"
+#include "flicker_detector.h"
 
 namespace mcp {
 
@@ -38,6 +40,16 @@ inline void McpLogf(const char* fmt, ...) {
 
 inline const std::string& GetSimulatorDataPath() {
     static const std::string path = []() -> std::string {
+        // SIMXR_DATA_DIR overrides the MCP<->runtime exchange folder, matching the
+        // same override in the Python MCP server: side-by-side simulator instances
+        // and hermetic server tests can use a throwaway directory.
+        char over[MAX_PATH]{};
+        DWORD olen = GetEnvironmentVariableA("SIMXR_DATA_DIR", over, (DWORD)sizeof(over));
+        if (olen > 0 && olen < sizeof(over)) {
+            std::string dir(over);
+            while (!dir.empty() && (dir.back() == '\\' || dir.back() == '/')) dir.pop_back();
+            if (!dir.empty()) return dir;
+        }
         char base[MAX_PATH]{};
         DWORD overrideLen = GetEnvironmentVariableA("SIMXR_DATA_DIR", base, (DWORD)sizeof(base));
         if (overrideLen > 0 && overrideLen < sizeof(base)) return std::string(base);
@@ -62,6 +74,7 @@ inline const std::string& GetSimulatorDataPath() {
 // The 500ms backstop covers what the watch cannot: an overflowed notification buffer,
 // and the handle going stale if the folder is deleted and recreated underneath us.
 inline std::atomic_bool g_commandsDue{true};   // poll once on the first frame to drain anything stale
+inline CommandEpoch g_commandEpoch;
 
 inline bool IsCommandFileName(const wchar_t* name, size_t chars) {
     wchar_t lowered[96];
@@ -129,11 +142,21 @@ inline void RefreshCommandsDue() {
             commandTouched = true;
         }
         rearm();
-        if (commandTouched) g_commandsDue = true;
+        if (commandTouched) {
+            flicker::RequestRuntimeCommands();
+            g_commandEpoch.Notify();
+            g_commandsDue = true;
+        }
+    }
+    if (flicker::RuntimeCommandsReady()) {
+        g_commandEpoch.Notify();
+        g_commandsDue = true;
     }
     const ULONGLONG now = GetTickCount64();
     if (now - lastPoll >= 500) {
         lastPoll = now;
+        flicker::RequestRuntimeCommands();
+        g_commandEpoch.Notify();
         g_commandsDue = true;
     }
 }
@@ -197,15 +220,23 @@ inline uint32_t g_quadLayerWidth = 0;
 inline uint32_t g_quadLayerHeight = 0;
 inline bool g_quadLayerCaptured = false;
 
+// Consume the worker's bounded command inbox; no filesystem access here.
+inline bool ReadPendingCommand(const char* path, char* buffer, size_t capacity) {
+    const std::string fullPath(path);
+    const size_t slash = fullPath.find_last_of("\\/");
+    std::string contents;
+    if (!flicker::TakeRuntimeCommand(fullPath.substr(slash == std::string::npos ? 0 : slash+1), contents)) return false;
+    const size_t count = (std::min)(contents.size(), capacity-1);
+    memcpy(buffer, contents.data(), count);
+    buffer[count] = 0;
+    return true;
+}
+
 // Check if MCP has requested a screenshot
 inline void CheckScreenshotRequest() {
     std::string reqPath = GetSimulatorDataPath() + "\\screenshot_request.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, reqPath.c_str(), "r") == 0 && f) {
-        char buf[512];
-        size_t n = fread(buf, 1, sizeof(buf)-1, f);
-        buf[n] = 0;
-        fclose(f);
+    char buf[512];
+    if (ReadPendingCommand(reqPath.c_str(), buf, sizeof(buf))) {
 
         json::Object o(buf);
         g_screenshotRequested = true;
@@ -219,7 +250,6 @@ inline void CheckScreenshotRequest() {
         }
         g_screenshotAfterSync = (uint64_t)o.number("after_sync", 0.0);
 
-        DeleteFileA(reqPath.c_str());
         McpLogf("Screenshot request detected: layer=%s, eye=%s", g_screenshotLayer.c_str(), g_screenshotEye.c_str());
     }
 }
@@ -498,32 +528,21 @@ inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t heigh
     if (lastWriteMs != 0 && nowMs - lastWriteMs < 500) return;
     lastWriteMs = nowMs;
 
-    std::string path = GetSimulatorDataPath() + "\\runtime_status.json";
-    FILE* file = nullptr;
-    if (fopen_s(&file, path.c_str(), "w") != 0 || !file) return;
-
-    // Get current timestamp
     SYSTEMTIME st;
     GetLocalTime(&st);
-
-    fprintf(file, "{\n");
-    fprintf(file, "  \"timestamp\": \"%04d-%02d-%02dT%02d:%02d:%02d\",\n",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    fprintf(file, "  \"frame_count\": %u,\n", frameCount);
-    fprintf(file, "  \"preview_width\": %u,\n", width);
-    fprintf(file, "  \"preview_height\": %u,\n", height);
-    fprintf(file, "  \"format\": \"%s\",\n", format ? format : "unknown");
-    fprintf(file, "  \"session_state\": \"%s\",\n", sessionState ? sessionState : "unknown");
-    fprintf(file, "  \"target_fps\": 90,\n");
-    fprintf(file, "  \"frame_time_ms\": 11.1,\n");
-    fprintf(file, "  \"head_tracking\": {\n");
-    fprintf(file, "    \"position\": {\"x\": %.3f, \"y\": %.3f, \"z\": %.3f},\n", headX, headY, headZ);
-    fprintf(file, "    \"yaw\": %.3f,\n", headYaw);
-    fprintf(file, "    \"pitch\": %.3f,\n", headPitch);
-    fprintf(file, "    \"roll\": %.3f\n", headRoll);
-    fprintf(file, "  }\n");
-    fprintf(file, "}\n");
-    fclose(file);
+    char snapshot[1536];
+    const int length = snprintf(snapshot, sizeof(snapshot),
+        "{\n  \"timestamp\": \"%04d-%02d-%02dT%02d:%02d:%02d\",\n"
+        "  \"frame_count\": %u,\n  \"preview_width\": %u,\n  \"preview_height\": %u,\n"
+        "  \"format\": \"%s\",\n  \"session_state\": \"%s\",\n"
+        "  \"target_fps\": 90,\n  \"frame_time_ms\": 11.1,\n"
+        "  \"head_tracking\": {\n    \"position\": {\"x\": %.3f, \"y\": %.3f, \"z\": %.3f},\n"
+        "    \"yaw\": %.3f,\n    \"pitch\": %.3f,\n    \"roll\": %.3f\n  }\n}\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+        frameCount, width, height, format ? format : "unknown", sessionState ? sessionState : "unknown",
+        headX, headY, headZ, headYaw, headPitch, headRoll);
+    if (length > 0 && length < (int)sizeof(snapshot))
+        flicker::PublishRuntimeStatus(std::string(snapshot, (size_t)length));
 }
 
 // Get session state name
@@ -540,6 +559,24 @@ inline const char* GetSessionStateName(int state) {
         case 8: return "EXITING";
         default: return "UNKNOWN";
     }
+}
+
+// Explicit input-focus simulation; diagnostic-window activation remains separate.
+struct SessionFocusCommand {
+    bool valid = false;
+    bool focused = true;
+};
+
+inline SessionFocusCommand CheckSessionFocusCommand() {
+    SessionFocusCommand cmd;
+    const std::string path = GetSimulatorDataPath() + "\\session_focus_command.json";
+    char buffer[256];
+    if (!ReadPendingCommand(path.c_str(), buffer, sizeof(buffer))) return cmd;
+    json::Object object(buffer);
+    if (!object.valid() || !object.has("focused")) return cmd;
+    cmd.focused = object.boolean("focused", true);
+    cmd.valid = true;
+    return cmd;
 }
 
 // Head pose control structure for MCP
@@ -560,15 +597,9 @@ struct HeadPoseCommand {
 inline HeadPoseCommand CheckHeadPoseCommand() {
     HeadPoseCommand cmd;
     std::string cmdPath = GetSimulatorDataPath() + "\\head_pose_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, cmdPath.c_str(), "r") == 0 && f) {
-        char buf[512];
-        size_t n = fread(buf, 1, sizeof(buf)-1, f);
-        buf[n] = 0;
-        fclose(f);
+    char buf[512];
+    if (ReadPendingCommand(cmdPath.c_str(), buf, sizeof(buf))) {
 
-        // Delete the file after reading (one-shot command)
-        DeleteFileA(cmdPath.c_str());
 
         json::Object o(buf);
         if (!o.valid()) return cmd;
@@ -613,13 +644,8 @@ struct FovCommand {
 inline FovCommand CheckFovCommand() {
     FovCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\fov_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[1024];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -656,13 +682,8 @@ struct IpdCommand {
 inline IpdCommand CheckIpdCommand() {
     IpdCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\ipd_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -689,13 +710,8 @@ struct HeadsetProfileCommand {
 inline HeadsetProfileCommand CheckHeadsetProfileCommand() {
     HeadsetProfileCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\headset_profile_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     std::string name = json::Object(buf).string("name");
     if (name.empty()) return cmd;
@@ -719,13 +735,8 @@ struct PoseSweepCommand {
 inline PoseSweepCommand CheckPoseSweepCommand() {
     PoseSweepCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\pose_sweep_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -750,13 +761,8 @@ struct AnaglyphCommand {
 inline AnaglyphCommand CheckAnaglyphCommand() {
     AnaglyphCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\anaglyph_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -783,6 +789,12 @@ struct ProjLogEntry {
     float aL[2] = {0,0}, aR[2] = {0,0}, aU[2] = {0,0}, aD[2] = {0,0};
     // Image sub-rect per eye (left/right): offset_x, offset_y, extent_w, extent_h
     int32_t rectX[2] = {0,0}, rectY[2] = {0,0}, rectW[2] = {0,0}, rectH[2] = {0,0};
+    // The released images that supplied this projection. releaseSerial increments on
+    // every successful xrReleaseSwapchainImage; fresh=false therefore proves that the
+    // app resubmitted cached projection content rather than releasing a new image.
+    uint32_t imageIndex[2] = {UINT32_MAX, UINT32_MAX};
+    uint64_t releaseSerial[2] = {0,0};
+    bool fresh[2] = {false,false};
 };
 constexpr size_t PROJ_LOG_CAPACITY = 64;
 inline ProjLogEntry  g_projLog[PROJ_LOG_CAPACITY];
@@ -806,13 +818,17 @@ inline void DumpProjectionLog() {
                 "\"left_fov\":  {\"aL\": %.6f, \"aR\": %.6f, \"aU\": %.6f, \"aD\": %.6f}, "
                 "\"right_fov\": {\"aL\": %.6f, \"aR\": %.6f, \"aU\": %.6f, \"aD\": %.6f}, "
                 "\"left_rect\":  [%d, %d, %d, %d], "
-                "\"right_rect\": [%d, %d, %d, %d]}%s\n",
+                "\"right_rect\": [%d, %d, %d, %d], "
+                "\"images\": {\"left\": {\"index\": %u, \"releaseSerial\": %llu, \"fresh\": %s}, "
+                "\"right\": {\"index\": %u, \"releaseSerial\": %llu, \"fresh\": %s}}}%s\n",
                 e.frame, e.posX, e.posY, e.posZ,
                 e.poseQx, e.poseQy, e.poseQz, e.poseQw,
                 e.aL[0], e.aR[0], e.aU[0], e.aD[0],
                 e.aL[1], e.aR[1], e.aU[1], e.aD[1],
                 e.rectX[0], e.rectY[0], e.rectW[0], e.rectH[0],
                 e.rectX[1], e.rectY[1], e.rectW[1], e.rectH[1],
+                e.imageIndex[0], (unsigned long long)e.releaseSerial[0], e.fresh[0] ? "true" : "false",
+                e.imageIndex[1], (unsigned long long)e.releaseSerial[1], e.fresh[1] ? "true" : "false",
                 (i + 1 < n) ? "," : "");
     }
     fprintf(f, "  ]\n}\n");
@@ -821,10 +837,8 @@ inline void DumpProjectionLog() {
 
 // MCP polls a ".dump_request" file to ask us to write the log.
 inline bool CheckProjLogDumpRequest() {
-    std::string p = GetSimulatorDataPath() + "\\projection_log_dump_request";
-    if (GetFileAttributesA(p.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
-    DeleteFileA(p.c_str());
-    return true;
+    std::string contents;
+    return flicker::TakeRuntimeCommand("projection_log_dump_request", contents);
 }
 
 // ---------- Frame-burst capture ----------
@@ -838,9 +852,9 @@ inline bool CheckProjLogDumpRequest() {
 // artifacts (shadows lagging a head-pose whip) that a one-shot screenshot
 // round-trip is far too slow to catch.
 //
-// D3D12 and Vulkan sessions only: BurstOnFrame records the preview's DIB back
-// buffer, which is the one place a composited frame exists in CPU memory. A
-// D3D11 or OpenGL session acks the command as failed rather than recording it.
+// D3D12/Vulkan use the preview's existing DIB readback. D3D11 queues the fully
+// composed swapchain backbuffer into a non-blocking staging/query ring before Present.
+// OpenGL remains unsupported by this burst path.
 //
 // Drive it by writing burst_command.json:
 //   {"frames": 32, "pose": {"yaw": 25, "pitch": 0, "x": 0, "y": 1.7, "z": 0}}
@@ -858,13 +872,8 @@ struct BurstCommand {
 inline BurstCommand CheckBurstCommand() {
     BurstCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\burst_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[512];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -945,11 +954,17 @@ inline void BurstFlush() {
             fprintf(f, "    {\"i\": %u, \"file\": \"burst_%03u.bmp\", \"frame\": %u, \"t_ms\": %.2f, "
                     "\"head\": {\"yaw\": %.4f, \"pitch\": %.4f, \"roll\": %.4f, \"x\": %.4f, \"y\": %.4f, \"z\": %.4f}, "
                     "\"submitted\": {\"frame\": %u, \"qx\": %.6f, \"qy\": %.6f, \"qz\": %.6f, \"qw\": %.6f, "
-                    "\"x\": %.4f, \"y\": %.4f, \"z\": %.4f}}%s\n",
+                    "\"x\": %.4f, \"y\": %.4f, \"z\": %.4f}, "
+                    "\"projectionFresh\": %s, "
+                    "\"images\": {\"left\": {\"index\": %u, \"releaseSerial\": %llu, \"fresh\": %s}, "
+                    "\"right\": {\"index\": %u, \"releaseSerial\": %llu, \"fresh\": %s}}}%s\n",
                     (unsigned)i, (unsigned)i, m.frame, m.tMs,
                     m.headYaw, m.headPitch, m.headRoll, m.headX, m.headY, m.headZ,
                     m.proj.frame, m.proj.poseQx, m.proj.poseQy, m.proj.poseQz, m.proj.poseQw,
                     m.proj.posX, m.proj.posY, m.proj.posZ,
+                    (m.proj.fresh[0] && m.proj.fresh[1]) ? "true" : "false",
+                    m.proj.imageIndex[0], (unsigned long long)m.proj.releaseSerial[0], m.proj.fresh[0] ? "true" : "false",
+                    m.proj.imageIndex[1], (unsigned long long)m.proj.releaseSerial[1], m.proj.fresh[1] ? "true" : "false",
                     (i + 1 < n) ? "," : "");
         }
         fprintf(f, "  ]\n}\n");
@@ -967,7 +982,8 @@ inline void BurstFlush() {
 
 inline void BurstOnFrame(const uint8_t* bits, int w, int h, int stride, uint32_t frameCount,
                          float headYaw, float headPitch, float headRoll,
-                         float headX, float headY, float headZ) {
+                         float headX, float headY, float headZ,
+                         const ProjLogEntry& projection) {
     if (!g_burstActive || !bits || w <= 0 || h <= 0) return;
     if (g_burstW == 0) {
         g_burstW = (uint32_t)w;
@@ -988,7 +1004,7 @@ inline void BurstOnFrame(const uint8_t* bits, int w, int h, int stride, uint32_t
     m.frame = frameCount;
     m.headYaw = headYaw; m.headPitch = headPitch; m.headRoll = headRoll;
     m.headX = headX; m.headY = headY; m.headZ = headZ;
-    m.proj = g_lastProjEntry;
+    m.proj = projection;
     m.tMs = (double)GetTickCount64();
     g_burstMeta.push_back(m);
 
@@ -1017,15 +1033,9 @@ struct ControllerPoseCommand {
 inline ControllerPoseCommand CheckControllerPoseCommand() {
     ControllerPoseCommand cmd;
     std::string cmdPath = GetSimulatorDataPath() + "\\controller_pose_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, cmdPath.c_str(), "r") == 0 && f) {
-        char buf[512];
-        size_t n = fread(buf, 1, sizeof(buf)-1, f);
-        buf[n] = 0;
-        fclose(f);
+    char buf[512];
+    if (ReadPendingCommand(cmdPath.c_str(), buf, sizeof(buf))) {
 
-        // Delete the file after reading (one-shot command)
-        DeleteFileA(cmdPath.c_str());
 
         json::Object o(buf);
         if (!o.valid()) return cmd;

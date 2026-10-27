@@ -24,6 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 from ui_targeting import UiAutomation, annotate_target
+from atomic_json_file import atomic_json
+from ui_comfort import guidelines as ui_comfort_guidelines, analyze_visibility, annotate_visibility, tool_specs as ui_comfort_tool_specs
 
 # MCP SDK imports
 try:
@@ -42,6 +44,9 @@ except ImportError:
 
 # Configuration
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
+# SIMXR_DATA_DIR overrides the MCP<->runtime file-exchange folder (it must match the
+# same override in the runtime) so instances can run side by side and tests can run
+# against a throwaway directory instead of %LOCALAPPDATA%.
 SIMULATOR_DIR = Path(os.environ.get("SIMXR_DATA_DIR") or Path(LOCALAPPDATA) / "OpenXR-Simulator")
 ui_automation = UiAutomation(SIMULATOR_DIR)
 # The runtime writes one log per process, openxr_simulator.<pid>.log, so there is no
@@ -115,13 +120,27 @@ def runtime_is_live() -> bool:
 
     The status and log files outlive the process that wrote them, so without this
     check a long-dead session still reports FOCUSED. The owning PID comes from the
-    log filename; PID reuse can in principle produce a false positive.
+    log filename, or a recent immutable capture plus this directory's heartbeat
+    when diagnostic logging is unavailable. PID reuse remains a limitation.
     """
     log = current_log_file()
-    if log is None:
+    pid = log_owner_pid(log) if log is not None else None
+    if pid is not None and _pid_alive(pid):
+        return True
+    # Diagnostic logging can be disabled or live outside an isolated exchange
+    # directory. A recent immutable capture identifies the actual runtime owner;
+    # require its live PID and a fresh heartbeat in this same directory as well.
+    age = status_age_seconds()
+    if age is None or not 0 <= age <= 2:
         return False
-    pid = log_owner_pid(log)
-    return _pid_alive(pid) if pid is not None else False
+    for capture in sorted(ui_automation.captures.values(), key=lambda c: c.get("created_at", 0), reverse=True):
+        if not 0 <= time.time() - capture.get("created_at", 0) <= 30:
+            continue
+        geometry = capture.get("geometry", {})
+        match = re.fullmatch(r"(\d+)-\d+-\d+", geometry.get("session_id", ""))
+        if geometry.get("supported") and match:
+            return _pid_alive(int(match.group(1)))
+    return False
 
 
 def status_age_seconds() -> Optional[float]:
@@ -247,15 +266,25 @@ def read_status_file() -> Optional[dict[str, Any]]:
         return None
 
 
-def build_flicker_contact_sheet(incident_dir: Path, max_frames: int = 8) -> Optional[bytes]:
+def select_flicker_preview_frames(incident_dir: Path, max_frames: int = 8) -> list[Path]:
+    """Return the newest complete, numerically ordered preview-frame slice."""
+    return sorted(
+        incident_dir.glob("frame*_preview.bmp"),
+        key=lambda path: int(re.search(r"frame(\d+)", path.name).group(1)),
+    )[-max(2, min(max_frames, 12)):]
+
+
+def build_flicker_contact_sheet(
+    incident_dir: Path,
+    max_frames: int = 8,
+    candidates: Optional[list[Path]] = None,
+) -> Optional[bytes]:
     """Build an in-memory JPEG from simulator-composed preview frames for LLM review."""
     from io import BytesIO
     from PIL import Image, ImageDraw
 
-    candidates = sorted(
-        incident_dir.glob("frame*_preview.bmp"),
-        key=lambda path: int(re.search(r"frame(\d+)", path.name).group(1)),
-    )[-max(2, min(max_frames, 12)):]
+    if candidates is None:
+        candidates = select_flicker_preview_frames(incident_dir, max_frames)
     if len(candidates) < 2:
         return None
     cells = []
@@ -370,10 +399,24 @@ def analyze_openxr_issue(symptoms: str) -> dict[str, Any]:
 def _write_json_command(path: Path, payload: dict[str, Any]) -> None:
     """Atomically write a JSON command file the simulator polls for."""
     ensure_simulator_dir()
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as f:
-        json.dump(payload, f)
-    tmp.replace(path)
+    atomic_json(path,payload)
+
+
+def _write_control_command(path: Path, payload: dict[str, Any]) -> Optional[str]:
+    """Write a control-command file, refusing when no live runtime can consume it.
+
+    The runtime consumes command files on read, but one written while no OpenXR
+    application is running simply sits in the exchange folder until the NEXT
+    session launches and applies it on its first frame - e.g. teleporting a
+    fresh session to a stale head pose or FOV. Returns an error string for the
+    agent instead of writing in that case.
+    """
+    if not runtime_is_live():
+        return ("No live OpenXR Simulator runtime found. Start an OpenXR application "
+                "with the simulator active before sending this command; otherwise it "
+                "would sit unconsumed and apply unexpectedly to a future session.")
+    _write_json_command(path, payload)
+    return None
 
 
 def _deg(rad: float) -> float:
@@ -446,7 +489,7 @@ def _validate_stereo_from_screenshot(image_bytes: bytes) -> dict[str, Any]:
 
     results = {}
     for name, L, R in layouts:
-        if L.size != R.size:  # uneven crop — skip
+        if L.size != R.size:  # uneven crop â€” skip
             continue
         dx, score, contrast = _shift_search(L, R, max_shift=min(60, L.size[0] // 6))
         results[name] = {"disparity_px": dx, "score": float(score), "contrast": round(contrast, 2)}
@@ -557,7 +600,7 @@ def ui_interaction_tools() -> list[Tool]:
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available tools."""
-    return ui_interaction_tools() + [
+    return ui_interaction_tools() + [Tool(**spec) for spec in ui_comfort_tool_specs()] + [
         Tool(
             name="capture_screenshot",
             description="Capture a screenshot of the current OpenXR frame being rendered. "
@@ -613,9 +656,9 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="capture_flicker_window",
-            description="Capture the simulator's rolling composed-preview history plus following frames now, "
-                       "even if the automatic detector threshold has not fired. Returns a contact sheet for "
-                       "direct temporal review by an LLM.",
+            description="Capture consecutive fully composed preview frames now, bypassing the Mirror Rate cap, "
+                       "even if the automatic detector threshold has not fired. Returns a contact sheet plus "
+                       "per-frame swapchain release/freshness metadata for direct temporal review by an LLM.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -716,6 +759,15 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {}
             }
+        ),
+        Tool(
+            name="set_session_focus",
+            description=("Explicitly simulate an OpenXR input-focus handoff: false enters VISIBLE, "
+                         "true returns to FOCUSED. The scene keeps rendering and held automation "
+                         "inputs release on focus loss. This does not emulate SteamVR dashboard compositing. "
+                         "Restore focused=true after testing; requires a live runtime."),
+            inputSchema={"type":"object","properties":{"focused":{"type":"boolean"}},
+                         "required":["focused"],"additionalProperties":False}
         ),
         Tool(
             name="set_head_pose",
@@ -824,7 +876,7 @@ async def list_tools() -> list[Tool]:
             description=("Returns the recent projection-layer FOV / pose / image-rect "
                          "the app submitted via xrEndFrame. Lets you compare what the "
                          "app told the compositor against what the simulator was "
-                         "configured to publish — a quick way to find FOV mismatch."),
+                         "configured to publish â€” a quick way to find FOV mismatch."),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -836,7 +888,7 @@ async def list_tools() -> list[Tool]:
             name="enable_pose_sweep",
             description=("Auto-oscillate the simulator's head yaw / pitch / roll "
                          "on a sine wave. Forces the app through a continuous "
-                         "range of orientations — any quaternion-handedness or "
+                         "range of orientations â€” any quaternion-handedness or "
                          "axis-flip bug produces a visible 'world wobbles wrong "
                          "direction' symptom within seconds. Each axis runs at "
                          "a different phase so the motion isn't degenerate."),
@@ -887,6 +939,30 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                             ImageContent(type="image", data=base64.b64encode(annotate_target(reference, arguments["x"], arguments["y"])).decode(), mimeType="image/jpeg")]
             return content
         except (ValueError, TimeoutError, OSError) as error:
+            return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(error)}))]
+
+    if name == "get_ui_comfort_guidelines":
+        return [TextContent(type="text", text=json.dumps(ui_comfort_guidelines(), indent=2))]
+
+    if name == "analyze_ui_visibility":
+        try:
+            capture_id = arguments["capture_id"]
+            async with ui_automation.lock:
+                capture = ui_automation.captures.get(capture_id)
+                if capture is None:
+                    raise ValueError("Unknown capture_id; capture a screenshot in this MCP session")
+                result = analyze_visibility(capture, targets=arguments.get("targets"), profile=arguments.get("profile"),
+                                            reference_mode=arguments.get("reference_mode", "level_head"),
+                                            reference_pose=arguments.get("reference_pose"))
+                content = [TextContent(type="text", text=json.dumps(result, indent=2, allow_nan=False))]
+                if arguments.get("include_overlay", True):
+                    source = ui_automation.images.get(capture_id)
+                    if source is None:
+                        raise ValueError("Original pixels are unavailable; use include_overlay=false for geometry only")
+                    overlay = annotate_visibility(source, capture, result)
+                    content.append(ImageContent(type="image", data=base64.b64encode(overlay).decode(), mimeType="image/png"))
+                return content
+        except (ValueError, KeyError, TypeError, OSError) as error:
             return [TextContent(type="text", text=json.dumps({"status": "error", "error": str(error)}))]
 
     if name == "capture_screenshot":
@@ -950,10 +1026,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 ).get("lastIncidentDirectory", "")
             except (OSError, json.JSONDecodeError):
                 pass
-        _write_json_command(FLICKER_CAPTURE_REQUEST_FILE, {
+        err = _write_control_command(FLICKER_CAPTURE_REQUEST_FILE, {
             "requestedUnixMs": int(time.time() * 1000),
             "source": "mcp",
         })
+        if err:
+            return [TextContent(type="text", text=err)]
         deadline = time.time() + timeout
         incident_dir: Optional[Path] = None
         status: dict[str, Any] = {}
@@ -973,18 +1051,36 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         if not incident_dir:
             return [TextContent(
                 type="text",
-                text="Timed out waiting for a manual composed-preview burst. The simulator may not be rendering new D3D12 preview frames."
+                text="Timed out waiting for a manual composed-preview burst. The simulator may not be rendering new composed projection frames."
             )]
-        # Give the post-trigger ring a short opportunity to finish without making
-        # a partially filled packet look like a detector failure.
-        settle_deadline = min(deadline, time.time() + 1.0)
-        while time.time() < settle_deadline and len(list(incident_dir.glob("frame*_preview.bmp"))) < max_frames:
+        # A packet begins with rolling history, so a simple image-count threshold can
+        # succeed before the requested post-trigger D3D11 frames have even arrived.
+        # The runtime publishes this marker only after its final queued image is durable.
+        completion_file = incident_dir / "capture_complete.json"
+        while time.time() < deadline and not completion_file.exists():
             time.sleep(0.1)
-        contact_sheet = build_flicker_contact_sheet(incident_dir, max_frames)
+        if not completion_file.exists():
+            return [TextContent(
+                type="text",
+                text="The composed-preview incident started but did not finish before the timeout. No partial frame set was returned."
+            )]
+        selected_previews = select_flicker_preview_frames(incident_dir, max_frames)
+        contact_sheet = build_flicker_contact_sheet(
+            incident_dir, max_frames, selected_previews)
+        frame_metadata: list[dict[str, Any]] = []
+        for preview_path in selected_previews:
+            metadata_path = preview_path.with_name(
+                preview_path.name.replace("_preview.bmp", "_meta.json"))
+            try:
+                frame_metadata.append(json.loads(metadata_path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                pass
         result = [TextContent(type="text", text=json.dumps({
             "captureSource": "openxr-simulator-composed-preview",
             "incidentDirectory": str(incident_dir),
             "framesAvailable": len(list(incident_dir.glob("frame*_preview.bmp"))),
+            "frames": frame_metadata,
+            "captureComplete": True,
             "status": status,
         }, indent=2))]
         if contact_sheet:
@@ -1040,10 +1136,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 ).get("lastIncidentDirectory", "")
             except (OSError, json.JSONDecodeError):
                 pass
-        _write_json_command(UI_FLICKER_CAPTURE_REQUEST_FILE, {
+        err = _write_control_command(UI_FLICKER_CAPTURE_REQUEST_FILE, {
             "requestedUnixMs": int(time.time() * 1000),
             "source": "mcp-ui-only",
         })
+        if err:
+            return [TextContent(type="text", text=err)]
         deadline = time.time() + timeout
         incident_dir: Optional[Path] = None
         status: dict[str, Any] = {}
@@ -1065,14 +1163,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 type="text",
                 text="Timed out waiting for a UI-only burst. No valid quad rectangle may be visible."
             )]
-        settle_deadline = min(deadline, time.time() + 1.0)
-        while time.time() < settle_deadline and len(list(incident_dir.glob("frame*_preview.bmp"))) < max_frames:
+        completion_file = incident_dir / "capture_complete.json"
+        while time.time() < deadline and not completion_file.exists():
             time.sleep(0.1)
-        contact_sheet = build_flicker_contact_sheet(incident_dir, max_frames)
+        if not completion_file.exists():
+            return [TextContent(
+                type="text",
+                text="The UI-only incident started but did not finish before the timeout. No partial frame set was returned."
+            )]
+        selected_previews = select_flicker_preview_frames(incident_dir, max_frames)
+        contact_sheet = build_flicker_contact_sheet(
+            incident_dir, max_frames, selected_previews)
         result = [TextContent(type="text", text=json.dumps({
             "captureSource": "openxr-simulator-ui-quad",
             "incidentDirectory": str(incident_dir),
             "framesAvailable": len(list(incident_dir.glob("frame*_preview.bmp"))),
+            "captureComplete": True,
             "status": status,
         }, indent=2))]
         if contact_sheet:
@@ -1241,6 +1347,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 text=f"Failed to clear log file: {e}"
             )]
 
+    elif name == "set_session_focus":
+        focused = arguments.get("focused")
+        if type(focused) is not bool:
+            raise ValueError("focused must be an explicit boolean")
+        err = _write_control_command(SIMULATOR_DIR / "session_focus_command.json", {"focused":focused})
+        if err:
+            return [TextContent(type="text", text=err)]
+        return [TextContent(type="text", text=json.dumps({"queued":True,"focused":focused}))]
+
     elif name == "set_head_pose":
         payload = {
             "x": float(arguments.get("x", 0.0)),
@@ -1251,12 +1366,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         }
         if "roll_deg" in arguments and arguments["roll_deg"] is not None:
             payload["roll"] = _rad(float(arguments["roll_deg"]))
-        _write_json_command(HEAD_POSE_CMD_FILE, payload)
+        err = _write_control_command(HEAD_POSE_CMD_FILE, payload)
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text", text=f"Head pose command queued: {payload}")]
 
     elif name == "set_fov":
         if arguments.get("clear"):
-            _write_json_command(FOV_CMD_FILE, {"clear": True})
+            err = _write_control_command(FOV_CMD_FILE, {"clear": True})
+            if err:
+                return [TextContent(type="text", text=err)]
             return [TextContent(type="text", text="FOV reverted to symmetric default.")]
         def _eye(d):
             if not d: return None
@@ -1270,28 +1389,38 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         if L is None or R is None:
             return [TextContent(type="text",
                 text="set_fov requires both left_eye and right_eye sub-objects (or clear=true)")]
-        _write_json_command(FOV_CMD_FILE, {"left": L, "right": R})
+        err = _write_control_command(FOV_CMD_FILE, {"left": L, "right": R})
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text",
             text=f"Per-eye asymmetric FOV applied. left={L} right={R}")]
 
     elif name == "set_ipd":
         if arguments.get("clear"):
-            _write_json_command(IPD_CMD_FILE, {"clear": True})
+            err = _write_control_command(IPD_CMD_FILE, {"clear": True})
+            if err:
+                return [TextContent(type="text", text=err)]
             return [TextContent(type="text", text="IPD reverted to 64 mm.")]
         ipd_mm = float(arguments.get("ipd_mm", 64.0))
         if ipd_mm < 0 or ipd_mm > 200:
             return [TextContent(type="text", text="ipd_mm must be in [0, 200]")]
-        _write_json_command(IPD_CMD_FILE, {"ipd_mm": ipd_mm})
+        err = _write_control_command(IPD_CMD_FILE, {"ipd_mm": ipd_mm})
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text", text=f"IPD set to {ipd_mm:.1f} mm")]
 
     elif name == "set_headset_profile":
         prof_name = arguments.get("name", "default")
-        _write_json_command(HEADSET_PROFILE_CMD_FILE, {"name": prof_name})
+        err = _write_control_command(HEADSET_PROFILE_CMD_FILE, {"name": prof_name})
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text", text=f"Headset profile applied: {prof_name}")]
 
     elif name == "enable_anaglyph_preview":
         enabled = bool(arguments.get("enabled", True))
-        _write_json_command(ANAGLYPH_CMD_FILE, {"enabled": enabled})
+        err = _write_control_command(ANAGLYPH_CMD_FILE, {"enabled": enabled})
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text",
             text=f"Anaglyph preview {'enabled' if enabled else 'disabled'}.")]
 
@@ -1308,7 +1437,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             time.sleep(0.05)
         if not PROJ_LOG_FILE.exists():
             return [TextContent(type="text",
-                text="Projection log was not produced — is the simulator currently rendering frames?")]
+                text="Projection log was not produced â€” is the simulator currently rendering frames?")]
         try:
             data = json.loads(PROJ_LOG_FILE.read_text())
             entries = data.get("entries", [])
@@ -1327,11 +1456,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             "roll_amp_deg":  float(arguments.get("roll_amp_deg",  15.0)),
             "freq_hz":       float(arguments.get("freq_hz",        0.25)),
         }
-        _write_json_command(SIMULATOR_DIR / "pose_sweep_command.json", payload)
+        err = _write_control_command(SIMULATOR_DIR / "pose_sweep_command.json", payload)
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text",
             text=("Pose sweep " + ("enabled" if payload["enabled"] else "disabled") +
-                  f" — yaw=±{payload['yaw_amp_deg']}° pitch=±{payload['pitch_amp_deg']}°"
-                  f" roll=±{payload['roll_amp_deg']}° freq={payload['freq_hz']}Hz"))]
+                  f" â€” yaw=Â±{payload['yaw_amp_deg']}Â° pitch=Â±{payload['pitch_amp_deg']}Â°"
+                  f" roll=Â±{payload['roll_amp_deg']}Â° freq={payload['freq_hz']}Hz"))]
 
     elif name == "validate_stereo":
         timeout = float(arguments.get("timeout", 5.0))

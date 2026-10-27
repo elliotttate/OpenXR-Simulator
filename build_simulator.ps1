@@ -21,12 +21,17 @@
 
 .PARAMETER Clean
     Delete the CMake build tree first.
+
+.PARAMETER VulkanIncludeDir
+    Optional path containing vulkan\vulkan.h. When omitted, the script checks
+    VULKAN_SDK and the adjacent repo\Vulkan-Headers checkout.
 #>
 [CmdletBinding()]
 param(
     [string]$InstallTo = (Join-Path $PSScriptRoot '..\BotW-BetterVR\OpenXRSimulator'),
     [switch]$Copy,
-    [switch]$Clean
+    [switch]$Clean,
+    [string]$VulkanIncludeDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,13 +51,35 @@ Enter-VsDevShell -VsInstallPath $vsRoot -SkipAutomaticLocation -DevCmdArguments 
 
 if ($Clean -and (Test-Path $build)) { Remove-Item -Recurse -Force $build }
 
+if ([string]::IsNullOrWhiteSpace($VulkanIncludeDir)) {
+    $vulkanCandidates = @()
+    if ($env:VULKAN_SDK) {
+        $vulkanCandidates += (Join-Path $env:VULKAN_SDK 'Include')
+        $vulkanCandidates += (Join-Path $env:VULKAN_SDK 'include')
+    }
+    $vulkanCandidates += (Join-Path $root '..\Vulkan-Headers\include')
+    $VulkanIncludeDir = $vulkanCandidates |
+        Where-Object { Test-Path (Join-Path $_ 'vulkan\vulkan.h') } |
+        Select-Object -First 1
+}
+
+$configureArgs = @('-S', $root, '-B', $build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release')
+if ($VulkanIncludeDir) {
+    $VulkanIncludeDir = (Resolve-Path $VulkanIncludeDir).Path
+    $configureArgs += "-DSIMXR_VULKAN_INCLUDE_DIR=$VulkanIncludeDir"
+}
+
 Write-Host '==> Configuring' -ForegroundColor Cyan
-cmake -S $root -B $build -G Ninja -DCMAKE_BUILD_TYPE=Release
+& cmake @configureArgs
 if ($LASTEXITCODE -ne 0) { throw "cmake configure failed ($LASTEXITCODE)" }
 
 Write-Host '==> Building' -ForegroundColor Cyan
 cmake --build $build
 if ($LASTEXITCODE -ne 0) { throw "cmake build failed ($LASTEXITCODE)" }
+
+Write-Host '==> Testing' -ForegroundColor Cyan
+ctest --test-dir $build --output-on-failure
+if ($LASTEXITCODE -ne 0) { throw "ctest failed ($LASTEXITCODE)" }
 
 if (-not (Test-Path $InstallTo)) { New-Item -ItemType Directory -Force $InstallTo | Out-Null }
 $InstallTo = (Resolve-Path $InstallTo).Path

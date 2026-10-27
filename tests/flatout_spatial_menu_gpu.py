@@ -71,7 +71,7 @@ try:
         if len(matrix)!=12:
             continue
         for item in native['items']:
-            # Hover changes only translation by up to 15 mm while the capture
+            # Hover changes only translation by up to 20 mm while the capture
             # queues. The title and its authored shadow are far farther apart.
             separation=distance(matrix[9:12],item['rendered_position'])
             if separation>.025:

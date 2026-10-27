@@ -15,33 +15,50 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from flatout_frontend_e2e import Frontend, ROOT
+from flatout_feedback_layout_e2e import (check_card_artwork,check_card_padding,
+    check_challenge_layout,default_layout_manifest,load_layout_manifest,load_styles_manifest,
+    settle_challenge_baseline)
 
 
 class Challenge(Frontend):
+    def __init__(self,args,session):
+        super().__init__(args,session)
+        self.layout_manifest=load_layout_manifest(args.layout_manifest)
+        self.styles_manifest=load_styles_manifest(args.styles_manifest,args.layout_manifest)
+
     async def layout(self):
         menu = await self.query("menu.get_state")
         assert menu["current_menu"] == "INSANITY" and not menu["is_3d"], menu
+        await settle_challenge_baseline(self)
         native = await self.query("vr.targets")
         await self.capture("challenge-page-layout")
         cards = sorted((t for t in native["targets"] if t["name"].startswith("challenge.event.")),
                        key=lambda t: int(t["name"].split(".")[-1]))
         indices = [int(t["name"].split(".")[-1]) for t in cards]
-        valid = len(cards) == min(6, menu["item_count"] - (indices[0] if indices else 0))
-        self.cases.append({"case": "six-explicit-event-card-targets", "passed": valid,
+        valid = len(cards) == min(3, menu["item_count"] - (indices[0] if indices else 0))
+        self.cases.append({"case": "three-image-led-event-card-targets", "passed": valid,
                            "indices": indices, "targets": native["targets"]})
-        assert valid, "FlatOut Mode needs six explicit ray cards per page"
+        assert valid, "FlatOut Mode needs three image-led ray cards per page"
+        nodes=(await self.query('hud.rects',{'root':'menu','max_depth':48}))['nodes']
+        artwork=check_card_artwork(nodes,len(cards),self.layout_manifest)
+        check_card_padding(nodes)
+        geometry=check_challenge_layout(nodes,native['targets'],self.layout_manifest,len(cards),self.styles_manifest)
+        self.cases.append({'case':'native-geometry-matches-generated-html-layout','passed':True,
+                           'geometry':geometry,'manifest_schema':self.layout_manifest['schema']})
+        self.cases.append({'case':'original-event-artwork-on-every-page','passed':True,'artwork':artwork,
+                           'page':indices[0]//3,'image':str(self.last_image_path)})
         assert all(i["title"].strip() for i in menu["items"]), "Every event needs a localized readable name"
-        page = indices[0] // 6
-        assert indices == list(range(page * 6, min((page + 1) * 6, menu["item_count"]))), indices
+        page = indices[0] // 3
+        assert indices == list(range(page * 3, min((page + 1) * 3, menu["item_count"]))), indices
         names = {t["name"] for t in native["targets"]}
         assert ("challenge.page.prev" in names) == (page > 0), names
-        assert ("challenge.page.next" in names) == ((page + 1) * 6 < menu["item_count"]), names
+        assert ("challenge.page.next" in names) == ((page + 1) * 3 < menu["item_count"]), names
         assert not any(n.startswith(("helper.LB.", "helper.RB.")) for n in names), "Paging must stay in the header"
         assert any(n.startswith("helper.Cancel.") for n in names), "Keep a visible Back action"
         for target in cards:
             l, t, r, b = target["rect"]
-            assert 80 <= l < r <= 1840 and 240 <= t < b <= 920, target
-            assert r - l >= 520 and b - t >= 290, target
+            assert 80 <= l < r <= 1840 and 208 <= t < b <= 960, target
+            assert r - l >= 480 and b - t >= 560, target
         for i, target in enumerate(cards):
             l, t, r, b = target["rect"]
             for other in cards[i + 1:]:
@@ -53,9 +70,9 @@ class Challenge(Frontend):
         for target in native["targets"]:
             l, t, r, b = target["rect"]
             if target["name"].startswith("challenge.page."):
-                assert r - l >= 88 and b - t >= 88 and b <= 224, target
+                assert r - l >= 80-.01 and b - t >= 80-.01 and b <= 224, target
             elif target["name"].startswith("helper."):
-                assert r - l >= 200 and b - t >= 80 and t >= 960, target
+                assert r - l >= 200 and b - t >= 80-.01 and t>self.layout_manifest['rects']['grid']['y']+self.layout_manifest['rects']['grid']['height'], target
         await self.audit("challenge-card-header-and-dock-spacing")
         self.cases.append({"case": "challenge-page-readable-bounds-and-gaps", "passed": True,
                            "page": page, "names": [menu["items"][i]["title"] for i in indices]})
@@ -77,7 +94,7 @@ class Challenge(Frontend):
         while (await self.layout())[2] > 0:
             await self.click("challenge.page.prev")
         visited, locked_checked = [], 0
-        page_count = (menu["item_count"] + 5) // 6
+        page_count = (menu["item_count"] + 2) // 3
         for page in range(page_count):
             menu, cards, actual_page = await self.layout()
             assert actual_page == page, (page, actual_page)
@@ -211,6 +228,8 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--hand", choices=("left", "right"), default="right")
+    parser.add_argument("--layout-manifest",type=Path,default=default_layout_manifest())
+    parser.add_argument("--styles-manifest",type=Path)
     parser.add_argument("--locked-only", action="store_true")
     parser.add_argument("--layout-only", action="store_true")
     parser.add_argument("--preview-round-trip", action="store_true")

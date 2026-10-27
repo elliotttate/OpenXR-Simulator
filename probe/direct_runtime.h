@@ -20,6 +20,21 @@
 UI_PROBE_FUNCTIONS(DECLARE_XR)
 #undef DECLARE_XR
 static PFN_xrGetInstanceProcAddr xrGetInstanceProcAddr=nullptr;
+static PFN_xrCreateInstance directCreateInstance=nullptr;
+
+static XrResult XRAPI_PTR CreateDirectInstance(const XrInstanceCreateInfo* info, XrInstance* instance) {
+    const XrResult result=directCreateInstance(info,instance);
+    if (XR_FAILED(result)) return result;
+    // Instance commands become discoverable only after an instance exists.
+#define LOAD_INSTANCE_XR(name) do { \
+    const XrResult loaded=xrGetInstanceProcAddr(*instance,#name,(PFN_xrVoidFunction*)&name); \
+    if (XR_FAILED(loaded)) { printf("Cannot resolve %s: %d\n",#name,(int)loaded); return loaded; } \
+} while (0);
+    UI_PROBE_FUNCTIONS(LOAD_INSTANCE_XR)
+#undef LOAD_INSTANCE_XR
+    xrCreateInstance=CreateDirectInstance;
+    return result;
+}
 
 static bool InitDirectRuntime() {
     char path[MAX_PATH]{};
@@ -38,7 +53,10 @@ static bool InitDirectRuntime() {
     if (XR_FAILED(negotiate(&loader,&request))) return false;
     xrGetInstanceProcAddr=request.getInstanceProcAddr;
 #define LOAD_XR(name) if (XR_FAILED(xrGetInstanceProcAddr(XR_NULL_HANDLE,#name,(PFN_xrVoidFunction*)&name))) return false;
-    UI_PROBE_FUNCTIONS(LOAD_XR)
+    LOAD_XR(xrCreateInstance)
+    LOAD_XR(xrEnumerateInstanceExtensionProperties)
 #undef LOAD_XR
+    directCreateInstance=xrCreateInstance;
+    xrCreateInstance=CreateDirectInstance;
     return true;
 }

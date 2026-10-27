@@ -134,6 +134,441 @@ class AttachMode(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(atlas.CaptureMismatch):await test.run({"cases":[]})
 
 
+class SharedSkinsTitle(unittest.IsolatedAsyncioTestCase):
+    def runner(self,case):
+        test=atlas.Atlas(SimpleNamespace(pid=1,output=Path("unused"),native_timeout=.1),None,{})
+        test.active_case=case;calls=[]
+        async def query(method,params=None):
+            calls.append(method)
+            if method=="menu.get_state":return {"current_menu":"SKINS"}
+            if method=="vr.targets":return {"targets":[{"name":"customization.skin.0"}]}
+            if method=="ui.get_message_box":return {"open":False}
+            if method=="hud.rects":return {"nodes":[]}
+            if method=="livery.command":raise RuntimeError({"code":-1,"message":"Open the livery menu first"})
+            raise AssertionError(method)
+        test.query=query
+        return test,calls
+
+    async def test_customization_does_not_call_livery_just_because_title_is_skins(self):
+        test,calls=self.runner({"id":"customization","source_enums":["E_CUSTOMIZATION"]})
+        snapshot=await test.observe()
+        self.assertNotIn("livery.command",calls)
+        self.assertEqual(snapshot["targets"]["targets"][0]["name"],"customization.skin.0")
+
+    async def test_current_unknown_skins_accepts_only_explicit_native_not_livery_answer(self):
+        test,calls=self.runner({"id":"current"})
+        snapshot=await test.observe()
+        self.assertEqual(snapshot["presentation"]["kind"],"customization")
+        self.assertNotIn("livery",snapshot)
+        self.assertEqual(calls.count("livery.command"),1)
+
+    async def test_expected_livery_never_swallows_not_livery_error(self):
+        test,calls=self.runner({"id":"livery","expand":"livery"})
+        with self.assertRaisesRegex(RuntimeError,"Open the livery"):await test.observe()
+
+    async def test_other_native_error_is_not_silenced_for_unknown_skins(self):
+        test,calls=self.runner({"id":"current"});query=test.query
+        async def broken(method,params=None):
+            if method=="livery.command":raise RuntimeError({"code":-1,"message":"Native diagnostic failed"})
+            return await query(method,params)
+        test.query=broken
+        with self.assertRaisesRegex(RuntimeError,"Native diagnostic failed"):await test.observe()
+
+    async def test_livery_cleanup_capture_in_garage_does_not_query_closed_editor(self):
+        test,calls=self.runner({"id":"livery","expand":"livery","source_enums":["E_LIVERY"]});query=test.query
+        async def garage(method,params=None):
+            if method=="menu.get_state":return {"current_menu":"GARAGE"}
+            return await query(method,params)
+        test.query=garage
+        await test.observe()
+        self.assertNotIn("livery.command",calls)
+
+
+class LiveryCloseAndScope(unittest.IsolatedAsyncioTestCase):
+    def runner(self,overlays_only=True):
+        args=SimpleNamespace(pid=1,output=Path("unused"),native_timeout=.1,current=False,settle=0,
+                             fixture_timeout=.04,livery_overlays_only=overlays_only)
+        test=atlas.Atlas(args,None,{"states":[],"cases":[]});test.active_case={"id":"livery","expand":"livery"}
+        data={"menu":"SKINS","dirty":False,"tab":0,"overlay":None,"calls":[],"captures":[],"rays":[],
+              "close_mode":"immediate","closing":False,"close_reads":0,"ownership_race":False}
+        def state():return {"ready":True,"dirty":data["dirty"],"tab":data["tab"],"keyboard_target":data["overlay"]=="RENAME",
+                           "workshop_browser":{"open":data["overlay"]=="BROWSE WORKSHOP"},
+                           "exit_requested":data["closing"] and data["close_mode"]=="legacy"}
+        async def query(method,params=None):
+            data["calls"].append((method,copy.deepcopy(params)))
+            if method=="menu.get_state":
+                if data["closing"] and data["close_mode"]=="delayed":
+                    data["close_reads"]+=1
+                    data["menu"]="" if data["close_reads"]==1 else "GARAGE"
+                return {"current_menu":data["menu"]}
+            if method=="ui.get_message_box":return {"open":False}
+            self.assertEqual(method,"livery.command")
+            if data["menu"]!="SKINS":raise AssertionError("Closed editor must not be queried")
+            if params["op"]=="state":
+                if data["ownership_race"] and data["closing"]:
+                    data["menu"]="GARAGE"
+                    raise RuntimeError({"code":-1,"message":"Open the livery menu first"})
+                return state()
+            if params["op"]=="catalog":return {"categories":2}
+            if params["op"]=="input":
+                if params["action"]=="tab":data["tab"]=(data["tab"]+1)%3
+                elif data["overlay"]:data["overlay"]=None
+                else:
+                    data["closing"]=True
+                    if data["close_mode"]=="immediate":data["menu"]="GARAGE"
+                    elif data["close_mode"]=="unexpected":data["menu"]="MAIN MENU"
+                return {"success":True}
+            if params["op"] in {"view","browse"}:return {"success":True}
+            raise AssertionError(params)
+        async def capture(title,*a,**kw):data["captures"].append(title)
+        async def fixture():return state()
+        async def ray(label):
+            data["rays"].append(label)
+            if label=="DISCARD":data["menu"]="GARAGE"
+            else:data["overlay"]=label
+        test.query=query;test.capture=capture;test.capture_livery_views=capture;test.livery_fixture=fixture;test.livery_ray=ray
+        return test,data
+
+    async def test_clean_cancel_closes_to_garage_without_another_livery_read(self):
+        test,data=self.runner()
+        await test.close_livery()
+        self.assertEqual(data["menu"],"GARAGE")
+        self.assertTrue(test.active_case["fixture_checks"][-1]["clean_livery_close"])
+        self.assertIn("Livery — returned to Garage",data["captures"])
+
+    async def test_close_allows_bounded_intermediate_blank_menu(self):
+        test,data=self.runner();data["close_mode"]="delayed"
+        await test.close_livery()
+        self.assertEqual(data["menu"],"GARAGE")
+        self.assertEqual(data["close_reads"],2)
+
+    async def test_close_handles_ownership_changing_between_menu_and_state_read(self):
+        test,data=self.runner();data.update(close_mode="waiting",ownership_race=True)
+        await test.close_livery()
+        self.assertTrue(test.active_case["fixture_checks"][-1]["clean_livery_close"])
+
+    async def test_dirty_document_is_never_cancelled_or_discarded(self):
+        test,data=self.runner();data["dirty"]=True
+        with self.assertRaises(atlas.UnknownModal):await test.close_livery()
+        self.assertFalse(data["closing"]);self.assertEqual(data["rays"],[])
+
+    async def test_unfinished_close_has_a_deadline_and_never_repeats_cancel(self):
+        test,data=self.runner();data["close_mode"]="waiting"
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"Cancel was not repeated"):await test.close_livery()
+        self.assertEqual(sum(p=={"op":"input","action":"cancel"} for m,p in data["calls"]),1)
+        self.assertEqual(data["rays"],[])
+
+    async def test_unexpected_menu_blocks_without_recovery(self):
+        test,data=self.runner();data["close_mode"]="unexpected"
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"unexpected menu"):await test.close_livery()
+        self.assertFalse(any(m in {"menu.back","menu.go_to","menu.select"} for m,p in data["calls"]))
+
+    async def test_clean_legacy_confirmation_is_captured_and_discarded_once(self):
+        test,data=self.runner();data["close_mode"]="legacy"
+        await test.close_livery()
+        self.assertEqual(data["rays"],["DISCARD"])
+        self.assertTrue(test.active_case["fixture_checks"][-1]["clean_legacy_discard"])
+
+    async def test_overlay_only_scope_skips_view_tab_and_catalog_galleries(self):
+        test,data=self.runner()
+        await test.livery(test.active_case)
+        self.assertEqual(data["captures"],["Livery — editor columns","Livery — large keyboard","Livery — Workshop browser","Livery — returned to Garage"])
+        self.assertEqual(test.active_case["scope"]["mode"],"overlays-only")
+        self.assertEqual(len(test.active_case["scope"]["omitted"]),3)
+        self.assertFalse(any(m=="livery.command" and p["op"] in {"view","browse","catalog"} for m,p in data["calls"]))
+        self.assertEqual(data["rays"],["RENAME","BROWSE WORKSHOP"])
+
+    async def test_default_full_scope_keeps_all_gallery_loops(self):
+        test,data=self.runner(overlays_only=False)
+        # Camera-view settling is unrelated to this offline route contract.
+        original_sleep=asyncio.sleep
+        async def fast_settle(delay):await original_sleep(0)
+        with mock.patch.object(atlas.asyncio,"sleep",side_effect=fast_settle):await test.livery(test.active_case)
+        self.assertEqual(test.active_case["scope"]["mode"],"full-livery")
+        self.assertEqual(test.active_case["scope"]["omitted"],[])
+        self.assertEqual(len([p for m,p in data["calls"] if m=="livery.command" and p["op"]=="view"]),7)
+        self.assertEqual(len([p for m,p in data["calls"] if m=="livery.command" and p["op"]=="browse"]),2)
+
+
+class RetainedLeaderboardPage(unittest.IsolatedAsyncioTestCase):
+    def runner(self):
+        args=SimpleNamespace(pid=1,output=Path("unused"),native_timeout=.1,current=False,settle=0)
+        test=atlas.Atlas(args,None,{"cases":[],"states":[]});test.active_case={"id":"leaderboards"}
+        data={"selected":24,"capable":{25},"events":[24,25],"menu":"INSANITY","rays":[],"captures":[],"pages":[],"read_error":0}
+        async def query(method,params=None):
+            if method=="vr.targets":return {"targets":[{"name":"challenge.event."+str(i)} for i in data["events"]]+
+                                           ([{"name":"helper.Secondary.1"}] if data["selected"] in data["capable"] else [])}
+            if method=="menu.get_state":return {"current_menu":data["menu"],"selection_index":data["selected"]}
+            if method=="leaderboard.get_state":return {"busy":False,"read_error":data["read_error"]}
+            if method=="ui.get_message_box":return {"open":False}
+            raise AssertionError(method)
+        async def ray(name,hover=False):
+            data["rays"].append((name,hover))
+            if name.startswith("challenge.event."):data["selected"]=int(name.split(".")[-1])
+            elif name=="helper.Secondary.1":data["menu"]="LEADERBOARD"
+            else:raise AssertionError(name)
+        async def capture(title,*a):data["captures"].append(title)
+        async def pages(*a):data["pages"].append(a)
+        test.query=query;test.ray=ray;test.capture=capture;test.pages=pages
+        return test,data
+
+    async def test_current_exposed_events_are_used_and_unsupported_card_is_skipped(self):
+        test,data=self.runner()
+        await test.leaderboard()
+        self.assertEqual(data["rays"],[("challenge.event.24",True),("challenge.event.25",True),("helper.Secondary.1",False)])
+        self.assertEqual(data["pages"],[("Leaderboard","page.down",64)])
+
+    async def test_no_capable_event_captures_blocked_explanation_without_clicking_start(self):
+        test,data=self.runner();data["capable"]=set()
+        with self.assertRaisesRegex(atlas.CaseBlocked,"current FlatOut Mode page"):await test.leaderboard()
+        self.assertIn("Leaderboard — unavailable for exposed events",data["captures"])
+        self.assertTrue(all(hover for name,hover in data["rays"]))
+
+    async def test_missing_event_targets_are_blocked_instead_of_false_interaction_failure(self):
+        test,data=self.runner();data["events"]=[]
+        with self.assertRaises(atlas.CaseBlocked):await test.leaderboard()
+        self.assertEqual(data["rays"],[]);self.assertEqual(len(data["captures"]),1)
+
+    async def test_native_read_error_is_reported_as_unavailable_fixture(self):
+        test,data=self.runner();data["read_error"]=7
+        with self.assertRaisesRegex(atlas.CaseBlocked,"native error 7"):await test.leaderboard()
+        self.assertIn("Leaderboard — read unavailable",data["captures"])
+        self.assertEqual(data["pages"],[])
+
+    async def test_case_blocked_status_is_retained_and_later_safe_case_still_runs(self):
+        test,data=self.runner()
+        test.args.only=None;test.args.fixture=[];test.args.dialog_templates=False;test.args.fail_fast=False
+        steps=[]
+        async def query(method,params=None):
+            return {"game.get_state":{"is_main_menu":True},"vr.get_state":tracking_fixture(dict(x=0,y=1.7,z=0,yaw_deg=0,pitch_deg=0,roll_deg=0)),
+                    "ui.get_message_box":{"open":False},"game.errors":{"total":0},"menu.get_state":{"current_menu":"MAIN MENU"}}[method]
+        async def main():pass
+        async def stage(case):steps.append(case["id"])
+        async def expand(case):
+            if case["id"]=="leaderboards":raise atlas.CaseBlocked("Unavailable event/service fixture")
+        test.query=query;test.main=main;test.stage=stage;test.expand=expand
+        with tempfile.TemporaryDirectory() as tmp:
+            test.output=Path(tmp)
+            await test.run({"cases":[{"id":"leaderboards"},{"id":"next"}]})
+        self.assertEqual(steps,["leaderboards","next"])
+        self.assertEqual([c["status"] for c in test.report["cases"]],["blocked","captured"])
+
+
+class PartyDriverRecipe(unittest.IsolatedAsyncioTestCase):
+    """Offline navigation contracts; retained pages come from the saved native r18 report."""
+    def runner(self):
+        args=SimpleNamespace(pid=1,output=Path("unused"),native_timeout=.1,current=False,settle=0,fixture_timeout=.03)
+        test=atlas.Atlas(args,None,{"cases":[],"states":[]});test.active_case={"id":"party-drivers"}
+        data={"phase":"players","playlist":[],"clicks":[],"flows":[],"toggle_works":True,"start_works":True,"tiles":True}
+        async def normal_flow(name):
+            self.assertEqual(name,"party_game");data["flows"].append(name)
+        async def query(method,params=None):
+            if method=="party.get_state":
+                return {"open":data["phase"]=="players","stunt_picker_open":data["phase"]=="stunts",
+                        "players":8,"visible":[8,11],"playlist":[{"index":i} for i in data["playlist"]]}
+            if method=="menu.get_state":return {"current_menu":"DRIVERS" if data["phase"]=="drivers" else "OFFLINE"}
+            if method=="vr.targets":return {"targets":[{"name":"helper.Validate.0"},
+                {"name":"stunts.page.previous"}]+([{"name":"stunt.0","enabled":False},{"name":"stunt.8"},{"name":"stunt.9"}] if data["tiles"] else [])}
+            raise AssertionError(method)
+        async def ray(name,*args,**kwargs):
+            data["clicks"].append(name)
+            if name=="players.8":data["phase"]="stunts"
+            elif name=="stunt.8":
+                if data["toggle_works"]:data["playlist"]=[8]
+            elif name=="helper.Validate.0":
+                if data["start_works"]:data["phase"]="drivers"
+            else:raise AssertionError("Unexpected invisible target: "+name)
+        test.normal_flow=normal_flow;test.query=query;test.ray=ray
+        return test,data
+
+    def test_default_manifest_uses_retained_page_aware_party_fixture(self):
+        case=next(c for c in atlas.load_manifest(atlas.DEFAULT_MANIFEST)["cases"] if c["id"]=="party-drivers")
+        self.assertEqual(case["route"],[{"party_drivers":8}])
+
+    async def test_retained_third_page_chooses_exposed_stunt_eight_and_starts_once(self):
+        test,data=self.runner()
+        await test.party_drivers(8)
+        self.assertEqual(data["flows"],["party_game"])
+        self.assertEqual(data["clicks"],["players.8","stunt.8","helper.Validate.0"])
+        self.assertEqual(test.active_case["fixture_checks"][0]["stunt_picker_visible"],[8,11])
+
+    async def test_dirty_initial_playlist_is_never_toggled_or_started(self):
+        test,data=self.runner();data["playlist"]=[5]
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"empty playlist"):await test.party_drivers(8)
+        self.assertEqual(data["clicks"],[])
+
+    async def test_unconfirmed_tile_toggle_never_sends_start(self):
+        test,data=self.runner();data["toggle_works"]=False
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"exactly the selected"):await test.party_drivers(8)
+        self.assertEqual(data["clicks"],["players.8","stunt.8"])
+
+    async def test_no_visible_tiles_block_without_start(self):
+        test,data=self.runner();data["tiles"]=False
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"no exposed enabled tile"):await test.party_drivers(8)
+        self.assertEqual(data["clicks"],["players.8"])
+
+    async def test_failed_start_has_a_deadline_and_is_not_repeated(self):
+        test,data=self.runner();data["start_works"]=False
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"no retry or second Start"):await test.party_drivers(8)
+        self.assertEqual(data["clicks"].count("helper.Validate.0"),1)
+
+    async def test_current_attachment_cannot_stage_party_driver_fixture(self):
+        test,data=self.runner();test.args.current=True
+        with self.assertRaises(ValueError):await test.party_drivers(8)
+        self.assertEqual(data["flows"],[]);self.assertEqual(data["clicks"],[])
+
+
+class NormalMenuFixtures(unittest.IsolatedAsyncioTestCase):
+    """Offline callback/order models, not rendered evidence or a native flow proof."""
+    def runner(self,**changes):
+        args=SimpleNamespace(pid=1,output=Path("unused"),native_timeout=.1,current=False,settle=0,
+                             fixture_timeout=.08,fixture=["showroom","career"],only=None,fail_fast=False,dialog_templates=False)
+        for k,v in changes.items():setattr(args,k,v)
+        test=atlas.Atlas(args,None,{"cases":[],"states":[]})
+        test.active_case={"id":"fixture","group":"Garage","states":[]}
+        data={"menu":"MAIN MENU","mode":"unknown","career_mode":"career","selection":0,"owned":True,"caption":True,
+              "garage_loading":0,"livery_checks":0,"bound":True,"career_count":2,"actions":[],"reads":[]}
+        counts={"MAIN MENU":8,"FLATOUT":2,"GARAGE":4,"SKINS":0,"CARS":6,"UPGRADES":5,"MULTIPLAYER":2,"OFFLINE":0}
+        async def query(method,params=None):
+            data["reads"].append(method)
+            if method=="ui.get_message_box":return {"open":data["menu"]=="WELCOME"}
+            if method=="game.get_state":return {"game_mode":data["mode"],"is_main_menu":True}
+            if method=="vr.get_state":return tracking_fixture(dict(x=0,y=1.7,z=0,yaw_deg=0,pitch_deg=0,roll_deg=0))
+            if method=="game.errors":return {"total":0}
+            if method=="menu.get_state":
+                count=data["career_count"] if data["menu"]=="FLATOUT" else counts.get(data["menu"],0)
+                return {"current_menu":data["menu"],"selection_index":data["selection"],"item_count":count,
+                        "is_3d":data["menu"] in {"MAIN MENU","FLATOUT","MULTIPLAYER"},
+                        "items":[{"index":i,"title":"item"+str(i),"locked":False} for i in range(count)]}
+            if method=="hud.rects":
+                nodes=[]
+                if data["caption"] and data["menu"]=="FLATOUT":nodes.append({"visible":True,"path":"Menu/Info_3D_C/TXT_Value","text":"Owned fixture car"})
+                if data["menu"]=="GARAGE" and data["garage_loading"]:
+                    data["garage_loading"]-=1;nodes.append({"visible":True,"path":"Menu/ModelLoading/Cog"})
+                return {"nodes":nodes}
+            if method=="menu.navigate":
+                data["actions"].append((method,params["direction"]))
+                data["selection"]+=1;return {"success":True}
+            if method=="menu.back":
+                data["actions"].append((method,data["menu"]))
+                data["menu"]="MAIN MENU";data["selection"]=0;return {"success":True}
+            if method=="menu.select":
+                before,index=data["menu"],data["selection"];data["actions"].append((method,before,index));data["selection"]=0
+                if before=="MAIN MENU" and index==0:data["mode"]=data["career_mode"];data["menu"]="FLATOUT" if data["owned"] else "WELCOME"
+                elif before=="FLATOUT" and index==1:data["menu"]="GARAGE"
+                elif before=="GARAGE":data["menu"]={0:"CARS",1:"UPGRADES",2:"SKINS",3:"SKINS"}[index]
+                elif before=="MAIN MENU" and index==4:data["menu"]="MULTIPLAYER"
+                elif before=="MULTIPLAYER" and index==1:data["mode"]="party_game";data["menu"]="OFFLINE"
+                else:raise AssertionError((before,index))
+                return {"success":True}
+            if method=="livery.command":
+                self.assertEqual(params,{"op":"state"});data["livery_checks"]+=1
+                bound=data["bound"] and data["livery_checks"]>=2
+                return {"ready":True,"bindings":28 if bound else 0,"projection_primitives":26229 if bound else 0,
+                        "vr":{"active":True,"controls":[{"id":1}]}}
+            raise AssertionError("Unexpected/unsafe native operation: "+method)
+        test.query=query
+        return test,data
+
+    def test_direct_showroom_opens_are_rejected_before_pipe_access(self):
+        game=atlas.NativeGame(0,[])
+        for name in atlas.NORMAL_FLOWS:
+            with self.assertRaisesRegex(ValueError,"normal parent callback"):game.call("menu.go_to",{"menu":name})
+
+    def test_implicit_fixture_requirements_apply_to_old_and_custom_recipes(self):
+        for alias in atlas.PROFILE_FLOWS:
+            self.assertEqual(atlas.case_fixture_requirements({"route":[{"goto":alias}]}),{"showroom"})
+        self.assertEqual(atlas.case_fixture_requirements({"route":[{"goto":"options"}]}),set())
+        self.assertEqual(atlas.case_fixture_requirements({"route":[{"goto":"filter"}]}),{"network"})
+
+    async def test_livery_uses_normal_callbacks_and_waits_for_real_bind_counts(self):
+        test,data=self.runner();data["garage_loading"]=2
+        await test.stage({"route":[{"goto":"livery"}],"expect":["SKINS"]})
+        self.assertEqual([a for a in data["actions"] if a[0]=="menu.select"],
+                         [("menu.select","MAIN MENU",0),("menu.select","FLATOUT",1),("menu.select","GARAGE",3)])
+        self.assertGreaterEqual(data["livery_checks"],2)
+        self.assertEqual(data["garage_loading"],0)
+        checks=test.active_case["fixture_checks"]
+        self.assertEqual(checks[0]["car_caption"],"Owned fixture car")
+        self.assertEqual(checks[-1]["bindings"],28)
+        self.assertNotIn("menu.go_to",data["reads"])
+
+    async def test_missing_owned_car_is_blocked_without_confirming_or_opening_garage(self):
+        test,data=self.runner();data["owned"]=False
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"real entry modal"):
+            await test.stage({"route":[{"goto":"livery"}]})
+        self.assertEqual(data["menu"],"WELCOME")
+        self.assertEqual(data["actions"],[("menu.select","MAIN MENU",0)])
+        self.assertNotIn("ui.confirm_message_box",data["reads"])
+
+    async def test_wrong_mode_blocks_even_if_car_caption_and_menu_look_ready(self):
+        test,data=self.runner();data["career_mode"]="unknown"
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,'"game_mode": "unknown"'):
+            await test.stage({"route":[{"goto":"livery"}]})
+        self.assertEqual(data["actions"],[("menu.select","MAIN MENU",0)])
+
+    async def test_all_showroom_aliases_use_their_own_garage_callback(self):
+        for alias in ("cars","upgrade","customization"):
+            with self.subTest(alias=alias):
+                test,data=self.runner()
+                await test.stage({"route":[{"goto":alias}]})
+                self.assertEqual([a for a in data["actions"] if a[0]=="menu.select"],
+                                 [("menu.select","MAIN MENU",0),("menu.select","FLATOUT",1),
+                                  ("menu.select","GARAGE",atlas.SHOWROOM_FLOWS[alias][0])])
+                self.assertNotIn("menu.go_to",data["reads"])
+
+    async def test_declared_fixture_does_not_replace_positive_car_readiness(self):
+        test,data=self.runner();data["caption"]=False
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"did not become ready"):
+            await test.stage({"route":[{"goto":"livery"}]})
+        self.assertEqual(data["menu"],"FLATOUT")
+        self.assertEqual(data["actions"],[("menu.select","MAIN MENU",0)])
+
+    async def test_unfinished_garage_loading_blocks_before_editor(self):
+        test,data=self.runner();data["garage_loading"]=1000
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"ModelLoading"):
+            await test.stage({"route":[{"goto":"livery"}]})
+        self.assertEqual(data["menu"],"GARAGE")
+        self.assertEqual(data["livery_checks"],0)
+
+    async def test_zero_livery_binding_is_fatal_and_never_recovers_through_another_menu(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            test,data=self.runner(output=Path(tmp));data["bound"]=False
+            cases=[{"id":"livery","route":[{"goto":"livery"}]},{"id":"garage","route":[{"goto":"garage"}]}]
+            with self.assertRaisesRegex(atlas.FixtureUnavailable,"did not bind"):
+                await test.run({"cases":cases})
+            self.assertEqual(data["menu"],"SKINS")
+            self.assertEqual(len(test.report["cases"]),1)
+            self.assertEqual(test.report["cases"][0]["status"],"blocked")
+            self.assertFalse(any(a[0]=="menu.back" for a in data["actions"]))
+            self.assertEqual(sum(a==("menu.select","FLATOUT",1) for a in data["actions"]),1)
+
+    async def test_active_cup_is_never_continued_or_cancelled(self):
+        test,data=self.runner();data["career_count"]=3
+        with self.assertRaisesRegex(atlas.FixtureUnavailable,"active cup"):
+            await test.stage({"route":[{"goto":"class_selection"}]})
+        self.assertEqual(data["actions"],[("menu.select","MAIN MENU",0)])
+
+    async def test_party_callback_sets_mode_without_online_match_creation(self):
+        test,data=self.runner()
+        await test.stage({"route":[{"goto":"party_game"}],"expect":["OFFLINE"]})
+        self.assertEqual(data["mode"],"party_game")
+        self.assertIn(("menu.select","MULTIPLAYER",1),data["actions"])
+        self.assertNotIn(("menu.select","MULTIPLAYER",0),data["actions"])
+
+    async def test_current_mode_cannot_enter_a_normal_flow(self):
+        test,data=self.runner(current=True)
+        with self.assertRaises(ValueError):await test.stage({"route":[{"goto":"livery"}]})
+        with self.assertRaises(ValueError):await test.normal_flow("livery")
+        self.assertEqual(data["reads"],[])
+
+    async def test_dead_native_pipe_becomes_fatal_instead_of_retrying_staging(self):
+        test,data=self.runner()
+        with mock.patch.object(test.game,"call",side_effect=FileNotFoundError("closed native process")):
+            with self.assertRaisesRegex(atlas.NativeTimeout,"process/pipe is unavailable"):
+                await atlas.Atlas.query(test,"menu.get_state")
+
+
 def split_livery_fixture(center=False):
     c,s=math.cos(.45),math.sin(.45)
     camera={"origin":[0,0,0],"right":[1,0,0],"up":[0,0,1],"back":[0,-1,0]}
@@ -240,7 +675,13 @@ class LiveryGlances(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(isError=False)
         test=atlas.Atlas(SimpleNamespace(pid=1,output=Path("unused"),native_timeout=.1,current=current,hand="right",dwell_frames=3,settle=0),Session(),{})
         async def query(method,params=None):
-            if method=="livery.command":return copy.deepcopy(state)
+            if method=="livery.command":
+                value=copy.deepcopy(state)
+                eyes=tracking_fixture(shared["pose"])["eyes"]
+                for eye,key in zip(eyes,("left_eye","right_eye")):
+                    native=eye["tracking_pose"]
+                    value["vr"]["frame"][key]={"origin":native["position"],"right":native["x"],"up":native["y"],"back":native["z"]}
+                return value
             self.assertEqual(method,"vr.get_state")
             if shared["stale"]:shared["stale"]=False
             elif shared["pending"] is not None:shared["pose"]=shared["pending"];shared["pending"]=None
@@ -288,6 +729,7 @@ class LiveryGlances(unittest.IsolatedAsyncioTestCase):
         test,state,shared,original=self.runner();clicks=[]
         async def tool(name,args):
             if name=="capture_screenshot":return projection_fixture(shared["pose"]),[]
+            if name=="release_ui_pointer":return {"status":"input_delivered","delivery":{"button_down":False}},[]
             self.assertEqual(name,"click_ui_at");clicks.append(args)
             return {"status":"input_delivered"},[]
         test.tool=tool
@@ -298,6 +740,225 @@ class LiveryGlances(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(clicks[0]["surface"]["size"],[4.6,2.5875])
         self.assertLess(shared["commands"][0]["yaw_deg"],-20)
         self.assertTrue(atlas.head_pose_matches(tracking_fixture(shared["pose"]),original))
+
+    async def test_absolute_pose_redelivery_recovers_dropped_first_command(self):
+        test,state,shared,original=self.runner();test.args.head_pose_timeout=.2;test.args.head_redelivery_interval=.02
+        commands=[]
+        async def delivery(name,args):
+            commands.append(dict(args))
+            if len(commands)==2:shared["pose"]=dict(args)
+            return SimpleNamespace(isError=False)
+        test.session.call_tool=delivery
+        requested={**original,"yaw_deg":35}
+        await test.set_livery_head_pose(requested)
+        self.assertEqual(commands,[requested,requested])
+        move=test.report["head_moves"][-1]
+        self.assertTrue(move["acknowledged"]);self.assertEqual(move["retries"],1)
+        self.assertAlmostEqual(move["observed_pose"]["yaw_deg"],35)
+
+    async def test_never_acknowledged_commands_are_bounded_and_report_actual_pose(self):
+        test,state,shared,original=self.runner();test.args.head_pose_timeout=.045;test.args.head_redelivery_interval=.01
+        commands=[]
+        async def lost(name,args):commands.append(dict(args));return SimpleNamespace(isError=False)
+        test.session.call_tool=lost
+        with self.assertRaisesRegex(atlas.NativeTimeout,"observed="):
+            await test.set_livery_head_pose({**original,"yaw_deg":35})
+        self.assertEqual(len(commands),3)
+        move=test.report["head_moves"][-1]
+        self.assertFalse(move["acknowledged"])
+        self.assertAlmostEqual(move["observed_pose"]["yaw_deg"],original["yaw_deg"])
+
+    async def test_queue_error_retains_exact_native_transport_diagnostic(self):
+        test,state,shared,original=self.runner()
+        message="[WinError 5] Access is denied: 'owned.tmp' -> 'head_pose_command.json'"
+        async def denied(name,args):return SimpleNamespace(isError=True,content=[SimpleNamespace(type="text",text=message)])
+        test.session.call_tool=denied
+        with self.assertRaisesRegex(RuntimeError,"WinError 5"):await test.set_livery_head_pose(original)
+        move=test.report["head_moves"][-1]
+        self.assertEqual(move["deliveries"][0]["error"],message)
+        self.assertFalse(move["acknowledged"])
+
+    async def test_acknowledged_native_pose_cannot_authorize_stale_capture_geometry(self):
+        test,state,shared,original=self.runner();clicks=[]
+        async def stale(name,args):
+            if name=="capture_screenshot":return projection_fixture(),[]
+            clicks.append(name);raise AssertionError("Stale image must not send ray input")
+        test.tool=stale
+        with self.assertRaises(atlas.CaptureMismatch):await test.livery_ray("RENAME")
+        self.assertEqual(clicks,[])
+        self.assertTrue(atlas.head_pose_matches(tracking_fixture(shared["pose"]),original))
+
+
+class OrdinaryMenuFraming(unittest.IsolatedAsyncioTestCase):
+    """Offline pose/action and rejection contracts; no generated pixels prove native rendering."""
+    def runner(self):
+        original=dict(x=.17,y=1.68,z=-.08,yaw_deg=33.437751,pitch_deg=-7,roll_deg=2)
+        data={"pose":dict(original),"commands":[],"modal":False,"selection":2,"menu":"GARAGE","actions":[]}
+        class Session:
+            async def call_tool(self,name,args):
+                if name!="set_head_pose":raise AssertionError(name)
+                data["commands"].append(dict(args));data["pose"]=dict(args)
+                return SimpleNamespace(isError=False)
+        args=SimpleNamespace(pid=1,output=Path("unused"),native_timeout=.1,current=False,settle=0,eye="both",width=2048)
+        test=atlas.Atlas(args,Session(),{"cases":[],"states":[]})
+        test.active_case={"id":"customization","group":"Garage","states":[]}
+        async def query(method,params=None):
+            if method=="vr.get_state":return tracking_fixture(data["pose"])
+            if method=="ui.get_message_box":return {"open":data["modal"]}
+            if method=="menu.get_state":return {"current_menu":data["menu"],"selection_index":data["selection"],
+                "item_count":4,"items":[{"index":i,"title":"Item "+str(i)} for i in range(4)]}
+            if method=="menu.select":
+                self.assertTrue(atlas.head_pose_matches(tracking_fixture(data["pose"]),test.neutral_head_pose))
+                data["actions"].append((method,dict(data["pose"])));data["menu"]="SKINS"
+                return {"success":True}
+            raise AssertionError(method)
+        test.query=query
+        test.initialize_framing(tracking_fixture(original))
+        return test,data,original
+
+    async def test_stage_neutralizes_before_menu_opening_and_preserves_tracked_position(self):
+        test,data,original=self.runner()
+        async def main():
+            self.assertTrue(atlas.head_pose_matches(tracking_fixture(data["pose"]),test.neutral_head_pose))
+        test.main=main
+        await test.stage({"route":[{"select":2}],"expect":["SKINS"]})
+        self.assertEqual(len(data["commands"]),1)
+        self.assertEqual([data["commands"][0][k] for k in ("yaw_deg","pitch_deg","roll_deg")],[0,0,0])
+        for key in ("x","y","z"):self.assertAlmostEqual(data["commands"][0][key],original[key])
+        self.assertEqual(data["actions"][0][0],"menu.select")
+
+    async def test_livery_reference_is_opened_neutral_before_any_per_plane_glance(self):
+        test,data=NormalMenuFixtures().runner();native_query=test.query
+        original=dict(x=.1,y=1.7,z=0,yaw_deg=33,pitch_deg=4,roll_deg=-2)
+        tracked={"pose":dict(original),"opening":[]}
+        class Session:
+            async def call_tool(self,name,args):tracked["pose"]=dict(args);return SimpleNamespace(isError=False)
+        test.session=Session();test.initialize_framing(tracking_fixture(original))
+        async def query(method,params=None):
+            if method=="vr.get_state":return tracking_fixture(tracked["pose"])
+            if method=="menu.select" and data["menu"]=="GARAGE" and data["selection"]==3:
+                tracked["opening"].append(dict(tracked["pose"]))
+            return await native_query(method,params)
+        test.query=query
+        await test.stage({"route":[{"goto":"livery"}],"expect":["SKINS"]})
+        self.assertEqual(len(tracked["opening"]),1)
+        self.assertEqual([tracked["opening"][0][k] for k in ("yaw_deg","pitch_deg","roll_deg")],[0,0,0])
+        self.assertAlmostEqual(tracked["opening"][0]["x"],original["x"])
+
+    async def test_stale_native_glance_cannot_accept_an_ordinary_menu_screenshot(self):
+        test,data,original=self.runner();data["pose"]["yaw_deg"]=-35
+        async def observe():return {"menu":{"current_menu":"SKINS"},"targets":{"targets":[]},"nodes":[],"message":{"open":False}}
+        async def tool(*a):raise AssertionError("A stale native pose must stop before screenshot acquisition")
+        test.observe=observe;test.tool=tool
+        with self.assertRaisesRegex(atlas.CaptureMismatch,"native head pose drifted"):await test.capture("Historical clipped-menu regression")
+        self.assertEqual(test.report["states"],[])
+
+    async def test_stale_submitted_glance_is_rejected_even_after_native_neutral_ack(self):
+        test,data,original=self.runner();data["pose"]=dict(test.neutral_head_pose)
+        async def observe():return {"menu":{"current_menu":"SKINS"},"targets":{"targets":[]},"nodes":[],"message":{"open":False}}
+        stale=projection_fixture({**test.neutral_head_pose,"yaw_deg":33.437751})
+        native=tracking_fixture(test.neutral_head_pose)
+        for eye,tracked in zip(stale["geometry"]["projection_eyes"],native["eyes"]):
+            eye["pose"]["position"]=tracked["tracking_pose"]["position"]
+        # Translation agrees exactly; the rejection must detect stale rotation.
+        async def tool(*a):return stale,[]
+        test.observe=observe;test.tool=tool
+        with tempfile.TemporaryDirectory() as tmp:
+            test.output=Path(tmp);(test.output/"images").mkdir();(test.output/"states").mkdir()
+            with self.assertRaises(atlas.CaptureMismatch):await test.capture("Rejected stale compositor view")
+            self.assertEqual(list((test.output/"images").iterdir()),[])
+        self.assertEqual(test.report["states"],[])
+
+    async def test_success_and_failure_restore_the_original_attachment_pose(self):
+        for fails in (False,True):
+            with self.subTest(fails=fails):
+                test,data,original=self.runner()
+                async def body(manifest):
+                    await test.prepare_neutral_frame("test route")
+                    await test.set_livery_head_pose({**test.neutral_head_pose,"yaw_deg":-40})
+                    if fails:raise ValueError("Original case failure")
+                test._run=body
+                if fails:
+                    with self.assertRaisesRegex(ValueError,"Original case failure"):await test.run({})
+                else:await test.run({})
+                self.assertTrue(atlas.head_pose_matches(tracking_fixture(data["pose"]),original))
+                self.assertTrue(test.report["framing"]["restore"]["acknowledged"])
+                self.assertEqual(data["commands"][-1],test.attachment_head_pose)
+
+    async def test_restore_failure_is_reported_without_masking_the_original_error(self):
+        test,data,original=self.runner()
+        async def body(manifest):raise atlas.UnknownModal("Unresolved real dialog")
+        async def restore():raise atlas.NativeTimeout("Native process unavailable during restore")
+        test._run=body;test.restore_attachment_frame=restore
+        with self.assertRaisesRegex(atlas.UnknownModal,"Unresolved real dialog"):await test.run({})
+        self.assertIn("Native process unavailable",test.report["framing"]["restore_error"])
+
+    async def test_midroute_unknown_modal_prevents_neutral_input_or_confirmation(self):
+        test,data,original=self.runner();data["modal"]=True
+        with self.assertRaises(atlas.UnknownModal):await test.prepare_neutral_frame("blocked route")
+        self.assertEqual(data["commands"],[]);self.assertEqual(data["actions"],[])
+
+    async def test_initial_unknown_modal_keeps_original_pose_and_captures_without_framing(self):
+        test,data,original=self.runner()
+        test.attachment_head_pose=None;test.neutral_head_pose=None;data["modal"]=True;captures=[]
+        query=test.query
+        async def initial(method,params=None):
+            if method=="game.get_state":return {"is_main_menu":True}
+            return await query(method,params)
+        async def capture(*a):captures.append(dict(data["pose"]))
+        test.query=initial;test.capture=capture
+        with self.assertRaises(atlas.UnknownModal):await test.run({"cases":[]})
+        self.assertEqual(captures,[original]);self.assertEqual(data["commands"],[])
+
+    def test_framing_policy_is_part_of_dedup_identity(self):
+        snapshot={"menu":{"current_menu":"SKINS"},"framing":{"kind":"ordinary neutral","pose":{"yaw_deg":0}}}
+        before=atlas.state_signature(snapshot);snapshot["framing"]["pose"]["yaw_deg"]=33.437751
+        self.assertNotEqual(before,atlas.state_signature(snapshot))
+
+
+class PointerLifecycle(unittest.IsolatedAsyncioTestCase):
+    def runner(self,current=False):
+        test=atlas.Atlas(SimpleNamespace(pid=1,output=Path("unused"),native_timeout=.1,current=current,hover="all"),None,{})
+        calls=[]
+        async def tool(name,args):
+            calls.append((name,args.copy()))
+            return {"status":"input_delivered","delivery":{"button_down":False}},[]
+        test.tool=tool
+        return test,calls
+
+    async def test_release_clears_only_owned_hands_using_fresh_session_capture(self):
+        test,calls=self.runner();test.owned_pointers={"right":"old-aim"};test.capture_cache={"capture_id":"latest-native"}
+        await test.release_owned_pointers();await test.release_owned_pointers()
+        self.assertEqual(calls,[("release_ui_pointer",{"capture_id":"latest-native","hand":"right","timeout":30})])
+        self.assertEqual(test.owned_pointers,{})
+        self.assertTrue(test.report["pointer_releases"][0]["acknowledged"])
+
+    async def test_hover_state_is_captured_before_its_pointer_is_released(self):
+        test,calls=self.runner()
+        async def query(method,params=None):return {"targets":[{"name":"button","enabled":True}]}
+        async def ray(name,hover=False):test.owned_pointers["right"]="source";calls.append(("hover",name))
+        async def capture(*a):
+            self.assertIn("right",test.owned_pointers);calls.append(("capture",a[0]))
+        test.query=query;test.ray=ray;test.capture=capture
+        await test.variants("Menu")
+        self.assertEqual([c[0] for c in calls],["hover","capture","release_ui_pointer"])
+        self.assertEqual(test.owned_pointers,{})
+
+    async def test_unacknowledged_release_stops_before_main_navigation(self):
+        test,calls=self.runner();test.owned_pointers={"right":"source"};native=[]
+        async def tool(*a):return {"status":"error"},[]
+        async def query(*a):native.append(a);raise AssertionError("Must not navigate after failed release")
+        test.tool=tool;test.query=query
+        with self.assertRaises(atlas.NativeTimeout):await test.main()
+        self.assertEqual(native,[])
+
+    async def test_readonly_attachment_never_sends_a_release(self):
+        test,calls=self.runner(current=True)
+        await test.release_owned_pointers()
+        self.assertEqual(calls,[])
+        test.owned_pointers={"right":"unexpected"}
+        with self.assertRaises(ValueError):await test.release_owned_pointers()
+        self.assertEqual(calls,[])
 
 
 class OwnerQueue(unittest.TestCase):
@@ -406,6 +1067,22 @@ class BoundedPipe(unittest.TestCase):
 
 
 class SavedNativeEvidence(unittest.TestCase):
+    def test_saved_r18_native_livery_pose_and_submitted_stereo_geometry_agree(self):
+        root=PATH.parents[1]/"build-ui-automation/flatout4-evidence/livery-side-panels-r18-final"
+        source=root/"left-left-state.json";capture_path=root/"004-left-left-both.json"
+        if not source.exists() or not capture_path.exists():self.skipTest("Historical r18 livery evidence is unavailable")
+        state=json.loads(source.read_text(encoding="utf-8"))
+        capture=json.loads(capture_path.read_text(encoding="utf-8"))[0]
+        # Read immutable real evidence; this validates processing, not a new live run.
+        pose=atlas.tracking_head_pose(atlas.livery_tracking_state(state["vr"]["frame"]))
+        atlas.validate_capture_pose(capture,pose)
+        self.assertGreater(abs(pose["yaw_deg"]),20)
+        stale=copy.deepcopy(capture);stale["geometry"]["projection_eyes"][1]["pose"]["orientation"]=[0,0,0,1]
+        with self.assertRaises(atlas.CaptureMismatch):atlas.validate_capture_pose(stale,pose)
+        moved=copy.deepcopy(capture)
+        for eye in moved["geometry"]["projection_eyes"]:eye["pose"]["position"][0]+=.01
+        with self.assertRaises(atlas.CaptureMismatch):atlas.validate_capture_pose(moved,pose)
+
     def test_derived_modal_inventory_preserves_original_real_native_evidence(self):
         source=PATH.parents[1]/"build-ui-automation/flatout4-evidence/ui-atlas-native-current-r1"
         if not (source/"report.json").exists():self.skipTest("Saved native atlas fixture is not present")

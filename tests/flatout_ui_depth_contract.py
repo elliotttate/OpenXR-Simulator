@@ -4,6 +4,7 @@ Input is capture_screenshot/hover_ui_at geometry from the running XR compositor;
 no model of the application's rendering substitutes for submitted surfaces.
 """
 import numpy as np
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 from flatout_livery_e2e import quaternion_matrix
 
 
@@ -14,7 +15,7 @@ def ui_planes(capture):
     return base, [s for s in planes if s['id'] != base['id']]
 
 
-def assert_hover_lift(capture, expected=.015):
+def assert_hover_lift(capture, expected=HOVER_LIFT_METERS):
     base, tiles = ui_planes(capture)
     assert tiles, 'Hovered control remains flattened into its source UI plane'
     normal = quaternion_matrix(base['pose']['orientation'])[:, 2]

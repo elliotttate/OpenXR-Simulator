@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(OpenXR-Simulator VERSION 1.0.0 LANGUAGES CXX)
+project(OpenXR-Simulator VERSION 1.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,11 +42,19 @@ add_library(openxr_simulator SHARED
     src/json.h
     src/mcp_integration.h
     src/projection_timing.h
+    src/preview_focus.h
+    src/command_epochs.h
     src/ui_enhancements.h
 )
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    target_sources(openxr_simulator PRIVATE openxr_simulator_x86.def)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(runtime_command_worker_tests tests/runtime_command_worker_tests.cpp src/flicker_detector.cpp)
+    target_compile_definitions(runtime_command_worker_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME runtime_command_worker COMMAND runtime_command_worker_tests)
     add_executable(xr_ui_probe probe/xr_probe.cpp)
     target_compile_definitions(xr_ui_probe PRIVATE XR_PROBE_DIRECT_RUNTIME)
     target_link_libraries(xr_ui_probe PRIVATE d3d12 dxgi d3dcompiler)
@@ -63,6 +71,10 @@ if(BUILD_TESTING)
     add_executable(projection_timing_tests tests/projection_timing_tests.cpp)
     target_include_directories(projection_timing_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME projection_timing COMMAND projection_timing_tests)
+
+    add_executable(command_epochs_tests tests/command_epochs_tests.cpp)
+    target_include_directories(command_epochs_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME command_epochs COMMAND command_epochs_tests)
 
     add_executable(ui_resolution_tests tests/ui_resolution_tests.cpp)
     target_include_directories(ui_resolution_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -130,7 +142,57 @@ if(BUILD_TESTING)
                 --probe $<TARGET_FILE:xr_ui_probe> --hand ${hand} --activation-button secondary --evidence ${CMAKE_BINARY_DIR}/ui-evidence)
             set_tests_properties(ui_e2e_secondary_${hand} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
         endforeach()
+        foreach(backend d3d11 d3d12)
+            foreach(mode projection stereo_quads)
+                set(layer_args)
+                if(mode STREQUAL "stereo_quads")
+                    list(APPEND layer_args --stereo-quads)
+                endif()
+                add_test(NAME composition_order_${backend}_${mode}
+                    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/composition_layer_order_e2e.py
+                        --probe $<TARGET_FILE:xr_layer_order> --runtime $<TARGET_FILE:openxr_simulator>
+                        --backend ${backend} ${layer_args} --evidence ${CMAKE_BINARY_DIR}/layer-evidence)
+                set_tests_properties(composition_order_${backend}_${mode} PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+            endforeach()
+        endforeach()
     endif()
+    add_executable(action_state_tests tests/action_state_tests.cpp)
+    target_include_directories(action_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME action_state COMMAND action_state_tests)
+
+    add_executable(pose_math_tests tests/pose_math_tests.cpp)
+    target_include_directories(pose_math_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME pose_math COMMAND pose_math_tests)
+
+    add_executable(swapchain_state_tests tests/swapchain_state_tests.cpp)
+    target_include_directories(swapchain_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME swapchain_state COMMAND swapchain_state_tests)
+
+    add_executable(frame_state_tests tests/frame_state_tests.cpp)
+    target_include_directories(frame_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME frame_state COMMAND frame_state_tests)
+    add_executable(preview_focus_tests tests/preview_focus_tests.cpp)
+    target_include_directories(preview_focus_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME preview_focus COMMAND preview_focus_tests)
+
+
+    add_executable(composition_validation_tests tests/composition_validation_tests.cpp)
+    target_include_directories(composition_validation_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME composition_validation COMMAND composition_validation_tests)
+
+    add_executable(composition_render_tests tests/composition_render_tests.cpp)
+    target_include_directories(composition_render_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME composition_render COMMAND composition_render_tests)
+
+    add_executable(api_validation_tests tests/api_validation_tests.cpp)
+    target_include_directories(api_validation_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME api_validation COMMAND api_validation_tests)
+    add_executable(ui_input_polling_tests tests/ui_input_polling_tests.cpp)
+    target_include_directories(ui_input_polling_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    if(MSVC)
+        target_compile_options(ui_input_polling_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME ui_input_polling COMMAND ui_input_polling_tests)
 endif()
 
 # Link libraries
@@ -156,6 +218,20 @@ if(WIN32)
     if(MSVC)
         # Without this MSVC decodes the UTF-8 sources as the system ANSI codepage.
         target_compile_options(openxr_simulator PRIVATE /utf-8)
+        # Statically link the C/C++ runtime (/MT) so the DLL does not depend on the
+        # process's MSVCP140.dll. Godot loads an older MSVCP140 (14.15) into the
+        # process; if our DLL binds to that older copy, std::string/locale layout
+        # mismatches crash during static init (access violation in MSVCP140 0x18e44)
+        # before any runtime entry point runs. /MT embeds the CRT we built with.
+        set_property(TARGET openxr_simulator PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(openxr_simulator PRIVATE
+            $<$<CONFIG:Debug>:/MTd>
+            $<$<CONFIG:Release>:/MT>
+            $<$<CONFIG:RelWithDebInfo>:/MT>)
+        target_link_options(openxr_simulator PRIVATE
+            $<$<CONFIG:Debug>:/NODEFAULTLIB:MSVCRTD.lib>
+            $<$<CONFIG:Release>:/NODEFAULTLIB:MSVCRT.lib>
+            $<$<CONFIG:RelWithDebInfo>:/NODEFAULTLIB:MSVCRT.lib>)
     endif()
 endif()
 
@@ -163,6 +239,7 @@ endif()
 set(RUNTIME_MANIFEST_CONTENT "{
     \"file_format_version\": \"1.0.0\",
     \"runtime\": {
+        \"name\": \"OpenXR Simulator\",
         \"library_path\": \"${SIMXR_OUTPUT_DIRECTORY}/openxr_simulator.dll\"
     }
 }")

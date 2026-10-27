@@ -17,6 +17,7 @@ import sys
 import uuid
 
 import numpy as np
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from PIL import Image
@@ -244,9 +245,9 @@ class NativeDepth(Frontend):
                 assert count>=8,("Reduced motion lacks flat hover feedback",feedback)
             self.cases.append({"case":"reduced-motion-keeps-flat-color-feedback-in-both-eyes","passed":True,"feedback":feedback})
         else:
-            assert .014 <= delta[2] <= .016 and approach >= .012, ("Button did not physically approach the camera", delta.tolist(), approach)
+            assert abs(delta[2]-HOVER_LIFT_METERS) <= .001 and approach >= HOVER_LIFT_METERS*.8, ("Button did not physically approach the camera", delta.tolist(), approach)
         assert np.allclose(tile["size"], expected_size, atol=.006), ("Hover changed the physical button size", tile["size"], expected_size)
-        rays = raised["geometry"]["decorations"]
+        rays = [layer for layer in raised["geometry"]["decorations"] if layer.get("role")=="one_texel_ribbon"]
         assert len(rays) == 2, "Both hand beams must stay on their compositor ribbon layers"
         origin = np.array(hovered["target"]["application_ray"]["position"])
         direction = np.array(hovered["target"]["application_ray"]["direction"])

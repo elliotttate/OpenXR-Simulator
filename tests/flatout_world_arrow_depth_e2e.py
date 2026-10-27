@@ -2,6 +2,7 @@
 import argparse, asyncio, copy, json, os, sys, uuid
 from pathlib import Path
 import numpy as np
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from flatout_frontend_e2e import Frontend, ROOT
@@ -29,7 +30,7 @@ class WorldArrows(Frontend):
              'origin_mode':'hand','surface':ui_surface(state),'dwell_frames':45}
         result=await self.tool('hover_ui_at',aim,'hover-arrow');assert result['status']=='input_delivered',result
         current=await self.query('vr.targets');actual=next(a for a in current['world_arrows'] if a['side']==self.args.side)
-        expected=.015 if arrow['enabled'] else 0
+        expected=HOVER_LIFT_METERS if arrow['enabled'] else 0
         self.check_geometry(arrow,actual,normal,expected,current,'hover')
         raised=await self.tool('capture_screenshot',{'eye':'both','max_width':4096},'stereo-raised-arrow');self.last_capture=raised
         if self.args.press:

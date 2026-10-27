@@ -130,16 +130,7 @@
       "group": "Party",
       "route": [
         {
-          "goto": "party_game"
-        },
-        {
-          "ray": "players.8"
-        },
-        {
-          "ray": "stunt.0"
-        },
-        {
-          "ray_prefix": "helper.Validate."
+          "party_drivers": 8
         }
       ],
       "expect": [

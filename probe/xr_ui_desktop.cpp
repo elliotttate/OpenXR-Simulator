@@ -92,6 +92,13 @@ int main() {
     chainInfo.width=768; chainInfo.height=512;
     const XrRect2Di subRect{{32,64},{640,360}};
     XrSwapchain chain; CHECK(xrCreateSwapchain(session,&chainInfo,&chain));
+    // Recreating one chain must preserve the other live chain's identity and images.
+    XrSwapchain survivor; CHECK(xrCreateSwapchain(session,&chainInfo,&survivor));
+    CHECK(xrDestroySwapchain(chain)); CHECK(xrCreateSwapchain(session,&chainInfo,&chain));
+    if (chain==survivor) { fprintf(stderr,"Recreated swapchain reused a live handle\n"); return 1; }
+    uint32_t survivorImages=0; CHECK(xrEnumerateSwapchainImages(survivor,0,&survivorImages,nullptr));
+    if (!survivorImages) return 1;
+    CHECK(xrDestroySwapchain(survivor));
     uint32_t count; CHECK(xrEnumerateSwapchainImages(chain,0,&count,nullptr));
     std::vector<XrSwapchainImageD3D11KHR> d3dImages(count,{XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
     std::vector<XrSwapchainImageOpenGLKHR> glImages(count,{XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR});
@@ -109,6 +116,8 @@ int main() {
         if (!began) Sleep(10);
     }
     if (!began) return 1;
+    // A rejected premature end must leave the session running for the frame loop.
+    if (xrEndSession(session)!=XR_ERROR_SESSION_NOT_STOPPING) return 1;
     UiFixture fixture;
     std::vector<uint8_t> pixels(chainInfo.width*chainInfo.height*4,0);
     for (int f=0;f<12000;++f) {
@@ -146,7 +155,7 @@ int main() {
         end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE; end.layerCount=1; end.layers=&layer;
         CHECK(xrEndFrame(session,&end)); fixture.Write(f);
     }
-    CHECK(xrEndSession(session)); CHECK(xrDestroySwapchain(chain)); CHECK(xrDestroySpace(aimSpace)); CHECK(xrDestroySpace(stage));
+    CHECK(xrRequestExitSession(session)); CHECK(xrEndSession(session)); CHECK(xrDestroySwapchain(chain)); CHECK(xrDestroySpace(aimSpace)); CHECK(xrDestroySpace(stage));
     CHECK(xrDestroySession(session)); CHECK(xrDestroyInstance(instance));
     if (gl) { wglMakeCurrent(nullptr,nullptr); wglDeleteContext(glBinding.hGLRC); ReleaseDC(window,glBinding.hDC); DestroyWindow(window); }
     printf("%s UI probe: %d click(s), %d snapshot errors\n",gl ? "OpenGL":"D3D11",fixture.clicks,fixture.syncErrors);

@@ -39,6 +39,11 @@ class CreditsBounds(Frontend):
         self.cases.append(dict(case='rewind-disabled-at-start',passed=inactive,reader=top,targets=targets))
         assert inactive,'Rewind must be disabled at the beginning of Credits'
         nodes=(await self.query('hud.rects',{'root':'menu','max_depth':14}))['nodes']
+        viewport=next(n for n in nodes if n['visible'] and n['path'].endswith('/CreditsViewport'))
+        first=next(n for n in nodes if n['visible'] and '/CreditsText/' in n['path'] and n.get('text','').strip())
+        vl,vt,vr,vb=viewport['rect'];l,t,r,b=first['rect']
+        assert vl<=l<r<=vr and vt<=t<b<=vb,('The reader must show its first heading at the beginning',viewport,first)
+        self.cases.append(dict(case='first-heading-visible-at-start',passed=True,viewport=viewport,heading=first))
         label=next(n for n in nodes if n.get('text','').strip().upper()=='REWIND' and n['visible'])
         color=[label['color'][c] for c in ('r','g','b')]
         assert max(color)<.8 and max(color)-min(color)<.15,('Unavailable rewind must be grey',label)

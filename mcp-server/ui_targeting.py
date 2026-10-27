@@ -13,6 +13,7 @@ from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, ImageDraw
+from atomic_json_file import atomic_json
 
 
 def rotate(q, v):
@@ -169,12 +170,6 @@ def validate_surface(surface):
         valid = False
     if not valid:
         raise ValueError("surface requires position[3], unit orientation[4], and positive size[2]")
-
-
-def atomic_json(path, payload):
-    tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    tmp.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
-    tmp.replace(path)
 
 
 class UiAutomation:
