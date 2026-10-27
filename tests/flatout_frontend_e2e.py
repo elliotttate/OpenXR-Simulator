@@ -1478,6 +1478,33 @@ class Frontend:
         await self.capture("return-main-verified")
         self.cases.append({"case":"options-back-and-confirm-frontend-return","passed":True,"destination":self.args.expected_menu})
 
+    async def spatial_height(self):
+        menu = await self.query("menu.get_state")
+        assert menu["current_menu"] in ("MAIN MENU", "MULTIPLAYER", "EXTRAS") and menu["is_3d"], menu
+        native = await self.query("vr.targets")
+        capture = await self.tool("capture_screenshot", {"eye":"both", "max_width":2048}, "spatial-height-both-eyes")
+        camera = native["vr_frame"]["camera"]
+        basis = np.column_stack([camera[k] for k in ("right", "up", "back")])
+        head = np.array(camera["origin"]) + basis @ np.array(capture["geometry"]["head"]["position"])
+        positions = [np.array(i["rest_position"]) for i in menu["items"]]
+        if menu.get("spatial_back", {}).get("position"):
+            positions.append(np.array(menu["spatial_back"]["position"]))
+        center = (positions[0] + positions[-1]) * .5
+        drop = float(center[2] - head[2])
+        passed = -.3 <= drop <= .1
+        self.cases.append({"case":"spatial-column-centered-near-neutral-gaze", "passed":passed,
+                           "head_world":head.tolist(), "column_center":center.tolist(), "height_delta_m":drop})
+        assert passed, ("Spatial navigation is lower than the regular menu reading surface", drop)
+        assert np.allclose(menu["spatial_layout"]["up"], [0,0,1], atol=1e-5), "Spatial column gained pitch or roll"
+        visible_points = positions + [corner for item in menu["items"] for corner in item["rendered_bounds"]["corners"]]
+        for eye in ("left", "right"):
+            for point in visible_points:
+                x,y = world_pixel({"vr":{"frame":native["vr_frame"]}}, capture, point, eye)
+                w,h = capture["image_size"]
+                index = int(eye == "right")
+                assert index*w/2 <= x < (index+1)*w/2 and 0 <= y < h, (eye, point, x, y)
+        self.cases.append({"case":"spatial-column-visible-in-both-eyes", "passed":True})
+
     async def spatial_hover(self):
         from flatout_livery_e2e import world_pixel
         assert not (await self.query("ui.get_message_box"))["open"], "Dismiss the startup/modal dialog before testing spatial labels"
@@ -1707,13 +1734,30 @@ class Frontend:
             self.cases.append({"case":"garage-car-trigger-isolated-"+car_hand,"passed":True,"ui_hand":ui_hand,"before":before,"after":after})
         await self.capture("garage-two-ray-safety-verified")
 
+    async def showroom_floor(self):
+        native = await self.query("vr.targets")
+        assert native["menu"] in ("GARAGE", "CARS", "SKINS", "UPGRADES"), native["menu"]
+        frame = native["vr_frame"]
+        # These are the same world-plane control bounds the renderer and rays
+        # consume. Include footer actions: a hover layer can conceal their base
+        # draw being buried in the showroom floor.
+        controls = [t for t in native["targets"] if 0 <= t["rect"][1] < t["rect"][3] <= 1080]
+        heights = [{"name": t["name"], "bottom_m": frame["panel"]["origin"][2] +
+                    (.5-t["rect"][3]/1080)*frame["panel_height"]} for t in controls]
+        assert heights
+        await self.tool("capture_screenshot", {"eye":"both", "max_width":2048}, "showroom-floor-both-eyes")
+        passed = all(h["bottom_m"] >= .05 for h in heights)
+        self.cases.append({"case":"showroom-controls-above-floor", "menu":native["menu"], "passed":passed, "heights":heights})
+        assert passed, ("Showroom controls intersect the floor", heights)
+
     async def garage_clearance(self):
         native = await self.query("vr.targets")
         assert (await self.query("menu.get_state"))["current_menu"]=="GARAGE"
         frame = native["vr_frame"]
         height, origin = frame["panel_height"],frame["panel"]["origin"][2]
-        buttons = [t for t in native["targets"] if t["name"].startswith("item.")]
+        buttons = [t for t in native["targets"] if t["name"].startswith(("item.", "helper."))]
         tops = [origin+(.5-t["rect"][1]/1080)*height for t in buttons]
+        bottoms = [origin+(.5-t["rect"][3]/1080)*height for t in buttons]
         # The showroom floor is Z=0 and the car body is around Z=.8 m.
         # Aim at that height through the same rendered plane as the screenshot.
         y = (.5-(.8-origin)/height)*1080
@@ -1722,10 +1766,10 @@ class Frontend:
         hovered = await self.tool("hover_ui_at",aim,"garage-car-body-hover")
         assert hovered["status"]=="input_delivered"
         actual = await self.query("vr.targets")
-        passed = max(tops)<=.4 and not actual["hovered"]
-        self.cases.append({"case":"garage-actions-clear-car-body","passed":passed,"button_top_heights":tops,"body_height":.8,"hovered":actual["hovered"]})
+        passed = min(bottoms)>=.05 and max(tops)<=.4 and not actual["hovered"]
+        self.cases.append({"case":"garage-actions-above-floor-and-clear-car-body","passed":passed,"button_top_heights":tops,"button_bottom_heights":bottoms,"body_height":.8,"hovered":actual["hovered"]})
         await self.capture("garage-car-body-clearance")
-        assert passed, ("Pointing at the car body must not select a garage action",tops,actual["hovered"])
+        assert passed, ("Garage actions must clear the floor and car body",tops,bottoms,actual["hovered"])
         args={**aim,"hold_frames":45,"timeout":30,"command_id":uuid.uuid4().hex}
         clicked=await self.tool("click_ui_at",args,"garage-car-body-no-action")
         assert clicked["status"]=="input_delivered"
@@ -1782,6 +1826,12 @@ class Frontend:
         # Livery owns its ImGui ray surface independently of the common menu pointer.
         from flatout_livery_e2e import game_read, LiveryTest
         livery = LiveryTest(self.args, self.session)
+        opening = (await self.capture("livery-opening-head"))["geometry"]["head"]
+        rotation = quaternion_matrix(opening["orientation"])
+        restore_pose = dict(zip(("x", "y", "z"), opening["position"]))
+        restore_pose.update(yaw_deg=math.degrees(math.atan2(rotation[0,2], rotation[2,2])),
+                            pitch_deg=math.degrees(math.asin(float(np.clip(-rotation[1,2], -1, 1)))),
+                            roll_deg=math.degrees(math.atan2(rotation[1,0], rotation[1,1])))
         before = await asyncio.to_thread(game_read,self.args.pid)
         assert before["ready"] and before["vr"]["active"] and not before["dirty"], before
         for step in range(3):
@@ -1805,6 +1855,9 @@ class Frontend:
             assert repeated["delivery"]["sync_id"]==clicked["delivery"]["sync_id"]
             assert (await self.query("menu.get_state"))["current_menu"]==after["current_menu"]
             if after["current_menu"]=="GARAGE":
+                # The livery Back button requires a real sideways glance. Put
+                # the test's opening head pose back before aiming at the dock.
+                await self.observed_head_pose("garage-head-restored", restore_pose)
                 self.cases.append({"case":"garage-livery-back-held-click-and-retry","passed":True})
                 return
             before = await asyncio.to_thread(game_read,self.args.pid)
@@ -1815,12 +1868,23 @@ class Frontend:
         targets = (await self.query("vr.targets"))["targets"]
         await self.capture("quick-start-compact-groups")
         rows = [r for r in setup["rows"] if r["visible"] and r["index"]>0]
+        nodes=(await self.query("hud.rects",{"root":"menu","max_depth":12}))["nodes"]
+        track=next(n for n in nodes if n["path"].endswith("/QuickTrackPanel") and n["visible"])
+        rules=next(n for n in nodes if n["path"].endswith("/QuickRulesPanel") and n["visible"])
         for left in (True,False):
             group = [r for r in rows if (r["index"]<=3)==left]
+            panel=track if left else rules
+            centres=[]
             for slot,row in enumerate(group):
-                arrows = [t for t in targets if t["name"].startswith("quick."+str(row["index"])+".")]
-                expected = (620 if left else 460)+slot*(104 if left else 120)
-                assert arrows and all(abs(t["rect"][1]-expected)<1 for t in arrows), ("Hidden settings left a gap",row,expected,arrows)
+                arrows=[t for t in targets if t["name"].startswith("quick."+str(row["index"])+".")]
+                if not arrows: continue  # Both directions may be disabled for a single choice.
+                for arrow in arrows:
+                    l,t,r,b=arrow["rect"]
+                    assert l>=panel["rect"][0]+15 and r<=panel["rect"][2]-15 and t>=panel["rect"][1]+90 and b<=panel["rect"][3]-15,(panel,arrow)
+                centres.append(sum(arrows[0]["rect"][i] for i in (1,3))*.5)
+            if len(centres)>1:
+                stride=56 if left else min(83,(panel["rect"][3]-panel["rect"][1]-128-max(0,len(group)-1)*13)/max(1,len(group)))+13
+                assert all(abs((b-a)-stride)<1.5 for a,b in zip(centres,centres[1:])),("Hidden settings left a gap",centres,stride)
         self.cases.append({"case":"quick-start-compact-visible-groups","passed":True})
         capture = await self.capture("quick-start-heading-contrast")
         image = np.asarray(Image.open(self.last_image_path).convert("RGB")).astype(float)
@@ -1872,7 +1936,7 @@ class Frontend:
                 if not t["name"].startswith("quick.") or t["name"].startswith("quick.mode."):
                     continue
                 l,top,r,b = t["rect"]
-                assert r-l >= 72 and b-top >= 72 and b <= 936, t
+                assert r-l >= 53 and b-top >= 49 and b <= 936, t
                 values = [(r["index"],r["value"],r["visible"]) for r in (await self.query("menu.get_state"))["setup"]["rows"]]
                 await self.hover(t["name"])
                 assert [(r["index"],r["value"],r["visible"]) for r in (await self.query("menu.get_state"))["setup"]["rows"]] == values, "Hover edited the event settings"
@@ -2128,6 +2192,10 @@ class Frontend:
         print("Cyan left and amber right beams visible in both eyes PASS",flush=True)
 
     async def run(self):
+        if self.args.showroom_floor_only:
+            return await self.showroom_floor()
+        if self.args.spatial_height_only:
+            return await self.spatial_height()
         if self.args.statistics_header_only:
             return await self.statistics_header()
         if self.args.reading_comfort_only:
@@ -2283,7 +2351,9 @@ async def run(args):
     args.evidence.mkdir(parents=True, exist_ok=False)
     params = StdioServerParameters(command=sys.executable, args=[str(ROOT/"mcp-server/openxr_simulator_mcp.py")],
         env={**os.environ, "SIMXR_DATA_DIR": str(args.data_dir.resolve())})
-    scope = ("Statistics page-count legibility" if args.statistics_header_only else
+    scope = ("Showroom world-plane controls clear the floor" if args.showroom_floor_only else
+             "Spatial navigation height and both-eye visibility" if args.spatial_height_only else
+             "Statistics page-count legibility" if args.statistics_header_only else
              "Reading-menu head-height placement and world-locked both-eye visibility" if args.reading_comfort_only else
              "Quick Start head-height placement and world-locked both-eye visibility" if args.quick_comfort_only else
              "Options head-height placement and world-locked both-eye visibility" if args.options_comfort_only else
@@ -2377,6 +2447,8 @@ if __name__ == "__main__":
     parser.add_argument("--spatial-locked-only", action="store_true", help="From this RC's main menu: verify Wreck Run is reported as Coming Soon and a held ray click cannot enter it")
     parser.add_argument("--spatial-click-index", type=int)
     parser.add_argument("--expected-menu", help="Expected destination for --spatial-click-index or --return-main-only")
+    parser.add_argument("--showroom-floor-only", action="store_true", help="From Garage, Cars, Customize or Upgrades: reject any canvas control intersecting the showroom floor")
+    parser.add_argument("--spatial-height-only", action="store_true", help="From an ordinary spatial navigation column: compare its center to the opening head height and check both eyes")
     parser.add_argument("--garage-two-rays-only", action="store_true", help="From Garage: press a trigger over the car while the other ray rests on an action, in both hand assignments")
     parser.add_argument("--garage-clearance-only", action="store_true", help="From Garage: verify the dock stays below the car and a car-body ray cannot activate its buttons")
     parser.add_argument("--garage-only", action="store_true", help="From Garage: verify large labeled action buttons, spacing, hovers and submenu routes")

@@ -68,11 +68,17 @@ async def run(a):
             await session.initialize()
             t = ChallengeStyle(a, session)
             t.frames = []
-            assert (await t.query('menu.get_state'))['current_menu'] == ('OPTIONS' if a.menu == 'options' else 'INSANITY')
+            menus = {'options': 'OPTIONS', 'challenge': 'INSANITY', 'quick': 'QUICK EVENTS'}
+            assert (await t.query('menu.get_state'))['current_menu'] == menus[a.menu]
             await t.park()
             points = {}
             rects = {x['name']: x['rect'] for x in (await t.query('vr.targets'))['targets']}
-            names = ('settings.category.0', 'settings.category.2', 'helper.Cancel.OptionsDone') if a.menu == 'options' else ('challenge.event.0', 'challenge.event.1', 'helper.Validate.2')
+            targets_by_menu = {
+                'options': ('settings.category.0', 'settings.category.2', 'helper.Cancel.OptionsDone'),
+                'challenge': ('challenge.event.0', 'challenge.event.1', 'helper.Validate.2'),
+                'quick': ('quick.mode.0', 'quick.mode.1', 'helper.Validate.QuickContinue'),
+            }
+            names = targets_by_menu[a.menu]
             for name in names:
                 l, top, r, b = rects[name]
                 points[name] = {'x': (l+r)/2, 'y': (top+b)/2}
@@ -136,5 +142,5 @@ if __name__ == '__main__':
     p.add_argument('--data-dir', type=Path, required=True)
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--real-xr', action='store_true')
-    p.add_argument('--menu', choices=('challenge', 'options'), default='challenge')
+    p.add_argument('--menu', choices=('challenge', 'options', 'quick'), default='challenge')
     asyncio.run(run(p.parse_args()))
