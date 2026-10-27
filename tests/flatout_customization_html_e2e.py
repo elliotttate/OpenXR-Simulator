@@ -41,14 +41,23 @@ class CustomTest(Frontend):
                 state=await self.query('menu.get_state')
                 available=[x for x in state['items'] if not x['locked'] and x['installed']]
                 alternate=next((x for x in available if not x['equipped']),None)
-                if alternate:
+                # A newly created garage can retain the native BoostFX sentinel
+                # 0, which has no selectable card or restore callback. Never
+                # commit away from a value the real UI cannot restore.
+                restorable=next((x for x in available if x['customization_id']==original[key]),None)
+                if alternate and restorable:
                     await self.focus(alternate['index'])
                     await self.click('helper.Validate.CustomSelect')
                     equipped=await self.query('menu.get_state')
                     assert equipped['customization_context'][key]==alternate['customization_id']
                     assert next(x for x in equipped['items'] if x['customization_id']==alternate['customization_id'])['equipped']
                     self.cases.append({'case':'native-equip-and-profile-state','category':category,'passed':True})
-                await self.restore(category,key,original[key])
+                if restorable:
+                    await self.restore(category,key,original[key])
+                else:
+                    assert (await self.query('menu.get_state'))['customization_context'][key]==original[key]
+                    self.cases.append({'case':'native-value-without-selectable-card-preserved','category':category,
+                        'value':original[key],'passed':True,'equip_tested':False})
                 state=await self.query('menu.get_state')
                 locked=next((x for x in state['items'] if x['locked'] or not x['installed']),None)
                 if locked:
@@ -135,6 +144,7 @@ class CustomTest(Frontend):
         assert not [n for n in nodes if '/CustomizationWorkspace/' in n['path'] and n['kind']=='panel' and n['visible'] and n.get('color',{}).get('a',0)>.2
             and min(n['rect'][2],preview[2])-max(n['rect'][0],preview[0])>20 and min(n['rect'][3],preview[3])-max(n['rect'][1],preview[1])>20]
         assert all(t['rect'][2]-t['rect'][0]>=79 and t['rect'][3]-t['rect'][1]>=79 for t in targets)
+        assert all(20<=t['rect'][0]<t['rect'][2]<=1900 and 20<=t['rect'][1]<t['rect'][3]<=1060 for t in targets), 'Controls require canvas-edge clearance'
         await self.audit(label);return indices
 
 

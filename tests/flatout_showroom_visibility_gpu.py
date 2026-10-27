@@ -67,8 +67,19 @@ def inspect(job, rd):
             checks = []
             for target in job["targets"]:
                 left, top, right, bottom = target["rect"]
-                points = sorted(set(pixel((left+(right-left)*x)/1920, (top+(bottom-top)*y)/1080)
-                                    for x in (.15, .35, .5, .65, .85) for y in (.25, .5, .75)))
+                if target.get('sample_source_ink'):
+                    # A text node's layout box can be mostly transparent. Choose
+                    # actual RTT ink first; then still require its RGB change
+                    # and passing scene depth history independently in each eye.
+                    candidates = [(int(left+(right-left)*x/40), int(top+(bottom-top)*y/8))
+                                  for x in range(1, 40) for y in range(1, 8)]
+                    ink = [p for p in candidates if
+                           controller.PickPixel(source, *p, rd.Subresource(), rd.CompType.Typeless).floatValue[3] > .2]
+                    assert len(ink) >= 3, ('Missing source text ink', target, len(ink))
+                    points = sorted(set(pixel((x+.5)/1920, (y+.5)/1080) for x,y in ink))
+                else:
+                    points = sorted(set(pixel((left+(right-left)*x)/1920, (top+(bottom-top)*y)/1080)
+                                        for x in (.15, .35, .5, .65, .85) for y in (.25, .5, .75)))
                 assert all(viewport.x <= x < viewport.x+viewport.width and viewport.y <= y < viewport.y+viewport.height for x, y in points), (eye, target, points)
                 controller.SetFrameEvent(event-1, True)
                 before = [list(controller.PickPixel(output, x, y, rd.Subresource(), rd.CompType.Typeless).floatValue) for x, y in points]

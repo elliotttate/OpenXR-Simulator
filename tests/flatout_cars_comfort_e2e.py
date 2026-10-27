@@ -22,7 +22,8 @@ async def run(args):
             await session.initialize()
             t=Frontend(args,session)
             try:
-                assert (await t.query('menu.get_state'))['current_menu']==args.menu.upper()
+                expected={'customization':'SKINS','career':'FLATOUT'}.get(args.menu,args.menu.upper())
+                assert (await t.query('menu.get_state'))['current_menu']==expected
                 capture=await t.tool('capture_screenshot',{'eye':'both','max_width':2048},'comfort-source')
                 head=capture['geometry']['head']
                 original=dict(zip(('x','y','z'),head['position']))
@@ -33,7 +34,8 @@ async def run(args):
                         capture=await t.observed_head_pose('cars-'+posture,{**original,'y':height,
                             'yaw_deg':0,'pitch_deg':0,'roll_deg':0})
                         native=await t.query('vr.targets')
-                        surface=ui_surface({'vr':{'frame':native['vr_frame']}}) if native.get('vr_frame') else max(
+                        spatial=(await t.query('menu.get_state'))['is_3d']
+                        surface=ui_surface({'vr':{'frame':native['vr_frame']}}) if native.get('vr_frame') and not spatial else max(
                             (s for s in capture['geometry']['surfaces'] if s['visibility']==0),key=lambda s:s['size'][0]*s['size'][1])
                         surface={k:surface[k] for k in ('pose','size')}
                         review=await t.tool('analyze_ui_visibility',{'capture_id':capture['capture_id'],'reference_mode':'level_head',
@@ -60,5 +62,5 @@ if __name__=='__main__':
     p.add_argument('--data-dir',required=True,type=Path)
     p.add_argument('--evidence',required=True,type=Path)
     p.add_argument('--hand',default='right',choices=('left','right'))
-    p.add_argument('--menu',default='cars',choices=('cars','drivers','upgrades'))
+    p.add_argument('--menu',default='cars',choices=('cars','drivers','upgrades','customization','career'))
     asyncio.run(run(p.parse_args()))

@@ -76,7 +76,8 @@ class ShowroomProfile(Frontend):
 
     async def depth(self, capture):
         native = await self.query('vr.targets')
-        base = ui_surface({'vr':{'frame':native['vr_frame']}}) if native.get('vr_frame') else max(
+        spatial = (await self.query('menu.get_state'))['is_3d']
+        base = ui_surface({'vr':{'frame':native['vr_frame']}}) if native.get('vr_frame') and not spatial else max(
             (s for s in capture['geometry']['surfaces'] if s['visibility']==0),key=lambda s:s['size'][0]*s['size'][1])
         normal = quaternion_matrix(base['pose']['orientation'])[:,2]
         tiles = [s for s in capture['geometry']['surfaces'] if s['visibility']==0 and s.get('id')!=base.get('id')]
@@ -100,9 +101,9 @@ async def run(a):
     async with stdio_client(server) as streams:
         async with ClientSession(*streams) as session:
             await session.initialize()
-            t = ShowroomProfile(a,session) if a.menu in ('garage','cars','drivers','upgrades') else ChallengeStyle(a, session)
+            t = ShowroomProfile(a,session) if a.menu in ('garage','cars','drivers','upgrades','customization','career') else ChallengeStyle(a, session)
             t.frames = []
-            menus = {'options': 'OPTIONS', 'challenge': 'INSANITY', 'quick': 'QUICK EVENTS', 'garage':'GARAGE', 'cars':'CARS','drivers':'DRIVERS','upgrades':'UPGRADES'}
+            menus = {'options': 'OPTIONS', 'challenge': 'INSANITY', 'quick': 'QUICK EVENTS', 'garage':'GARAGE', 'cars':'CARS','drivers':'DRIVERS','upgrades':'UPGRADES','customization':'SKINS','career':'FLATOUT'}
             assert (await t.query('menu.get_state'))['current_menu'] == menus[a.menu]
             await t.park()
             points = {}
@@ -115,6 +116,8 @@ async def run(a):
                 'cars': ('cars.item.0', 'cars.item.1', 'helper.Cancel.4'),
                 'drivers': ('drivers.item.0', 'drivers.item.1', 'helper.Cancel.4'),
                 'upgrades': ('upgrades.item.0', 'upgrades.item.1', 'helper.Cancel.UpgradeBack'),
+                'customization': ('custom.item.0', 'custom.item.1', 'helper.Cancel.CustomBack'),
+                'career': ('career.hero', 'career.garage', 'helper.Cancel.CareerBack'),
             }
             names = targets_by_menu[a.menu]
             for name in names:
@@ -154,13 +157,24 @@ async def run(a):
                         offset = page['next_offset']
                     (a.evidence / (phase + '.json')).write_text(json.dumps({'capture': capture, 'events': events}, indent=2), encoding='utf-8')
                     result['windows'][phase] = summarize(capture)
+                    if a.real_xr:
+                        pointer = await t.query('vr.targets')
+                        result.setdefault('window_pointer', {})[phase] = {
+                            'hovered': pointer['hovered'], 'clicks': pointer['clicks']}
+                        assert pointer['clicks'] == clicks
+                        assert pointer['hovered'] == (names[0] if phase == 'hover' else ''), (phase, pointer)
                     print(phase, json.dumps(result['windows'][phase]), flush=True)
                     if phase == 'hover':
                         await asyncio.to_thread(call, a.pid, 'vr.beam', {'off': True})
+                        # The parked spare hand has a ten-second input lease.
+                        # Renew both outside the measured window before taking
+                        # more screenshots, so its expiry cannot steal focus.
+                        if a.real_xr:
+                            await t.park()
                         await t.hover(names[0])
                         await asyncio.sleep(1.2)
                         frame = await t.frame('depth-after-hover-stress')
-                        result['physical_depth_after_stress'] = await t.depth(frame.capture) if a.menu in ('garage','cars','drivers','upgrades') else assert_hover_lift(frame.capture)
+                        result['physical_depth_after_stress'] = await t.depth(frame.capture) if a.menu in ('garage','cars','drivers','upgrades','customization','career') else assert_hover_lift(frame.capture)
                     (a.evidence / 'summary.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
                 assert (await t.query('vr.targets'))['clicks'] == clicks
                 result['native_errors'] = await asyncio.to_thread(call, a.pid, 'game.errors')
@@ -180,5 +194,5 @@ if __name__ == '__main__':
     p.add_argument('--data-dir', type=Path, required=True)
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--real-xr', action='store_true')
-    p.add_argument('--menu', choices=('challenge', 'options', 'quick', 'garage', 'cars','drivers','upgrades'), default='challenge')
+    p.add_argument('--menu', choices=('challenge', 'options', 'quick', 'garage', 'cars','drivers','upgrades','customization','career'), default='challenge')
     asyncio.run(run(p.parse_args()))

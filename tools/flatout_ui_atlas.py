@@ -80,7 +80,8 @@ def loading_widgets(nodes):
 
 def career_car_caption(nodes):
     return next((n["text"].strip() for n in nodes if n.get("visible") and n.get("text","").strip() and
-                 "/info_3d_c/" in n.get("path","").casefold() and n["path"].casefold().endswith("/txt_value")),None)
+                 (("/info_3d_c/" in n.get("path","").casefold() and n["path"].casefold().endswith("/txt_value")) or
+                  n.get("path","").endswith("/CareerWorkspace/CareerGarage/CareerGarageCar"))),None)
 
 
 def livery_ready(state):
