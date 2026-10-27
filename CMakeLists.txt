@@ -51,6 +51,8 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(key_query_probe tests/key_query_probe.cpp)
+    target_link_libraries(key_query_probe PRIVATE user32)
     add_executable(host_message_pump_tests tests/host_message_pump_tests.cpp)
     target_link_libraries(host_message_pump_tests PRIVATE user32)
     add_test(NAME host_message_pump_default COMMAND host_message_pump_tests)

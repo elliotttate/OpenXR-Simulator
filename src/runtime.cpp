@@ -3599,44 +3599,83 @@ static void Dump() {
 // Diagnostic-only wait-path attribution. No file I/O occurs while recording.
 // Samples are bounded and exported at teardown; keep this separate from throughput runs.
 namespace wait_frame_trace {
-constexpr size_t PointCount = 9;
+constexpr size_t PointCount = 13;
 constexpr size_t Capacity = 512;
-struct Sample { LONGLONG ticks[PointCount]{}; uint64_t frame{}; };
+struct KeyQuery { int key; LONGLONG ticks; };
+struct Sample { LONGLONG ticks[PointCount]; uint64_t frame; KeyQuery keys[40]; size_t keyCount; };
 static Sample samples[Capacity]{};
-static uint64_t retainedCount = 0;
+struct AggregateBin { uint64_t firstFrame{}, lastFrame{}, count{}, activeInputCount{}; LONGLONG phaseTicks[PointCount - 1]{}; };
+static AggregateBin bins[128]{}; // 256 submitted frames per bin, bounded across long sessions.
+static uint64_t retainedCount = 0, observedCount = 0;
+static LONGLONG phaseTotals[PointCount - 1]{}, keyTotals[256]{};
 static std::mutex mutex;
 static bool Enabled() {
     static const bool enabled = []() { char value[8]{}; return GetEnvironmentVariableA("SIMXR_WAIT_FRAME_TRACE", value, sizeof(value)) == 1 && value[0] == '1'; }();
     return enabled;
 }
 struct Capture {
-    Sample sample{};
-    bool enabled = Enabled();
+    Sample sample;
+    const bool enabled = Enabled();
+    Capture() { if (enabled) sample = {}; } // No diagnostic-buffer clearing in ordinary play.
     void Mark(size_t point) { if (enabled) { LARGE_INTEGER now{}; QueryPerformanceCounter(&now); sample.ticks[point] = now.QuadPart; } }
+    SHORT KeyState(int key) {
+        if (!enabled) return GetAsyncKeyState(key);
+        LARGE_INTEGER before{}, after{}; QueryPerformanceCounter(&before);
+        const SHORT state = GetAsyncKeyState(key);
+        QueryPerformanceCounter(&after);
+        if (sample.keyCount < 40) sample.keys[sample.keyCount++] = {key, after.QuadPart - before.QuadPart};
+        return state;
+    }
     void Keep() {
-        if (!enabled || (sample.ticks[PointCount-1] - sample.ticks[0]) * 1000.0 / end_frame_trace::Frequency() < 0.5) return;
+        if (!enabled) return;
         sample.frame = mcp::g_runtimeFrameCount.load(std::memory_order_acquire);
         std::lock_guard<std::mutex> guard(mutex);
-        samples[retainedCount++ % Capacity] = sample;
+        ++observedCount;
+        auto& bin = bins[(sample.frame / 256) % 128];
+        if (bin.count && bin.firstFrame / 256 != sample.frame / 256) bin = {};
+        if (!bin.count) bin.firstFrame = sample.frame;
+        bin.lastFrame = sample.frame; ++bin.count;
+        if (sample.keyCount) ++bin.activeInputCount;
+        for (size_t i = 0; i + 1 < PointCount; ++i) bin.phaseTicks[i] += sample.ticks[i + 1] - sample.ticks[i];
+        for (size_t i = 0; i + 1 < PointCount; ++i) phaseTotals[i] += sample.ticks[i + 1] - sample.ticks[i];
+        for (size_t i = 0; i < sample.keyCount; ++i) keyTotals[sample.keys[i].key] += sample.keys[i].ticks;
+        if ((sample.ticks[PointCount-1] - sample.ticks[0]) * 1000.0 / end_frame_trace::Frequency() >= 0.5) samples[retainedCount++ % Capacity] = sample;
     }
 };
 static void Dump() {
     if (!Enabled()) return;
     std::lock_guard<std::mutex> guard(mutex);
-    if (!retainedCount) return; // EndSession followed by DestroySession must retain the first export.
+    if (!observedCount) return; // EndSession followed by DestroySession must retain the first export.
     const std::string path = mcp::GetSimulatorDataPath() + "\\wait_frame_trace.jsonl";
     FILE* file = nullptr;
     if (fopen_s(&file, path.c_str(), "w") != 0 || !file) return;
-    fprintf(file, "{\"schema\":1,\"qpc_frequency\":%lld,\"slow_frames_observed\":%llu,\"capacity\":512,\"threshold_ms\":0.5,\"phase_names\":[\"lifecycle\",\"preview_creation\",\"host_messages\",\"control_lock\",\"input\",\"commands\",\"pointer\",\"prediction\"]}\n", end_frame_trace::Frequency(), static_cast<unsigned long long>(retainedCount));
+    fprintf(file, "{\"schema\":6,\"qpc_frequency\":%lld,\"slow_frames_observed\":%llu,\"capacity\":512,\"threshold_ms\":0.5,\"phase_names\":[\"lifecycle\",\"preview_creation\",\"host_messages\",\"control_lock\",\"input_focus\",\"first_key_query\",\"head_controller_motion\",\"controller_buttons\",\"velocity\",\"commands\",\"pointer\",\"prediction\"]}\n", end_frame_trace::Frequency(), static_cast<unsigned long long>(retainedCount));
+    fprintf(file, "{\"record_type\":\"all_wait_aggregates\",\"observed_frames\":%llu,\"phase_total_ticks\":[", static_cast<unsigned long long>(observedCount));
+    for (size_t i = 0; i + 1 < PointCount; ++i) fprintf(file, "%s%lld", i ? "," : "", phaseTotals[i]);
+    fprintf(file, "],\"key_total_ticks\":[");
+    for (size_t i = 0; i < 256; ++i) fprintf(file, "%s%lld", i ? "," : "", keyTotals[i]);
+    fprintf(file, "]}\n");
+    for (const auto& bin : bins) {
+        if (!bin.count) continue;
+        fprintf(file, "{\"record_type\":\"wait_bin\",\"first_frame\":%llu,\"last_frame\":%llu,\"count\":%llu,\"active_input_count\":%llu,\"phase_total_ticks\":[",
+            static_cast<unsigned long long>(bin.firstFrame), static_cast<unsigned long long>(bin.lastFrame), static_cast<unsigned long long>(bin.count), static_cast<unsigned long long>(bin.activeInputCount));
+        for (size_t i = 0; i + 1 < PointCount; ++i) fprintf(file, "%s%lld", i ? "," : "", bin.phaseTicks[i]);
+        fprintf(file, "]}\n");
+    }
     const uint64_t first = retainedCount > Capacity ? retainedCount - Capacity : 0;
     for (uint64_t i = first; i < retainedCount; ++i) {
         const auto& sample = samples[i % Capacity];
         fprintf(file, "{\"previous_submission_frame\":%llu,\"qpc\":[", static_cast<unsigned long long>(sample.frame));
         for (size_t point = 0; point < PointCount; ++point) fprintf(file, "%s%lld", point ? "," : "", sample.ticks[point]);
+        fprintf(file, "],\"key_queries\":[");
+        for (size_t k = 0; k < sample.keyCount; ++k) fprintf(file, "%s{\"vk\":%d,\"ticks\":%lld}", k ? "," : "", sample.keys[k].key, sample.keys[k].ticks);
         fprintf(file, "]}\n");
     }
     fclose(file);
-    retainedCount = 0;
+    retainedCount = observedCount = 0;
+    for (auto& value : phaseTotals) value = 0;
+    for (auto& value : keyTotals) value = 0;
+    for (auto& bin : bins) bin = {};
 }
 }
 
@@ -4804,12 +4843,14 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
             inputActive = (fgPid != 0 && fgPid == GetCurrentProcessId());
         }
     }
+    trace.Mark(5);
     if (inputActive && !rt::g_automationOnly) {
         // Shift is the sprint modifier; both it and the base speed are set from
         // Tools > Movement Speed. GetAsyncKeyState rather than the WM_KEYDOWN
         // path because this reads a held state, and the host window may be the
         // one with focus (see above).
-        const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        const bool shiftHeld = (trace.KeyState(VK_SHIFT) & 0x8000) != 0;
+        trace.Mark(6);
         const float moveSpeed = ui::GetMoveSpeed(shiftHeld);  // meters per second
         const float deltaTime = inputDeltaSeconds;
 
@@ -4817,30 +4858,30 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         XrVector3f fwd = rt::RotateVectorByQuaternion(headQ, XrVector3f{0.0f, 0.0f, -1.0f});
         XrVector3f right = rt::RotateVectorByQuaternion(headQ, XrVector3f{1.0f, 0.0f, 0.0f});
 
-        if (GetAsyncKeyState('W') & 0x8000) {
+        if (trace.KeyState('W') & 0x8000) {
             rt::g_headPos.x += fwd.x * moveSpeed * deltaTime;
             rt::g_headPos.y += fwd.y * moveSpeed * deltaTime;
             rt::g_headPos.z += fwd.z * moveSpeed * deltaTime;
         }
-        if (GetAsyncKeyState('S') & 0x8000) {
+        if (trace.KeyState('S') & 0x8000) {
             rt::g_headPos.x -= fwd.x * moveSpeed * deltaTime;
             rt::g_headPos.y -= fwd.y * moveSpeed * deltaTime;
             rt::g_headPos.z -= fwd.z * moveSpeed * deltaTime;
         }
-        if (GetAsyncKeyState('A') & 0x8000) {
+        if (trace.KeyState('A') & 0x8000) {
             rt::g_headPos.x -= right.x * moveSpeed * deltaTime;
             rt::g_headPos.y -= right.y * moveSpeed * deltaTime;
             rt::g_headPos.z -= right.z * moveSpeed * deltaTime;
         }
-        if (GetAsyncKeyState('D') & 0x8000) {
+        if (trace.KeyState('D') & 0x8000) {
             rt::g_headPos.x += right.x * moveSpeed * deltaTime;
             rt::g_headPos.y += right.y * moveSpeed * deltaTime;
             rt::g_headPos.z += right.z * moveSpeed * deltaTime;
         }
-        if (GetAsyncKeyState('Q') & 0x8000) {
+        if (trace.KeyState('Q') & 0x8000) {
             rt::g_headPos.y -= moveSpeed * deltaTime;
         }
-        if (GetAsyncKeyState('E') & 0x8000) {
+        if (trace.KeyState('E') & 0x8000) {
             rt::g_headPos.y += moveSpeed * deltaTime;
         }
 
@@ -4856,7 +4897,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         static bool mKeyWasPressed = false;
         static float animTime = 0.0f;
 
-        bool mKeyPressed = (GetAsyncKeyState('M') & 0x8000) != 0;
+        bool mKeyPressed = (trace.KeyState('M') & 0x8000) != 0;
         if (mKeyPressed && !mKeyWasPressed) {
             autoMotionEnabled = !autoMotionEnabled;
             Logf("[SimXR] Auto motion %s", autoMotionEnabled ? "ENABLED" : "DISABLED");
@@ -4893,39 +4934,39 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         const float ctrlRotSpeed = 1.0f * deltaTime;
 
         if (!autoMotionEnabled) {
-            if (GetAsyncKeyState(VK_NUMPAD8) & 0x8000) {
+            if (trace.KeyState(VK_NUMPAD8) & 0x8000) {
                 rt::g_rightController.posOffset.z -= ctrlMoveSpeed;  // Forward
             }
-            if (GetAsyncKeyState(VK_NUMPAD2) & 0x8000) {
+            if (trace.KeyState(VK_NUMPAD2) & 0x8000) {
                 rt::g_rightController.posOffset.z += ctrlMoveSpeed;  // Back
             }
-            if (GetAsyncKeyState(VK_NUMPAD4) & 0x8000) {
+            if (trace.KeyState(VK_NUMPAD4) & 0x8000) {
                 rt::g_rightController.posOffset.x -= ctrlMoveSpeed;  // Left
             }
-            if (GetAsyncKeyState(VK_NUMPAD6) & 0x8000) {
+            if (trace.KeyState(VK_NUMPAD6) & 0x8000) {
                 rt::g_rightController.posOffset.x += ctrlMoveSpeed;  // Right
             }
-            if (GetAsyncKeyState(VK_ADD) & 0x8000) {
+            if (trace.KeyState(VK_ADD) & 0x8000) {
                 rt::g_rightController.posOffset.y += ctrlMoveSpeed;  // Up
             }
-            if (GetAsyncKeyState(VK_SUBTRACT) & 0x8000) {
+            if (trace.KeyState(VK_SUBTRACT) & 0x8000) {
                 rt::g_rightController.posOffset.y -= ctrlMoveSpeed;  // Down
             }
-            if (GetAsyncKeyState(VK_NUMPAD7) & 0x8000) {
+            if (trace.KeyState(VK_NUMPAD7) & 0x8000) {
                 rt::g_rightController.yawOffset -= ctrlRotSpeed;  // Rotate left
             }
-            if (GetAsyncKeyState(VK_NUMPAD9) & 0x8000) {
+            if (trace.KeyState(VK_NUMPAD9) & 0x8000) {
                 rt::g_rightController.yawOffset += ctrlRotSpeed;  // Rotate right
             }
-            if (GetAsyncKeyState(VK_NUMPAD1) & 0x8000) {
+            if (trace.KeyState(VK_NUMPAD1) & 0x8000) {
                 rt::g_rightController.pitchOffset += ctrlRotSpeed;  // Pitch down
             }
-            if (GetAsyncKeyState(VK_NUMPAD3) & 0x8000) {
+            if (trace.KeyState(VK_NUMPAD3) & 0x8000) {
                 rt::g_rightController.pitchOffset -= ctrlRotSpeed;  // Pitch up
             }
         }
         // Numpad 5: Reset controller to default position
-        if (GetAsyncKeyState(VK_NUMPAD5) & 0x8000) {
+        if (trace.KeyState(VK_NUMPAD5) & 0x8000) {
             rt::g_rightController.posOffset = {0.2f, -0.3f, -0.4f};
             rt::g_rightController.yawOffset = 0.0f;
             rt::g_rightController.pitchOffset = -0.3f;
@@ -4942,14 +4983,15 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         // R = Primary button (A)
         // T = Secondary button (B)
         // Enter = Thumbstick click
-        rt::g_rightController.triggerPressed = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+        trace.Mark(7);
+        rt::g_rightController.triggerPressed = (trace.KeyState(VK_SPACE) & 0x8000) != 0;
         rt::g_rightController.triggerValue = rt::g_rightController.triggerPressed ? 1.0f : 0.0f;
-        rt::g_rightController.gripPressed = (GetAsyncKeyState('F') & 0x8000) != 0;
+        rt::g_rightController.gripPressed = (trace.KeyState('F') & 0x8000) != 0;
         rt::g_rightController.gripValue = rt::g_rightController.gripPressed ? 1.0f : 0.0f;
-        rt::g_rightController.menuPressed = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
-        rt::g_rightController.primaryPressed = (GetAsyncKeyState('R') & 0x8000) != 0;
-        rt::g_rightController.secondaryPressed = (GetAsyncKeyState('T') & 0x8000) != 0;
-        rt::g_rightController.thumbstickPressed = (GetAsyncKeyState(VK_RETURN) & 0x8000) != 0;
+        rt::g_rightController.menuPressed = (trace.KeyState(VK_TAB) & 0x8000) != 0;
+        rt::g_rightController.primaryPressed = (trace.KeyState('R') & 0x8000) != 0;
+        rt::g_rightController.secondaryPressed = (trace.KeyState('T') & 0x8000) != 0;
+        rt::g_rightController.thumbstickPressed = (trace.KeyState(VK_RETURN) & 0x8000) != 0;
 
         // Left controller buttons (off-hand)
         // Left Ctrl = Trigger
@@ -4957,32 +4999,33 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         // G = Menu (left hand)
         // V = Primary (X)
         // B = Secondary (Y)
-        rt::g_leftController.triggerPressed = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) != 0;
+        rt::g_leftController.triggerPressed = (trace.KeyState(VK_LCONTROL) & 0x8000) != 0;
         rt::g_leftController.triggerValue = rt::g_leftController.triggerPressed ? 1.0f : 0.0f;
-        rt::g_leftController.gripPressed = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0;
+        rt::g_leftController.gripPressed = (trace.KeyState(VK_LMENU) & 0x8000) != 0;
         rt::g_leftController.gripValue = rt::g_leftController.gripPressed ? 1.0f : 0.0f;
-        rt::g_leftController.menuPressed = (GetAsyncKeyState('G') & 0x8000) != 0;
-        rt::g_leftController.primaryPressed = (GetAsyncKeyState('V') & 0x8000) != 0;
-        rt::g_leftController.secondaryPressed = (GetAsyncKeyState('B') & 0x8000) != 0;
+        rt::g_leftController.menuPressed = (trace.KeyState('G') & 0x8000) != 0;
+        rt::g_leftController.primaryPressed = (trace.KeyState('V') & 0x8000) != 0;
+        rt::g_leftController.secondaryPressed = (trace.KeyState('B') & 0x8000) != 0;
 
         // Right controller thumbstick (Arrow keys)
         rt::g_rightController.thumbstick = {0.0f, 0.0f};
-        if (GetAsyncKeyState(VK_UP) & 0x8000) rt::g_rightController.thumbstick.y = 1.0f;
-        if (GetAsyncKeyState(VK_DOWN) & 0x8000) rt::g_rightController.thumbstick.y = -1.0f;
-        if (GetAsyncKeyState(VK_LEFT) & 0x8000) rt::g_rightController.thumbstick.x = -1.0f;
-        if (GetAsyncKeyState(VK_RIGHT) & 0x8000) rt::g_rightController.thumbstick.x = 1.0f;
+        if (trace.KeyState(VK_UP) & 0x8000) rt::g_rightController.thumbstick.y = 1.0f;
+        if (trace.KeyState(VK_DOWN) & 0x8000) rt::g_rightController.thumbstick.y = -1.0f;
+        if (trace.KeyState(VK_LEFT) & 0x8000) rt::g_rightController.thumbstick.x = -1.0f;
+        if (trace.KeyState(VK_RIGHT) & 0x8000) rt::g_rightController.thumbstick.x = 1.0f;
 
         // Left controller thumbstick (IJKL keys)
         rt::g_leftController.thumbstick = {0.0f, 0.0f};
-        if (GetAsyncKeyState('I') & 0x8000) rt::g_leftController.thumbstick.y = 1.0f;
-        if (GetAsyncKeyState('K') & 0x8000) rt::g_leftController.thumbstick.y = -1.0f;
-        if (GetAsyncKeyState('J') & 0x8000) rt::g_leftController.thumbstick.x = -1.0f;
-        if (GetAsyncKeyState('L') & 0x8000) rt::g_leftController.thumbstick.x = 1.0f;
+        if (trace.KeyState('I') & 0x8000) rt::g_leftController.thumbstick.y = 1.0f;
+        if (trace.KeyState('K') & 0x8000) rt::g_leftController.thumbstick.y = -1.0f;
+        if (trace.KeyState('J') & 0x8000) rt::g_leftController.thumbstick.x = -1.0f;
+        if (trace.KeyState('L') & 0x8000) rt::g_leftController.thumbstick.x = 1.0f;
 
         // ========================================
         // Velocity Tracking for Motion Controls
         // ========================================
         // Calculate controller world positions
+        trace.Mark(8);
         XrPosef rightPose, leftPose;
         rt::GetControllerPose(rt::g_rightController, &rightPose);
         rt::GetControllerPose(rt::g_leftController, &leftPose);
@@ -4998,13 +5041,14 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         updateVelocity(rt::g_rightController, rightPose);
         updateVelocity(rt::g_leftController, leftPose);
     } else {
+        trace.Mark(6); trace.Mark(7); trace.Mark(8);
         rt::ResetControllerInputHistory();
     }
 
     // MCP commands work regardless of window focus (file-based IPC).
     // RefreshCommandsDue keeps this whole block off the frame path until the command
     // directory actually changes; see its comment for why that matters.
-    trace.Mark(5);
+    trace.Mark(9);
     mcp::RefreshCommandsDue();
     if (mcp::g_commandsDue) {
         mcp::HeadPoseCommand cmd = mcp::CheckHeadPoseCommand();
@@ -5135,18 +5179,18 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         }
     }
 
-    trace.Mark(6);
+    trace.Mark(10);
     PollUiPointerCommand();
     ApplyUiPointerButtons();
     controlLock.unlock();
-    trace.Mark(7);
+    trace.Mark(11);
 
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     // Exact integer conversion - the same math xrConvertWin32PerformanceCounterToTimeKHR
     // performs, so predicted display times and converted times agree for one instant.
     const XrTime nowTime = QpcToNs(now.QuadPart, freq.QuadPart);
     s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
-    trace.Mark(8); trace.Keep();
+    trace.Mark(12); trace.Keep();
     return XR_SUCCESS;
 }
 static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession session, const XrFrameBeginInfo* info) {

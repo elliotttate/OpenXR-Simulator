@@ -358,9 +358,17 @@ Other values leave it off; changing the environment after startup has no effect.
 For wait-path diagnosis, `SIMXR_WAIT_FRAME_TRACE=1` retains the latest 512 waits of
 at least 0.5 ms in memory. Normal teardown writes `wait_frame_trace.jsonl`, with
 QPC boundaries for lifecycle, preview creation, host messages, the control lock,
-input, command polling, pointer handling and prediction. The frame identifier is
+input focus, first keyboard query, head/controller motion, controller buttons, velocity updates, command
+polling, pointer handling and prediction (schema 6, including individual key-query durations without key states and totals
+across all observed waits). Bounded 256-frame bins also allow selecting whole bins
+inside a measured race interval, excluding startup/loading. The frame identifier is
 the previous submission count, not a new compositor frame ID. This trace is off
 by default and is for attribution; disable it for throughput comparisons.
+
+The manually run `key_query_probe` executable measures these key queries outside
+a game process. It prints durations only, with no input injection or pressed-key
+logging. Its unselected samples are not directly comparable with the slow-wait
+ring; compare equivalent sampling scopes before drawing performance conclusions.
 
 - Turn **Tools → Mirror Rate** down, or **Off**. Mirroring the eyes to the window is
   the only per-frame work the runtime does that scales with resolution.
