@@ -31,6 +31,22 @@ def check(root):
                         'passed': abs(observed-expected) < .025})
     print(json.dumps(reports, indent=2))
     assert all(r['passed'] for r in reports), 'Generated interface accent differs from the original game yellow'
+    # Directly authored native amber helpers must follow the same policy too;
+    # otherwise a correct atlas can conceal a different ray/button tint.
+    number = rb'(?:\d*\.\d+|\d+\.?)(?:f)?'
+    color = re.compile(rb'(?:Graphics::)?Color\(\s*('+number+rb')\s*,\s*('+number+rb')\s*,\s*('+number+rb')\s*(?:,\s*[^(),]+)?\)')
+    mismatches = []
+    for area in ('Menus', 'VR'):
+        for file in (root/'Flatout/Code/Sources'/area).rglob('*'):
+            if file.suffix not in ('.cpp', '.h', '.inl') or file.name.startswith('FORun'):
+                continue
+            for match in color.finditer(file.read_bytes()):
+                red, green, blue = (float(v.decode().rstrip('f')) for v in match.groups())
+                if red == 1 and .5 <= green <= .9 and 0 <= blue <= .15:
+                    hue = (green-blue)/(red-blue)
+                    if abs(hue-expected) > 2/255:
+                        mismatches.append({'source': str(file.relative_to(root)), 'color': match[0].decode(), 'hue': hue})
+    assert not mismatches, ('Native ray accents still use a different yellow', mismatches)
 
 
 if __name__ == '__main__':
