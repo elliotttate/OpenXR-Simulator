@@ -14,11 +14,17 @@ import statistics
 import struct
 import sys
 import time
+from types import SimpleNamespace
+
+import numpy as np
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from flatout_challenge_style_e2e import ChallengeStyle
 from flatout_ui_depth_contract import assert_hover_lift
+from flatout_frontend_e2e import Frontend
+from flatout_livery_e2e import ui_surface, quaternion_matrix
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
@@ -52,6 +58,33 @@ def summarize(capture):
     return result
 
 
+class ShowroomProfile(Frontend):
+    async def frame(self, label):
+        capture = await self.tool('capture_screenshot', {'eye':'both','max_width':2048}, label)
+        self.last_capture = capture
+        return SimpleNamespace(capture=capture)
+
+    async def park(self):
+        target = (await self.query('vr.targets'))['targets'][0]
+        l, top, r, b = target['rect']
+        for hand in ('left','right'):
+            _, aim = await self.point_args(target['name'], ((960-l)/(r-l),(30-top)/(b-top)),hand)
+            receipt = await self.tool('hover_ui_at',aim,'park-'+hand)
+            assert receipt['status']=='input_delivered'
+        await asyncio.sleep(.5)
+        assert not (await self.query('vr.targets'))['hovered']
+
+    async def depth(self, capture):
+        native = await self.query('vr.targets')
+        base = ui_surface({'vr':{'frame':native['vr_frame']}})
+        normal = quaternion_matrix(base['pose']['orientation'])[:,2]
+        tiles = [s for s in capture['geometry']['surfaces'] if s['visibility']==0]
+        lifts = [float(np.dot(np.array(s['pose']['position'])-base['pose']['position'],normal)) for s in tiles]
+        assert any(abs(lift-HOVER_LIFT_METERS)<.001 for lift in lifts), lifts
+        assert len(tiles)<=2, tiles
+        return {'lift_meters':lifts,'base':base,'tiles':tiles}
+
+
 async def run(a):
     a.evidence.mkdir(parents=True, exist_ok=False)
     a.hand = 'right'
@@ -66,9 +99,9 @@ async def run(a):
     async with stdio_client(server) as streams:
         async with ClientSession(*streams) as session:
             await session.initialize()
-            t = ChallengeStyle(a, session)
+            t = ShowroomProfile(a,session) if a.menu=='garage' else ChallengeStyle(a, session)
             t.frames = []
-            menus = {'options': 'OPTIONS', 'challenge': 'INSANITY', 'quick': 'QUICK EVENTS'}
+            menus = {'options': 'OPTIONS', 'challenge': 'INSANITY', 'quick': 'QUICK EVENTS', 'garage':'GARAGE'}
             assert (await t.query('menu.get_state'))['current_menu'] == menus[a.menu]
             await t.park()
             points = {}
@@ -77,6 +110,7 @@ async def run(a):
                 'options': ('settings.category.0', 'settings.category.2', 'helper.Cancel.OptionsDone'),
                 'challenge': ('challenge.event.0', 'challenge.event.1', 'helper.Validate.2'),
                 'quick': ('quick.mode.0', 'quick.mode.1', 'helper.Validate.QuickContinue'),
+                'garage': ('item.1', 'item.2', 'helper.Cancel.0'),
             }
             names = targets_by_menu[a.menu]
             for name in names:
@@ -122,7 +156,7 @@ async def run(a):
                         await t.hover(names[0])
                         await asyncio.sleep(1.2)
                         frame = await t.frame('depth-after-hover-stress')
-                        result['physical_depth_after_stress'] = assert_hover_lift(frame.capture)
+                        result['physical_depth_after_stress'] = await t.depth(frame.capture) if a.menu=='garage' else assert_hover_lift(frame.capture)
                     (a.evidence / 'summary.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
                 assert (await t.query('vr.targets'))['clicks'] == clicks
                 result['native_errors'] = await asyncio.to_thread(call, a.pid, 'game.errors')
@@ -142,5 +176,5 @@ if __name__ == '__main__':
     p.add_argument('--data-dir', type=Path, required=True)
     p.add_argument('--evidence', type=Path, required=True)
     p.add_argument('--real-xr', action='store_true')
-    p.add_argument('--menu', choices=('challenge', 'options', 'quick'), default='challenge')
+    p.add_argument('--menu', choices=('challenge', 'options', 'quick', 'garage'), default='challenge')
     asyncio.run(run(p.parse_args()))

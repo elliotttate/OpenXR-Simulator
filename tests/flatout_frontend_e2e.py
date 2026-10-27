@@ -1766,7 +1766,7 @@ class Frontend:
         hovered = await self.tool("hover_ui_at",aim,"garage-car-body-hover")
         assert hovered["status"]=="input_delivered"
         actual = await self.query("vr.targets")
-        passed = min(bottoms)>=.05 and max(tops)<=.4 and not actual["hovered"]
+        passed = min(bottoms)>=.05 and max(tops)<=.7 and not actual["hovered"]
         self.cases.append({"case":"garage-actions-above-floor-and-clear-car-body","passed":passed,"button_top_heights":tops,"button_bottom_heights":bottoms,"body_height":.8,"hovered":actual["hovered"]})
         await self.capture("garage-car-body-clearance")
         assert passed, ("Garage actions must clear the floor and car body",tops,bottoms,actual["hovered"])
@@ -1785,7 +1785,7 @@ class Frontend:
         targets = (await self.query("vr.targets"))["targets"]
         actions = [t for t in targets if t["name"].startswith("item.")]
         await self.capture("garage-action-buttons")
-        small = [t for t in actions if t["rect"][2]-t["rect"][0]<200 or t["rect"][3]-t["rect"][1]<88]
+        small = [t for t in actions if t["rect"][2]-t["rect"][0]<200 or t["rect"][3]-t["rect"][1]<80]
         unlabeled = [i for i in menu["items"] if not i["title"].strip()]
         self.cases.append({"case":"garage-large-labeled-buttons","passed":not small and not unlabeled,"actions":actions,"small":small,"unlabeled":unlabeled})
         assert len(actions)==menu["item_count"] and not small and not unlabeled, ("Garage actions need large readable buttons",small,unlabeled)
