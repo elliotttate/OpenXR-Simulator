@@ -133,6 +133,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include "enum_strings.h"
 #include "composition_validation.h"
 #include "composition_render.h"
+#include "controller_poses.h"
 #include "frame_state.h"
 #include "pose_math.h"
 #include "preview_focus.h"
@@ -877,6 +878,7 @@ struct ActionBinding {
     std::string collisionKey;
     int sourceMask{0};
     ActionInput input{ActionInput::Unknown};
+    bool gripPose{false}; // input/grip/pose rather than input/aim/pose
 };
 
 struct ActionSetRecord {
@@ -9303,13 +9305,33 @@ static bool GetSpaceWorldState(XrSpace space, SpaceWorldState& state) {
             sourceMask == interaction_query::kLeftHandSource
             ? rt::g_leftController : rt::g_rightController;
         if (!controller.isTracking) return true;
+        // The simulated hand drives the aim pose. A grip binding sits at the active
+        // profile's vendor offset from it, as on hardware.
+        bool gripPose = false;
+        for (const rt::ActionBinding& binding : action.bindings) {
+            if (binding.profile == rt::g_activeProfile &&
+                binding.input == rt::ActionInput::Pose &&
+                (binding.sourceMask & sourceMask)) {
+                gripPose = binding.gripPose;
+                break;
+            }
+        }
         XrPosef controllerWorld{};
         rt::GetControllerPose(controller, &controllerWorld);
-        const XrVector3f offsetWorld =
-            pose_math::Rotate(controllerWorld.orientation, actionSpace.poseInActionSpace.position);
+        XrPosef sourceWorld = controllerWorld;
+        auto profileIt = rt::g_pathStrings.find(rt::g_activeProfile);
+        if (gripPose && profileIt != rt::g_pathStrings.end()) {
+            sourceWorld = pose_math::Compose(controllerWorld, controller_poses::AimFromGrip(
+                profileIt->second, sourceMask == interaction_query::kLeftHandSource));
+        }
+        state.pose = pose_math::Compose(sourceWorld, actionSpace.poseInActionSpace);
+        const XrVector3f offsetWorld = {
+            state.pose.position.x - controllerWorld.position.x,
+            state.pose.position.y - controllerWorld.position.y,
+            state.pose.position.z - controllerWorld.position.z,
+        };
         const XrVector3f offsetVelocity =
             pose_math::Cross(controller.angularVelocity, offsetWorld);
-        state.pose = pose_math::Compose(controllerWorld, actionSpace.poseInActionSpace);
         state.tracked = true;
         state.velocityValid = true;
         state.linearVelocity = {
@@ -9946,9 +9968,12 @@ static XrResult XRAPI_PTR xrSuggestInteractionProfileBindings_runtime(XrInstance
         const int sourceMask = SourceMaskForBindingPath(pathIt->second);
         const rt::ActionInput inputKind = InputForBindingPath(actionIt->second.type, pathIt->second);
         if (sourceMask && inputKind != rt::ActionInput::Unknown) {
+            const bool gripPose = inputKind == rt::ActionInput::Pose &&
+                pathIt->second.find("/input/grip/pose") != std::string::npos;
             pending.push_back({suggested.action,
                                {bindings->interactionProfile, suggested.binding,
-                                input::BindingCollisionKey(pathIt->second), sourceMask, inputKind}});
+                                input::BindingCollisionKey(pathIt->second), sourceMask, inputKind,
+                                gripPose}});
         }
     }
 

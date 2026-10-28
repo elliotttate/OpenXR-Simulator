@@ -254,6 +254,14 @@ WASD/QE move the head at 3 m/s by default, and holding **Shift** multiplies that
 by 4. Both numbers are set from **Tools → Movement Speed**: presets from 0.5 to
 10 m/s, `,` and `.` to step off them, and a submenu for the Shift multiplier.
 
+### Controller Poses
+
+Each simulated hand drives the controller's aim pose (`.../input/aim/pose`). A grip
+pose (`.../input/grip/pose`) sits at the active profile's vendor offset from it, as on
+hardware: Touch grip is rotated 60 degrees from aim, Index grip 55.5 degrees. Other
+profiles report grip at the aim pose. Controller models an app draws on the grip pose
+therefore appear where a headset would put them.
+
 ### Input Polling
 
 Head and controller keys are read with `GetAsyncKeyState`, which ignores window

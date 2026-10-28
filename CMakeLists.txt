@@ -166,6 +166,10 @@ if(BUILD_TESTING)
     target_include_directories(pose_math_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME pose_math COMMAND pose_math_tests)
 
+    add_executable(controller_poses_tests tests/controller_poses_tests.cpp)
+    target_include_directories(controller_poses_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME controller_poses COMMAND controller_poses_tests)
+
     add_executable(swapchain_state_tests tests/swapchain_state_tests.cpp)
     target_include_directories(swapchain_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME swapchain_state COMMAND swapchain_state_tests)
