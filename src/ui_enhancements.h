@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <atomic>
 
 #include "json.h"
 #include "preview_title.h"
@@ -64,6 +65,7 @@ enum MenuCommand {
     ID_TOOLS_SCREENSHOT = 1401,
     ID_TOOLS_RESET_VIEW = 1402,
     ID_TOOLS_TOGGLE_STATS = 1403,
+    ID_TOOLS_GPU_TIMING = 1405,
 
     // Help
     ID_HELP_CONTROLS = 1501,
@@ -189,6 +191,25 @@ inline UIState g_uiState;
 // outside the loop (a menu toggle, say) can keep the FPS field rather than
 // blanking it until the next tick.
 inline int g_lastFps = 0;
+
+// Tools > GPU Timing: GPU timestamps around each frame on the app's queue, for the
+// frame timeline. Saved with the settings; the runtime reads it as each frame
+// begins. Outside UIState because only the runtime's frame calls use it.
+inline std::atomic<bool> g_gpuTiming{true};
+
+// OPENXR_SIM_GPU_TIMING=0/1 overrides the menu for scripted runs: -1 when unset.
+inline int GpuTimingForced() {
+    static const int forced = [] {
+        const char* value = getenv("OPENXR_SIM_GPU_TIMING");
+        return value && *value ? (atoi(value) != 0 ? 1 : 0) : -1;
+    }();
+    return forced;
+}
+
+inline bool GpuTimingOn() {
+    const int forced = GpuTimingForced();
+    return forced >= 0 ? forced != 0 : g_gpuTiming.load();
+}
 
 // Everything that varies per headset, in one table.
 //
@@ -627,6 +648,7 @@ inline std::string SerializeSettings() {
         "  \"window_height\": %d,\n"
         "  \"full_render\": %s,\n"
         "  \"show_stats\": %s,\n"
+        "  \"gpu_timing\": %s,\n"
         "  \"move_speed\": %.2f,\n"
         "  \"move_boost\": %.2f,\n"
         "  \"input_polling\": \"%s\",\n"
@@ -646,6 +668,7 @@ inline std::string SerializeSettings() {
         g_uiState.windowHeight,
         g_uiState.showFullRender ? "true" : "false",
         g_uiState.showStats ? "true" : "false",
+        g_gpuTiming.load() ? "true" : "false",
         g_uiState.moveSpeed,
         g_uiState.moveBoost,
         InputPollingName(g_uiState.inputPolling),
@@ -710,6 +733,7 @@ inline void ApplySettingsJson(const char* text) {
     g_uiState.windowHeight = (std::max)(0, o.number("window_height", g_uiState.windowHeight));
     g_uiState.showFullRender = o.boolean("full_render", g_uiState.showFullRender);
     g_uiState.showStats = o.boolean("show_stats", g_uiState.showStats);
+    g_gpuTiming = o.boolean("gpu_timing", g_gpuTiming.load());
 
     SetMoveSpeed(o.number("move_speed", g_uiState.moveSpeed));
     g_uiState.moveBoost = (std::max)(1.0f, (std::min)(50.0f,
@@ -989,6 +1013,8 @@ inline HMENU CreateAppMenu() {
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_RESET_VIEW, L"&Reset View\tHome");
     AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_TOGGLE_STATS, L"Show &Statistics\tF3");
+    AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_GPU_TIMING,
+                GpuTimingForced() >= 0 ? L"&GPU Timing (set by OPENXR_SIM_GPU_TIMING)" : L"&GPU Timing");
     AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
 
     HMENU renderResolutionMenu = CreatePopupMenu();
@@ -1069,6 +1095,8 @@ inline void UpdateMenuState(HMENU menu) {
     // Stats toggle
     CheckMenuItem(menu, ID_TOOLS_TOGGLE_STATS,
         g_uiState.showStats ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(menu, ID_TOOLS_GPU_TIMING, GpuTimingOn() ? MF_CHECKED : MF_UNCHECKED);
+    EnableMenuItem(menu, ID_TOOLS_GPU_TIMING, GpuTimingForced() >= 0 ? MF_GRAYED : MF_ENABLED);
 
     // FOV checks
     CheckMenuItem(menu, ID_FOV_SYMMETRIC, !g_uiState.useAsymmetricFov ? MF_CHECKED : MF_UNCHECKED);
@@ -1478,6 +1506,13 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
 
         case ID_TOOLS_TOGGLE_STATS: {
             g_uiState.showStats = !g_uiState.showStats;
+            SaveSettings();
+            HMENU menuT = GetMenu(hwnd);
+            if (menuT) UpdateMenuState(menuT);
+            return true;
+        }
+        case ID_TOOLS_GPU_TIMING: {
+            if (GpuTimingForced() < 0) g_gpuTiming = !g_gpuTiming;
             SaveSettings();
             HMENU menuT = GetMenu(hwnd);
             if (menuT) UpdateMenuState(menuT);

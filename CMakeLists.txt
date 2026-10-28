@@ -42,6 +42,7 @@ add_library(openxr_simulator SHARED
     src/json.h
     src/mcp_integration.h
     src/frame_timeline.h
+    src/gpu_frame_timer.h
     src/projection_timing.h
     src/preview_focus.h
     src/command_epochs.h
@@ -203,6 +204,17 @@ if(BUILD_TESTING)
     target_include_directories(frame_timeline_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME frame_timeline COMMAND frame_timeline_tests)
     set_tests_properties(frame_timeline PROPERTIES TIMEOUT 60)
+    add_executable(gpu_frame_timer_tests tests/gpu_frame_timer_tests.cpp)
+    target_include_directories(gpu_frame_timer_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(gpu_frame_timer_tests PRIVATE d3d12 d3d11 dxgi)
+    add_test(NAME gpu_frame_timer COMMAND gpu_frame_timer_tests)
+    set_tests_properties(gpu_frame_timer PROPERTIES TIMEOUT 60)
+    add_executable(ui_gpu_timing_tests tests/ui_gpu_timing_tests.cpp)
+    target_include_directories(ui_gpu_timing_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    if(MSVC)
+        target_compile_options(ui_gpu_timing_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME ui_gpu_timing COMMAND ${CMAKE_COMMAND} -E env --unset=OPENXR_SIM_GPU_TIMING $<TARGET_FILE:ui_gpu_timing_tests>)
 endif()
 
 # Link libraries

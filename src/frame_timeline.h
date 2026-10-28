@@ -10,6 +10,7 @@
 //   [0, kHeaderBytes)                              TimelineHeader
 //   [frameOffset,  + frameCapacity  * 192 bytes)   FrameRecord ring
 //   [markerOffset, + markerCapacity * 128 bytes)   MarkerRecord ring
+//   [gpuOffset,    + frameCapacity  * 64 bytes)    GpuRecord ring
 //
 // Reading either ring: load its count (acquire), copy records [from, count),
 // fence (acquire), load the count again. Record i survived the copy iff
@@ -34,7 +35,7 @@
 namespace perf::timeline {
 
 constexpr uint32_t kMagic = 0x54465258;  // "XRFT"
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kHeaderBytes = 4096;
 constexpr uint32_t kDefaultFrameCapacity = 65536;  // ~12 minutes at 90 Hz
 constexpr uint32_t kDefaultMarkerCapacity = 4096;
@@ -122,6 +123,41 @@ struct MarkerRecord {
 };
 static_assert(sizeof(MarkerRecord) == 128, "MarkerRecord is a shared-memory ABI");
 
+enum class GpuApi : uint32_t { None, D3D12, Vulkan, D3D11, OpenGL };
+
+inline const char* GpuApiName(uint32_t api) {
+    switch (GpuApi(api)) {
+        case GpuApi::D3D12: return "D3D12";
+        case GpuApi::Vulkan: return "Vulkan";
+        case GpuApi::D3D11: return "D3D11";
+        case GpuApi::OpenGL: return "OpenGL";
+        default: return "none";
+    }
+}
+
+// When the GPU worked on a frame, from timestamps the runtime puts on the
+// app's own queue: one in xrBeginFrame, one in xrEndFrame behind everything
+// the app submitted. Published a few frames late, once the GPU has finished;
+// joined to its FrameRecord by frameId. The reader takes the GPU frame time as
+// end minus the later of begin and the previous frame's end, so the GPU idling
+// between frames is not counted.
+struct GpuRecord {
+    uint64_t index;
+    uint64_t frameId;
+    uint64_t beginTicks;      // 0 when the frame had no xrBeginFrame marker
+    uint64_t endTicks;
+    uint64_t tickFrequency;   // GPU timestamp ticks per second
+    uint64_t beginQpc;        // the same moments on the CPU clock when the API could
+    uint64_t endQpc;          // calibrate the two (kGpuCalibrated), else 0
+    uint32_t api;             // GpuApi
+    uint32_t flags;           // GpuFlags
+};
+static_assert(sizeof(GpuRecord) == 64, "GpuRecord is a shared-memory ABI");
+
+enum GpuFlags : uint32_t {
+    kGpuCalibrated = 1u << 0,
+};
+
 struct TimelineHeader {
     uint32_t magic;
     uint32_t version;
@@ -151,6 +187,10 @@ struct TimelineHeader {
     std::atomic<uint32_t> sessionInfoSequence;
     uint32_t sessionInfoBytes;
     char sessionInfo[2048];
+    uint64_t gpuOffset;
+    uint32_t gpuRecordBytes;
+    uint32_t gpuCapacity;                        // frameCapacity
+    std::atomic<uint64_t> gpuCount;              // GpuRecords published
 };
 static_assert(sizeof(TimelineHeader) <= kHeaderBytes, "header must fit its page");
 
@@ -170,7 +210,7 @@ static_assert(std::atomic<uint64_t>::is_always_lock_free, "atomics in shared mem
 
 inline size_t TimelineBytes(uint32_t frameCapacity, uint32_t markerCapacity) {
     return kHeaderBytes + size_t(frameCapacity) * sizeof(FrameRecord) +
-           size_t(markerCapacity) * sizeof(MarkerRecord);
+           size_t(markerCapacity) * sizeof(MarkerRecord) + size_t(frameCapacity) * sizeof(GpuRecord);
 }
 
 struct ReadResult {
@@ -225,13 +265,16 @@ public:
         auto* header = static_cast<TimelineHeader*>(memory);
         const uint64_t frameOffset = kHeaderBytes;
         const uint64_t markerOffset = frameOffset + uint64_t(frameCapacity) * sizeof(FrameRecord);
+        const uint64_t gpuOffset = markerOffset + uint64_t(markerCapacity) * sizeof(MarkerRecord);
         const bool compatible =
             header->magic == kMagic && header->version == kVersion &&
             header->headerBytes == kHeaderBytes &&
             header->frameRecordBytes == sizeof(FrameRecord) &&
             header->markerRecordBytes == sizeof(MarkerRecord) &&
             header->frameCapacity == frameCapacity && header->markerCapacity == markerCapacity &&
-            header->frameOffset == frameOffset && header->markerOffset == markerOffset;
+            header->frameOffset == frameOffset && header->markerOffset == markerOffset &&
+            header->gpuOffset == gpuOffset && header->gpuRecordBytes == sizeof(GpuRecord) &&
+            header->gpuCapacity == frameCapacity;
         if (!compatible) {
             std::memset(memory, 0, kHeaderBytes);
             header = new (memory) TimelineHeader{};
@@ -242,6 +285,9 @@ public:
             header->markerCapacity = markerCapacity;
             header->frameOffset = frameOffset;
             header->markerOffset = markerOffset;
+            header->gpuOffset = gpuOffset;
+            header->gpuRecordBytes = sizeof(GpuRecord);
+            header->gpuCapacity = frameCapacity;
             header->createdQpc = nowQpc;
             header->version = kVersion;
         }
@@ -256,6 +302,7 @@ public:
         header->magic = kMagic;
         m_frames = reinterpret_cast<FrameRecord*>(static_cast<char*>(memory) + frameOffset);
         m_markers = reinterpret_cast<MarkerRecord*>(static_cast<char*>(memory) + markerOffset);
+        m_gpu = reinterpret_cast<GpuRecord*>(static_cast<char*>(memory) + gpuOffset);
         m_header = header;
         return true;
     }
@@ -263,6 +310,7 @@ public:
     TimelineHeader* Header() const { return m_header; }
     const FrameRecord* Frames() const { return m_frames; }
     const MarkerRecord* Markers() const { return m_markers; }
+    const GpuRecord* Gpu() const { return m_gpu; }
 
     // One writer at a time: the runtime publishes only from inside xrEndFrame,
     // whose reentrancy guard already serializes callers.
@@ -310,6 +358,20 @@ public:
     ReadResult ReadFrames(uint64_t from, std::vector<FrameRecord>& out) const {
         return ReadRing(m_header->frameCount, m_frames, m_header->frameCapacity, from, out);
     }
+    // Same single writer as PublishFrame: GPU results are collected in xrEndFrame.
+    void PublishGpu(const GpuRecord& record) {
+        const uint64_t index = m_header->gpuCount.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        GpuRecord stamped = record;
+        stamped.index = index;
+        std::memcpy(&m_gpu[index % m_header->gpuCapacity], &stamped, sizeof(GpuRecord));
+        m_header->gpuCount.store(index + 1, std::memory_order_release);
+    }
+
+    ReadResult ReadGpu(uint64_t from, std::vector<GpuRecord>& out) const {
+        return ReadRing(m_header->gpuCount, m_gpu, m_header->gpuCapacity, from, out);
+    }
+
     ReadResult ReadMarkers(uint64_t from, std::vector<MarkerRecord>& out) const {
         return ReadRing(m_header->markerCount, m_markers, m_header->markerCapacity, from, out);
     }
@@ -318,6 +380,7 @@ private:
     TimelineHeader* m_header = nullptr;
     FrameRecord* m_frames = nullptr;
     MarkerRecord* m_markers = nullptr;
+    GpuRecord* m_gpu = nullptr;
     std::mutex m_markerMutex;
 };
 
@@ -558,6 +621,10 @@ public:
         TimelineHeader& header = *m_timeline.Header();
         header.endActiveSinceQpc.store(0, std::memory_order_relaxed);
         if ((frame.frameId & 255) == 0) Calibrate(header, exitQpc);
+    }
+
+    void Gpu(const GpuRecord& record) {
+        if (Enabled()) m_timeline.PublishGpu(record);
     }
 
     void Marker(MarkerKind kind, int64_t a = 0, int64_t b = 0, const char* text = nullptr) {

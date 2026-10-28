@@ -25,6 +25,7 @@
 
 #include "flicker_detector.h"
 #include "frame_timeline.h"
+#include "gpu_frame_timer.h"
 namespace {
 // Per-frame timing feed for the frame-time viewer (shared memory, always on
 // unless OPENXR_SIM_FRAME_TIMELINE=0).
@@ -493,6 +494,19 @@ struct VulkanSession {
     uint64_t previewSignalled{0};   // last value the preview queue signalled, 0 = never
     uint64_t previewWaited{0};      // last previewSignalled the app's queue was made to wait on
     bool timeline{false};           // false: fall back to CPU waits around the composite
+    uint32_t queueFamilyIndex{0};
+    // GPU frame timing (vkrt::InitGpuTimer): one pre-recorded command buffer per query,
+    // each resetting and writing a timestamp on the app's queue.
+    VkQueryPool timingPool{VK_NULL_HANDLE};
+    VkCommandPool timingCmdPool{VK_NULL_HANDLE};
+    VkCommandBuffer timingBuffers[perf::gpu::kSlots * 2]{};
+    VkFence timingFences[perf::gpu::kSlots]{};  // signalled when a slot's end has run
+    perf::gpu::SlotRing timingSlots;
+    perf::gpu::Calibration timingCalibration;
+    uint64_t timingTickFrequency{0};
+    uint64_t timingMask{~0ull};
+    bool timingQpcDomain{false};    // the device can relate its clock to QPC
+    bool timing{false};
 };
 
 struct Session {
@@ -2054,6 +2068,19 @@ struct Dispatch {
     PFN_vkBeginCommandBuffer BeginCommandBuffer{nullptr};
     PFN_vkEndCommandBuffer EndCommandBuffer{nullptr};
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier{nullptr};
+    // GPU frame timing; optional, timing stays off without them.
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties{nullptr};
+    PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT GetPhysicalDeviceCalibrateableTimeDomains{nullptr};
+    PFN_vkCreateQueryPool CreateQueryPool{nullptr};
+    PFN_vkDestroyQueryPool DestroyQueryPool{nullptr};
+    PFN_vkCmdResetQueryPool CmdResetQueryPool{nullptr};
+    PFN_vkCmdWriteTimestamp CmdWriteTimestamp{nullptr};
+    PFN_vkGetQueryPoolResults GetQueryPoolResults{nullptr};
+    PFN_vkGetCalibratedTimestampsEXT GetCalibratedTimestamps{nullptr};
+    PFN_vkCreateFence CreateFence{nullptr};
+    PFN_vkDestroyFence DestroyFence{nullptr};
+    PFN_vkGetFenceStatus GetFenceStatus{nullptr};
+    PFN_vkResetFences ResetFences{nullptr};
 };
 
 static Dispatch g_d{};
@@ -2112,6 +2139,10 @@ static bool LoadInstanceLevel(VkInstance inst) {
     g_d.GetPhysicalDeviceProperties2 = InstFn<PFN_vkGetPhysicalDeviceProperties2>(
         inst, "vkGetPhysicalDeviceProperties2", "vkGetPhysicalDeviceProperties2KHR");
     g_d.GetPhysicalDeviceMemoryProperties = InstFn<PFN_vkGetPhysicalDeviceMemoryProperties>(inst, "vkGetPhysicalDeviceMemoryProperties");
+    g_d.GetPhysicalDeviceQueueFamilyProperties = InstFn<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+        inst, "vkGetPhysicalDeviceQueueFamilyProperties");
+    g_d.GetPhysicalDeviceCalibrateableTimeDomains = InstFn<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT>(
+        inst, "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR", "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
     return g_d.GetDeviceProcAddr && g_d.EnumeratePhysicalDevices && g_d.GetPhysicalDeviceProperties2;
 }
 
@@ -2138,6 +2169,18 @@ static bool LoadDeviceLevel(VkDevice dev) {
     g_d.BeginCommandBuffer = DevFn<PFN_vkBeginCommandBuffer>(dev, "vkBeginCommandBuffer");
     g_d.EndCommandBuffer = DevFn<PFN_vkEndCommandBuffer>(dev, "vkEndCommandBuffer");
     g_d.CmdPipelineBarrier = DevFn<PFN_vkCmdPipelineBarrier>(dev, "vkCmdPipelineBarrier");
+    g_d.CreateQueryPool = DevFn<PFN_vkCreateQueryPool>(dev, "vkCreateQueryPool");
+    g_d.DestroyQueryPool = DevFn<PFN_vkDestroyQueryPool>(dev, "vkDestroyQueryPool");
+    g_d.CmdResetQueryPool = DevFn<PFN_vkCmdResetQueryPool>(dev, "vkCmdResetQueryPool");
+    g_d.CmdWriteTimestamp = DevFn<PFN_vkCmdWriteTimestamp>(dev, "vkCmdWriteTimestamp");
+    g_d.GetQueryPoolResults = DevFn<PFN_vkGetQueryPoolResults>(dev, "vkGetQueryPoolResults");
+    // Only resolves when the device enabled calibrated timestamps.
+    g_d.GetCalibratedTimestamps = DevFn<PFN_vkGetCalibratedTimestampsEXT>(
+        dev, "vkGetCalibratedTimestampsKHR", "vkGetCalibratedTimestampsEXT");
+    g_d.CreateFence = DevFn<PFN_vkCreateFence>(dev, "vkCreateFence");
+    g_d.DestroyFence = DevFn<PFN_vkDestroyFence>(dev, "vkDestroyFence");
+    g_d.GetFenceStatus = DevFn<PFN_vkGetFenceStatus>(dev, "vkGetFenceStatus");
+    g_d.ResetFences = DevFn<PFN_vkResetFences>(dev, "vkResetFences");
 
     const void* required[] = {
         (const void*)g_d.GetDeviceQueue, (const void*)g_d.QueueSubmit, (const void*)g_d.CreateImage,
@@ -2390,10 +2433,155 @@ static void InitFrameSync(rt::Session& s) {
     Log("[SimXR][VK] frame sync: shared ID3D12Fence imported as a timeline VkSemaphore");
 }
 
+// --- GPU frame timing -----------------------------------------------------------------------
+// Timestamps on the app's queue around each frame (the scheme is in gpu_frame_timer.h).
+// Durations always; times on the CPU clock when the device enabled calibrated timestamps,
+// which xrCreateVulkanDeviceKHR asks for where it is available.
+static void ShutdownGpuTimer(rt::Session& s) {
+    for (VkFence& fence : s.vk.timingFences) {
+        if (fence && g_d.DestroyFence) g_d.DestroyFence(s.vk.device, fence, nullptr);
+        fence = VK_NULL_HANDLE;
+    }
+    if (s.vk.timingCmdPool && g_d.DestroyCommandPool) g_d.DestroyCommandPool(s.vk.device, s.vk.timingCmdPool, nullptr);
+    if (s.vk.timingPool && g_d.DestroyQueryPool) g_d.DestroyQueryPool(s.vk.device, s.vk.timingPool, nullptr);
+    s.vk.timingCmdPool = VK_NULL_HANDLE;
+    s.vk.timingPool = VK_NULL_HANDLE;
+    s.vk.timing = false;
+}
+
+static void CalibrateGpuTimer(rt::Session& s) {
+    if (!s.vk.timingQpcDomain || !g_d.GetCalibratedTimestamps) return;
+    VkCalibratedTimestampInfoEXT infos[2] = {
+        {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_DEVICE_EXT},
+        {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT},
+    };
+    uint64_t stamps[2] = {}, deviation = 0;
+    if (g_d.GetCalibratedTimestamps(s.vk.device, 2, infos, stamps, &deviation) != VK_SUCCESS) return;
+    s.vk.timingCalibration = perf::gpu::Calibration{true, stamps[0] & s.vk.timingMask, stamps[1],
+                                                    s.vk.timingTickFrequency, perf::gpu::QpcFrequency()};
+}
+
+static void InitGpuTimer(rt::Session& s) {
+    if (!g_d.CreateQueryPool || !g_d.DestroyQueryPool || !g_d.CmdResetQueryPool || !g_d.CmdWriteTimestamp ||
+        !g_d.GetQueryPoolResults || !g_d.GetPhysicalDeviceQueueFamilyProperties || !g_d.GetPhysicalDeviceProperties2 ||
+        !g_d.CreateFence || !g_d.DestroyFence || !g_d.GetFenceStatus || !g_d.ResetFences) {
+        Log("[SimXR][VK] GPU timing off: query entry points missing");
+        return;
+    }
+    uint32_t families = 0;
+    g_d.GetPhysicalDeviceQueueFamilyProperties(s.vk.physicalDevice, &families, nullptr);
+    std::vector<VkQueueFamilyProperties> props(families);
+    g_d.GetPhysicalDeviceQueueFamilyProperties(s.vk.physicalDevice, &families, props.data());
+    const uint32_t bits = s.vk.queueFamilyIndex < families ? props[s.vk.queueFamilyIndex].timestampValidBits : 0;
+    VkPhysicalDeviceProperties2 device{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    g_d.GetPhysicalDeviceProperties2(s.vk.physicalDevice, &device);
+    const double periodNs = device.properties.limits.timestampPeriod;
+    if (!bits || periodNs <= 0.0) {
+        Log("[SimXR][VK] GPU timing off: the app's queue family has no timestamps");
+        return;
+    }
+    s.vk.timingMask = bits >= 64 ? ~0ull : ((1ull << bits) - 1);
+    s.vk.timingTickFrequency = uint64_t(1.0e9 / periodNs + 0.5);
+
+    VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = perf::gpu::kSlots * 2;
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.queueFamilyIndex = s.vk.queueFamilyIndex;
+    VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbi.commandBufferCount = perf::gpu::kSlots * 2;
+    if (g_d.CreateQueryPool(s.vk.device, &qi, nullptr, &s.vk.timingPool) != VK_SUCCESS ||
+        g_d.CreateCommandPool(s.vk.device, &pci, nullptr, &s.vk.timingCmdPool) != VK_SUCCESS ||
+        (cbi.commandPool = s.vk.timingCmdPool, g_d.AllocateCommandBuffers(s.vk.device, &cbi, s.vk.timingBuffers)) != VK_SUCCESS) {
+        Log("[SimXR][VK] GPU timing off: could not create its queries");
+        ShutdownGpuTimer(s);
+        return;
+    }
+    for (VkFence& fence : s.vk.timingFences) {
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (g_d.CreateFence(s.vk.device, &fi, nullptr, &fence) != VK_SUCCESS) {
+            Log("[SimXR][VK] GPU timing off: could not create its fences");
+            ShutdownGpuTimer(s);
+            return;
+        }
+    }
+    for (uint32_t q = 0; q < perf::gpu::kSlots * 2; ++q) {
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+        g_d.BeginCommandBuffer(s.vk.timingBuffers[q], &begin);
+        g_d.CmdResetQueryPool(s.vk.timingBuffers[q], s.vk.timingPool, q, 1);
+        g_d.CmdWriteTimestamp(s.vk.timingBuffers[q], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s.vk.timingPool, q);
+        if (g_d.EndCommandBuffer(s.vk.timingBuffers[q]) != VK_SUCCESS) {
+            ShutdownGpuTimer(s);
+            return;
+        }
+    }
+    if (g_d.GetPhysicalDeviceCalibrateableTimeDomains && g_d.GetCalibratedTimestamps) {
+        uint32_t domains = 0;
+        g_d.GetPhysicalDeviceCalibrateableTimeDomains(s.vk.physicalDevice, &domains, nullptr);
+        std::vector<VkTimeDomainEXT> list(domains);
+        g_d.GetPhysicalDeviceCalibrateableTimeDomains(s.vk.physicalDevice, &domains, list.data());
+        const bool device = std::find(list.begin(), list.end(), VK_TIME_DOMAIN_DEVICE_EXT) != list.end();
+        const bool qpc = std::find(list.begin(), list.end(), VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT) != list.end();
+        s.vk.timingQpcDomain = device && qpc;
+    }
+    s.vk.timingSlots = perf::gpu::SlotRing{};
+    s.vk.timing = true;
+    CalibrateGpuTimer(s);
+    Logf("[SimXR][VK] GPU timing on: %u-bit timestamps every %.3f ns, %s", bits, periodNs,
+         s.vk.timingCalibration.valid ? "on the CPU clock" : "durations only (no calibrated timestamps)");
+}
+
+static void SubmitTimestamp(rt::Session& s, uint32_t query, VkFence fence = VK_NULL_HANDLE) {
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &s.vk.timingBuffers[query];
+    g_d.QueueSubmit(s.vk.queue, 1, &si, fence);
+}
+
+static void GpuBegin(rt::Session& s) {
+    if (!s.vk.timing) return;
+    const int slot = s.vk.timingSlots.OpenForBegin();
+    if (slot >= 0) SubmitTimestamp(s, uint32_t(slot) * 2);
+}
+
+static void GpuEnd(rt::Session& s, uint64_t frameId) {
+    if (!s.vk.timing) return;
+    const int slot = s.vk.timingSlots.OpenForEnd();
+    if (slot < 0) return;
+    SubmitTimestamp(s, uint32_t(slot) * 2 + 1, s.vk.timingFences[slot]);
+    s.vk.timingSlots.Close(slot, frameId);
+}
+
+static void GpuCollect(rt::Session& s, std::vector<perf::gpu::GpuRecord>& out) {
+    if (!s.vk.timing) return;
+    for (int slot = s.vk.timingSlots.Oldest(); slot >= 0; slot = s.vk.timingSlots.Oldest()) {
+        // Until its submit has run, a query still holds what it held 16 frames ago.
+        if (g_d.GetFenceStatus(s.vk.device, s.vk.timingFences[slot]) != VK_SUCCESS) break;
+        const bool begun = s.vk.timingSlots[slot].begun;
+        struct { uint64_t value, available; } q[2] = {};
+        const uint32_t first = uint32_t(slot) * 2 + (begun ? 0 : 1), count = begun ? 2 : 1;
+        g_d.GetQueryPoolResults(s.vk.device, s.vk.timingPool, first, count, sizeof(q), q, sizeof(q[0]),
+                                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        if (!q[count - 1].available || (begun && !q[0].available)) break;  // not there yet
+        const uint64_t begin = begun ? q[0].value & s.vk.timingMask : 0;
+        uint64_t end = q[count - 1].value & s.vk.timingMask;
+        // A counter narrower than 64 bits wraps (36 bits at 52 ns: hourly).
+        if (begun && end < begin && s.vk.timingMask != ~0ull) end += s.vk.timingMask + 1;
+        out.push_back(perf::gpu::MakeRecord(perf::timeline::GpuApi::Vulkan, s.vk.timingSlots[slot].frameId,
+                                            begin, end, s.vk.timingTickFrequency, s.vk.timingCalibration));
+        g_d.ResetFences(s.vk.device, 1, &s.vk.timingFences[slot]);
+        s.vk.timingSlots.Free(slot);
+    }
+    if (perf::timeline::Qpc() - s.vk.timingCalibration.cpuQpc > perf::gpu::QpcFrequency()) CalibrateGpuTimer(s);
+}
+
 static bool InitSession(rt::Session& s, const XrGraphicsBindingVulkanKHR& b) {
     s.vk = rt::VulkanSession{};
     s.vk.physicalDevice = b.physicalDevice;
     s.vk.device = b.device;
+    s.vk.queueFamilyIndex = b.queueFamilyIndex;
 
     if (!LoadInstanceLevel(b.instance)) { Log("[SimXR][VK] instance-level entry points missing"); return false; }
     if (!LoadDeviceLevel(b.device)) { Log("[SimXR][VK] device-level entry points missing (external memory not enabled?)"); return false; }
@@ -2425,6 +2613,7 @@ static bool InitSession(rt::Session& s, const XrGraphicsBindingVulkanKHR& b) {
 static void ShutdownSession(rt::Session& s) {
     if (s.vk.device) {
         if (g_d.DeviceWaitIdle) g_d.DeviceWaitIdle(s.vk.device);
+        ShutdownGpuTimer(s);
         if (s.vk.semaphore && g_d.DestroySemaphore) g_d.DestroySemaphore(s.vk.device, s.vk.semaphore, nullptr);
         if (s.vk.cmdPool && g_d.DestroyCommandPool) g_d.DestroyCommandPool(s.vk.device, s.vk.cmdPool, nullptr);
     }
@@ -2700,6 +2889,107 @@ static void FrameSyncEnd(rt::Session& s) {
 }
 
 } // namespace vkrt
+
+// GPU frame timing for whichever API the session uses. Vulkan's timer lives in vkrt
+// (it needs the loaded entry points); OpenGL's starts once the app's context is current
+// in a frame call, since GL entry points only resolve with a context.
+static perf::gpu::D3D12Timer g_gpuD3D12;
+static perf::gpu::D3D11Timer g_gpuD3D11;
+static perf::gpu::GlTimer g_gpuGl;
+static bool g_gpuTimerStarted = false;  // this session's timer is set up, or failed to be
+static bool g_gpuGlTried = false;       // OpenGL's starts inside a frame call, once
+static bool g_gpuTimingFrame = false;   // the frame in flight is timed
+// D3D11's immediate context is not thread-safe. xrEndFrame already uses it, so
+// xrBeginFrame stamps only from the thread that calls xrEndFrame.
+static std::atomic<DWORD> g_d3d11FrameThread{0};
+
+// Tools > GPU Timing, unless OPENXR_SIM_GPU_TIMING overrides it. Asked as each frame
+// begins, so it switches live. The timestamps need the frame timeline to land in.
+static bool GpuTimingWanted() { return ui::GpuTimingOn() && g_frameTimeline.Enabled(); }
+
+static bool GlContextCurrent(const rt::Session& s) {
+    return s.usesOpenGL && s.glRC && wglGetCurrentContext() == s.glRC;
+}
+
+static void GpuTimingStart(rt::Session& s) {
+    g_gpuTimerStarted = true;
+    if (s.usesVulkan) {
+        vkrt::InitGpuTimer(s);
+    } else if (s.usesOpenGL) {
+        return;  // GpuTimingBegin starts it inside a frame call
+    } else if (s.usesD3D12 && s.d3d12Device && s.d3d12Queue) {
+        Logf("[SimXR] GPU timing %s (D3D12)", g_gpuD3D12.Init(s.d3d12Device.Get(), s.d3d12Queue.Get()) ? "on" : "unavailable");
+    } else if (s.d3d11Device && s.d3d11Context) {
+        Logf("[SimXR] GPU timing %s (D3D11, durations only)",
+             g_gpuD3D11.Init(s.d3d11Device.Get(), s.d3d11Context.Get()) ? "on" : "unavailable");
+    }
+}
+
+static void GpuTimingStop() {
+    g_gpuD3D12.Shutdown();
+    g_gpuD3D11 = perf::gpu::D3D11Timer{};
+    g_gpuGl = perf::gpu::GlTimer{};  // its queries die with the app's context
+    g_gpuTimerStarted = false;
+    g_gpuGlTried = false;
+    g_gpuTimingFrame = false;
+    g_d3d11FrameThread = 0;
+}
+
+// Each session starts from no timer: the last one may have held another API's queue.
+static void GpuTimingNewSession(rt::Session& s) {
+    GpuTimingStop();
+    if (GpuTimingWanted()) GpuTimingStart(s);
+}
+
+// Switched off, frames just go unstamped: the timer stays until the session ends, so
+// results in flight still land and switching back on costs nothing.
+static void GpuTimingBegin() {
+    rt::Session& s = rt::g_session;
+    g_gpuTimingFrame = GpuTimingWanted();
+    if (!g_gpuTimingFrame) return;
+    if (!g_gpuTimerStarted) GpuTimingStart(s);
+    if (s.usesVulkan) {
+        vkrt::GpuBegin(s);
+    } else if (s.usesOpenGL) {
+        if (!GlContextCurrent(s)) return;
+        if (!g_gpuGl.Active() && !g_gpuGlTried) {
+            g_gpuGlTried = true;
+            Log(g_gpuGl.Init() ? "[SimXR] GPU timing on (OpenGL)" : "[SimXR] GPU timing unavailable (OpenGL)");
+        }
+        if (g_gpuGl.Active()) g_gpuGl.Begin();
+    } else if (s.usesD3D12) {
+        if (g_gpuD3D12.Active()) g_gpuD3D12.Begin();
+    } else if (g_gpuD3D11.Active() && GetCurrentThreadId() == g_d3d11FrameThread.load()) {
+        g_gpuD3D11.Begin();
+    }
+}
+
+// First thing in xrEndFrame: behind the app's frame, ahead of the simulator's own GPU work.
+static void GpuTimingEnd(uint64_t frameId) {
+    if (!g_gpuTimingFrame) return;
+    rt::Session& s = rt::g_session;
+    if (s.usesVulkan) {
+        vkrt::GpuEnd(s, frameId);
+    } else if (s.usesOpenGL) {
+        if (g_gpuGl.Active() && GlContextCurrent(s)) g_gpuGl.End(frameId);
+    } else if (s.usesD3D12) {
+        if (g_gpuD3D12.Active()) g_gpuD3D12.End(frameId);
+    } else if (g_gpuD3D11.Active()) {
+        g_d3d11FrameThread = GetCurrentThreadId();
+        g_gpuD3D11.End(frameId);
+    }
+}
+
+static void GpuTimingCollect() {
+    static std::vector<perf::gpu::GpuRecord> results;
+    results.clear();
+    rt::Session& s = rt::g_session;
+    if (s.usesVulkan) vkrt::GpuCollect(s, results);
+    else if (s.usesOpenGL) { if (g_gpuGl.Active() && GlContextCurrent(s)) g_gpuGl.Collect(results); }
+    else if (s.usesD3D12) { if (g_gpuD3D12.Active()) g_gpuD3D12.Collect(results); }
+    else if (g_gpuD3D11.Active()) g_gpuD3D11.Collect(results);
+    for (const perf::gpu::GpuRecord& r : results) g_frameTimeline.Gpu(r);
+}
 
 // ----------------- OpenXR runtime exports -----------------
 
@@ -3063,6 +3353,14 @@ static XrResult XRAPI_PTR xrCreateVulkanDeviceKHR_runtime(
         createInfo->vulkanCreateInfo->ppEnabledExtensionNames,
         createInfo->vulkanCreateInfo->enabledExtensionCount, available, storage);
 
+    // Optional: puts the app's GPU timestamps on the CPU clock for frame timing.
+    for (const char* optional : {"VK_KHR_calibrated_timestamps", "VK_EXT_calibrated_timestamps"}) {
+        const bool offered = std::find(available.begin(), available.end(), optional) != available.end();
+        const bool enabled = std::any_of(names.begin(), names.end(), [&](const char* n) {
+            return strcmp(n, "VK_KHR_calibrated_timestamps") == 0 || strcmp(n, "VK_EXT_calibrated_timestamps") == 0;
+        });
+        if (offered && !enabled) names.push_back(optional);
+    }
     VkDeviceCreateInfo dci = *createInfo->vulkanCreateInfo;
     dci.enabledExtensionCount = (uint32_t)names.size();
     dci.ppEnabledExtensionNames = names.data();
@@ -3556,6 +3854,7 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             rt::ResetD3D12PreviewResources(rt::g_session);
             rt::g_session.state = XR_SESSION_STATE_IDLE;
             b->device->GetImmediateContext(rt::g_session.d3d11Context.GetAddressOf());
+            GpuTimingNewSession(rt::g_session);
             // Window will be created lazily on first frame
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (D3D11, handle=%llu)", (unsigned long long)rt::g_session.handle);
@@ -3586,6 +3885,7 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             rt::g_session.usesD3D12 = true;
             rt::g_session.d3d12Device = b12->device;
             rt::g_session.d3d12Queue = b12->queue;
+            GpuTimingNewSession(rt::g_session);
             rt::g_session.d3d11Device.Reset();
             rt::g_session.d3d11Context.Reset();
             rt::g_session.previewSwapchain.Reset();
@@ -3624,6 +3924,7 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             // app is handed and how the two queues are ordered.
             rt::g_session.usesVulkan = true;
             rt::g_session.usesD3D12 = true;
+            GpuTimingNewSession(rt::g_session);
             rt::g_session.handle = newHandle;
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (Vulkan, handle=%llu)", (unsigned long long)rt::g_session.handle);
@@ -3728,6 +4029,7 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     }
     rt::g_swapchains.clear();
 
+    GpuTimingStop();
     // Reset session but don't destroy the window
     rt::g_session.handle = XR_NULL_HANDLE;
     rt::g_session.state = XR_SESSION_STATE_IDLE;
@@ -5286,6 +5588,7 @@ static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession session, const XrFrameB
     }
     if (XR_SUCCEEDED(result)) {
         g_frameTimeline.Begin();
+        GpuTimingBegin();
         rt::g_session.frameCondition.notify_all();
     }
     return result;
@@ -8512,6 +8815,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     static int frameCount = 0;
     frameCount++;
     mcp::g_runtimeFrameCount.store((uint64_t)frameCount, std::memory_order_release);
+    // Behind the app's frame on its queue, ahead of the simulator's own GPU work.
+    if (g_frameTimeline.Enabled()) GpuTimingEnd((uint64_t)frameCount);
 
     // Log every frame for first 10 frames, then every 60 frames
     bool shouldLog = g_logVerbose && ((frameCount <= 10) || (frameCount % 60 == 1));
@@ -8865,6 +9170,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         if (burstThisFrame) flags |= tl::kFrameBurst;
         if (rt::g_session.state == XR_SESSION_STATE_FOCUSED) flags |= tl::kFrameSessionFocused;
         timelineFrame.flags = flags;
+        GpuTimingCollect();
         // A fresh stamp rather than endFrameFinish, so the avg300 log line's cost is counted too.
         g_frameTimeline.EndExit(timelineFrame, info->displayTime, tl::Qpc());
     }
