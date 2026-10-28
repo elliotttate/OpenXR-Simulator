@@ -14,6 +14,11 @@ param(
     [Parameter(Mandatory)]
     [string]$X86Binary,
 
+    # The x64 frame-time viewer. One serves both runtimes: it is a process of
+    # its own and reads 32-bit apps' timelines too.
+    [Parameter(Mandatory)]
+    [string]$ViewerBinary,
+
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist')
 )
 
@@ -21,6 +26,7 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $x64 = (Resolve-Path -LiteralPath $X64Binary).Path
 $x86 = (Resolve-Path -LiteralPath $X86Binary).Path
+$viewer = (Resolve-Path -LiteralPath $ViewerBinary).Path
 
 function Get-PeMachine {
     param([string]$Path)
@@ -56,6 +62,10 @@ if ($x64Machine -ne 0x8664) {
 if ($x86Machine -ne 0x014c) {
     throw "$x86 is not an x86 binary (PE machine 0x$($x86Machine.ToString('x4')))"
 }
+$viewerMachine = Get-PeMachine $viewer
+if ($viewerMachine -ne 0x8664) {
+    throw "$viewer is not an x64 binary (PE machine 0x$($viewerMachine.ToString('x4')))"
+}
 
 New-Item -ItemType Directory -Force $OutputDirectory | Out-Null
 $output = (Resolve-Path -LiteralPath $OutputDirectory).Path
@@ -74,6 +84,8 @@ foreach ($path in @($packageDir, $zip, $checksum, $verificationDir)) {
 New-Item -ItemType Directory $packageDir | Out-Null
 Copy-Item -LiteralPath $x64 -Destination (Join-Path $packageDir 'openxr_simulator.dll')
 Copy-Item -LiteralPath $x86 -Destination (Join-Path $packageDir 'openxr_simulator-32.dll')
+# Tools > Frame Timing (F4) starts it from beside the runtime DLL.
+Copy-Item -LiteralPath $viewer -Destination (Join-Path $packageDir 'openxr_sim_frametime.exe')
 
 $commonFiles = @(
     'activate_simulator.ps1',
@@ -89,7 +101,7 @@ foreach ($file in $commonFiles) {
 
 $mcpDir = Join-Path $packageDir 'mcp-server'
 New-Item -ItemType Directory $mcpDir | Out-Null
-foreach ($file in @('openxr_simulator_mcp.py', 'ui_targeting.py', 'ui_comfort.py', 'atomic_json_file.py', 'ui_comfort.md', 'pyproject.toml', 'requirements.txt', 'README.md')) {
+foreach ($file in @('openxr_simulator_mcp.py', 'ui_targeting.py', 'ui_comfort.py', 'atomic_json_file.py', 'frame_timing.py', 'ui_comfort.md', 'pyproject.toml', 'requirements.txt', 'README.md')) {
     Copy-Item -LiteralPath (Join-Path $root "mcp-server\$file") -Destination $mcpDir
 }
 
@@ -136,12 +148,14 @@ try {
         'openxr_simulator.json',
         'openxr_simulator-32.dll',
         'openxr_simulator-32.json',
+        'openxr_sim_frametime.exe',
         'Activate Simulator.cmd',
         'Deactivate Simulator.cmd',
         'mcp-server\openxr_simulator_mcp.py',
         'mcp-server\ui_targeting.py',
         'mcp-server\ui_comfort.py',
         'mcp-server\atomic_json_file.py',
+        'mcp-server\frame_timing.py',
         'mcp-server\requirements.txt'
     )
     foreach ($file in $required) {

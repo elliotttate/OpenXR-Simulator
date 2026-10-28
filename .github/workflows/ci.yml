@@ -79,12 +79,16 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force 'staged-binary' | Out-Null
           Copy-Item 'bin/openxr_simulator.dll' 'staged-binary/${{ matrix.binary_name }}'
+          # One x64 frame-time viewer serves both runtimes.
+          if ('${{ matrix.arch }}' -eq 'x64') {
+              Copy-Item 'bin/openxr_sim_frametime.exe' 'staged-binary/openxr_sim_frametime.exe'
+          }
 
       - name: Upload runtime DLL
         uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.arch }}
-          path: staged-binary/${{ matrix.binary_name }}
+          path: staged-binary/
           if-no-files-found: error
           retention-days: 1
 
@@ -116,6 +120,7 @@ jobs:
               Version = $version
               X64Binary = 'built-binaries/openxr_simulator.dll'
               X86Binary = 'built-binaries/openxr_simulator-32.dll'
+              ViewerBinary = 'built-binaries/openxr_sim_frametime.exe'
               OutputDirectory = 'dist'
           }
           & ./scripts/package-release.ps1 @packageArgs
