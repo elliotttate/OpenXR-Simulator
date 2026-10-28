@@ -1,4 +1,5 @@
 #include "flicker_detector.h"
+#include "json.h"
 
 #include <windows.h>
 
@@ -7,6 +8,8 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cwctype>
+#include <string_view>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -15,11 +18,13 @@
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <map>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+#include <share.h>
 
 namespace flicker {
 namespace {
@@ -262,20 +267,20 @@ std::string JsonEscape(const std::string& value) {
     return out;
 }
 
-void AtomicWrite(const std::filesystem::path& path, const std::string& contents) {
+bool AtomicWrite(const std::filesystem::path& path, const std::string& contents) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     const std::filesystem::path temporary =
         path.wstring() + L".tmp." + std::to_wstring(GetCurrentProcessId());
     {
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        if (!file) return;
+        if (!file) return false;
         file.write(contents.data(), (std::streamsize)contents.size());
         file.flush();
     }
     // Rename atomically without forcing a physical disk flush. Readers never
     // observe a partial JSON file.
-    MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    return MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
 }
 
 uint8_t Luma(const uint8_t* bgra) {
@@ -511,11 +516,22 @@ struct PendingSample {
     bool completesIncident = false;
 };
 
+struct PendingLog {
+    std::string message;
+    bool debuggerSent=false;
+};
+
 struct IoWorker {
     std::mutex mutex;
     std::condition_variable wake;
     std::vector<PendingFile> files;
     std::deque<PendingSample> samples;
+    std::string runtimeStatus;
+    std::deque<PendingLog> logs;
+    size_t logBytes=0;
+    uint64_t droppedLogs=0;
+    bool scanCommands = false;
+    std::map<std::string, std::string> commands;
 };
 
 IoWorker& GetWorker() {
@@ -523,11 +539,43 @@ IoWorker& GetWorker() {
     return *worker;
 }
 
+void BoundRuntimeLogs(IoWorker& worker) {
+    while (worker.logs.size()>512 || worker.logBytes>1024*1024) {
+        worker.logBytes-=worker.logs.front().message.size();
+        worker.logs.pop_front();++worker.droppedLogs;
+    }
+}
+
+bool WriteRuntimeLogs(std::deque<PendingLog>& logs,uint64_t dropped) {
+    static FILE* file=nullptr;
+    if (!file) {
+        CreateDirectoryW(DataRoot().c_str(),nullptr);
+        const auto path=DataRoot()/(L"openxr_simulator."+std::to_wstring(GetCurrentProcessId())+L".log");
+        file=_wfsopen(path.c_str(),L"a",_SH_DENYNO);
+        if (file) setvbuf(file,nullptr,_IOFBF,64*1024);
+    }
+    for (PendingLog& entry:logs) {
+        if (!entry.debuggerSent) {
+            OutputDebugStringA(entry.message.c_str());entry.debuggerSent=true;
+        }
+        if (file) {
+            fputs(entry.message.c_str(),file);
+            if (entry.message.empty() || entry.message.back()!='\n') fputc('\n',file);
+        }
+    }
+    if (!file) return false;
+    if (dropped) fprintf(file,"[SimXR] Diagnostic backlog dropped %llu old log lines\n",(unsigned long long)dropped);
+    fflush(file);
+    return true;
+}
+
 void QueueFile(std::filesystem::path path, std::string contents) {
     IoWorker& worker = GetWorker();
     {
         std::lock_guard<std::mutex> guard(worker.mutex);
-        worker.files.push_back(PendingFile{ std::move(path), std::move(contents) });
+        auto prior=std::find_if(worker.files.begin(),worker.files.end(),[&](const PendingFile& file){return file.path==path;});
+        if (prior!=worker.files.end()) prior->contents=std::move(contents);
+        else worker.files.push_back(PendingFile{ std::move(path), std::move(contents) });
     }
     worker.wake.notify_one();
 }
@@ -826,19 +874,160 @@ void PollManualRequests() {
     }
 }
 
+// Directory notifications and re-arming stay off every XR/render/preview thread.
+bool IsCommandFileName(const wchar_t* name, size_t chars) {
+    wchar_t lowered[96];
+    if (chars == 0 || chars >= sizeof(lowered) / sizeof(lowered[0])) return false;
+    for (size_t i = 0; i < chars; ++i) {
+        lowered[i] = (wchar_t)towlower(name[i]);
+    }
+    lowered[chars] = 0;
+    const std::wstring_view view(lowered, chars);
+    constexpr std::wstring_view commandSuffix = L"_command.json";
+    if (view.size() >= commandSuffix.size() &&
+        view.compare(view.size() - commandSuffix.size(), commandSuffix.size(), commandSuffix) == 0) {
+        return true;
+    }
+    return view.find(L"_request") != std::wstring_view::npos;
+}
+
+bool PollRuntimeCommandDirectory() {
+    bool due = false;
+    static HANDLE directory = INVALID_HANDLE_VALUE;
+    static HANDLE event = nullptr;
+    static OVERLAPPED overlapped = {};
+    alignas(DWORD) static char buffer[4096];
+    static bool pending = false;
+    static ULONGLONG lastPoll = 0;
+    static bool init = false;
+
+    const auto rearm = []() {
+        ResetEvent(event);
+        pending = ReadDirectoryChangesW(directory, buffer, sizeof(buffer), FALSE,
+                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
+                                        nullptr, &overlapped, nullptr) != 0;
+    };
+
+    if (!init) {
+        init = true;
+        CreateDirectoryW(DataRoot().c_str(), nullptr);
+        directory = CreateFileW(DataRoot().c_str(), FILE_LIST_DIRECTORY,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                                nullptr);
+        event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        overlapped.hEvent = event;
+        if (directory != INVALID_HANDLE_VALUE && event) rearm();
+    }
+
+    if (pending && WaitForSingleObject(event, 0) == WAIT_OBJECT_0) {
+        DWORD bytes = 0;
+        bool commandTouched = false;
+        if (GetOverlappedResult(directory, &overlapped, &bytes, FALSE) && bytes > 0) {
+            const char* record = buffer;
+            for (;;) {
+                const FILE_NOTIFY_INFORMATION* info =
+                    reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(record);
+                if (IsCommandFileName(info->FileName, info->FileNameLength / sizeof(wchar_t))) {
+                    commandTouched = true;
+                    break;
+                }
+                if (!info->NextEntryOffset) break;
+                record += info->NextEntryOffset;
+            }
+        } else {
+            // Zero bytes means the buffer overflowed: too many changes to name
+            // them, so assume a command may be among them.
+            commandTouched = true;
+        }
+        rearm();
+        if (commandTouched) {
+            due = true;
+        }
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastPoll >= 500) {
+        lastPoll = now;
+        due = true;
+    }
+    return due;
+}
+
 void WorkerMain() {
     IoWorker& worker = GetWorker();
     bool pruned = false;
     for (;;) {
         std::vector<PendingFile> files;
         std::deque<PendingSample> samples;
+        std::string runtimeStatus;
+        std::deque<PendingLog> logs;
+        uint64_t droppedLogs=0;
+        bool scanCommands = false;
         {
             std::unique_lock<std::mutex> lock(worker.mutex);
-            worker.wake.wait_for(lock, std::chrono::milliseconds(250));
+            worker.wake.wait_for(lock, std::chrono::milliseconds(20));
             files.swap(worker.files);
             samples.swap(worker.samples);
+            runtimeStatus.swap(worker.runtimeStatus);
+            logs.swap(worker.logs);worker.logBytes=0;
+            droppedLogs=worker.droppedLogs;worker.droppedLogs=0;
+            scanCommands = worker.scanCommands;
+            worker.scanCommands = false;
         }
-        for (PendingFile& file : files) AtomicWrite(file.path, file.contents);
+        if ((!logs.empty() || droppedLogs) && !WriteRuntimeLogs(logs,droppedLogs)) {
+            std::lock_guard<std::mutex> guard(worker.mutex);
+            // Keep FIFO order after a temporary exclusive reader denies open.
+            for (auto entry=logs.rbegin();entry!=logs.rend();++entry) {
+                worker.logBytes+=entry->message.size();worker.logs.push_front(std::move(*entry));
+            }
+            worker.droppedLogs+=droppedLogs;BoundRuntimeLogs(worker);
+        }
+        if (!runtimeStatus.empty() && !AtomicWrite(DataRoot() / L"runtime_status.json", runtimeStatus)) {
+            // A reader can briefly deny rename. Retry without losing the last
+            // snapshot, while always giving a newer published snapshot priority.
+            std::lock_guard<std::mutex> guard(worker.mutex);
+            if (worker.runtimeStatus.empty()) worker.runtimeStatus = std::move(runtimeStatus);
+        }
+        if (PollRuntimeCommandDirectory() || scanCommands) {
+            static const char* names[] = {"ui_pointer_command.json", "screenshot_request.json",
+                "session_focus_command.json", "head_pose_command.json", "fov_command.json",
+                "ipd_command.json", "headset_profile_command.json", "pose_sweep_command.json",
+                "anaglyph_command.json", "burst_command.json", "controller_pose_command.json",
+                "projection_log_dump_request"};
+            for (const char* name : names) {
+                {
+                    std::lock_guard<std::mutex> guard(worker.mutex);
+                    if (worker.commands.count(name)) continue;
+                }
+                const auto path = DataRoot() / name;
+                if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+                std::ifstream file(path, std::ios::binary);
+                if (!file) continue;
+                char data[4096];
+                file.read(data, sizeof(data)-1);
+                const std::string contents(data, (size_t)file.gcount());
+                file.close();
+                if (!DeleteFileW(path.c_str())) continue;
+                if (std::strcmp(name,"ui_pointer_command.json")==0) {
+                    // Cross-client replay discovery belongs here, not on the
+                    // action thread. The runtime also guards completed commands
+                    // in memory while their atomic receipt is still queued.
+                    json::Object command(contents.c_str());
+                    const std::string id=command.string("command_id");
+                    const bool valid=!id.empty() && id.size()<=64 && std::all_of(id.begin(),id.end(),[](unsigned char c){
+                        return (c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9');});
+                    if (valid && GetFileAttributesW((DataRoot()/(L"ui_pointer_result."+std::wstring(id.begin(),id.end())+L".json")).c_str())!=INVALID_FILE_ATTRIBUTES)
+                        continue;
+                }
+                std::lock_guard<std::mutex> guard(worker.mutex);
+                worker.commands.emplace(name, contents);
+            }
+        }
+        for (PendingFile& file : files) if (!AtomicWrite(file.path,file.contents)) {
+            std::lock_guard<std::mutex> guard(worker.mutex);
+            const bool newer=std::any_of(worker.files.begin(),worker.files.end(),[&](const PendingFile& pending){return pending.path==file.path;});
+            if (!newer) worker.files.push_back(std::move(file));
+        }
         for (PendingSample& pending : samples) {
             SaveSample(pending.directory, pending.sample);
             if (pending.completesIncident) {
@@ -876,6 +1065,63 @@ void EnsureWorker() {
 }
 
 } // namespace
+
+void PublishRuntimeStatus(std::string snapshot) {
+    EnsureWorker();
+    IoWorker& worker = GetWorker();
+    {
+        std::lock_guard<std::mutex> guard(worker.mutex);
+        worker.runtimeStatus = std::move(snapshot);
+    }
+    worker.wake.notify_one();
+}
+
+void PublishRuntimeLog(std::string message) {
+    EnsureWorker();
+    // Bound individual records as well as the total queue under a stuck sink.
+    if (message.size()>8192) message=message.substr(0,8170)+" [log truncated]";
+    IoWorker& worker=GetWorker();
+    {
+        std::lock_guard<std::mutex> guard(worker.mutex);
+        worker.logBytes+=message.size();worker.logs.push_back({std::move(message),false});
+        BoundRuntimeLogs(worker);
+    }
+    worker.wake.notify_one();
+}
+
+void PublishRuntimeResult(std::string filename,std::string contents) {
+    if (filename.rfind("ui_pointer_result.",0)!=0 || filename.size()<24 ||
+        filename.find_first_of("/\\:")!=std::string::npos ||
+        filename.compare(filename.size()-5,5,".json")!=0) return;
+    EnsureWorker();
+    QueueFile(DataRoot()/filename,std::move(contents));
+}
+
+void RequestRuntimeCommands() {
+    EnsureWorker();
+    IoWorker& worker = GetWorker();
+    {
+        std::lock_guard<std::mutex> guard(worker.mutex);
+        worker.scanCommands = true;
+    }
+    worker.wake.notify_one();
+}
+
+bool TakeRuntimeCommand(const std::string& name, std::string& contents) {
+    IoWorker& worker = GetWorker();
+    std::lock_guard<std::mutex> guard(worker.mutex);
+    auto it = worker.commands.find(name);
+    if (it == worker.commands.end()) return false;
+    contents = std::move(it->second);
+    worker.commands.erase(it);
+    return true;
+}
+
+bool RuntimeCommandsReady() {
+    IoWorker& worker = GetWorker();
+    std::lock_guard<std::mutex> guard(worker.mutex);
+    return !worker.commands.empty();
+}
 
 bool WantsPreviewReadback() {
     uint32_t frames = g_forcedPreviewFrames.load(std::memory_order_acquire);

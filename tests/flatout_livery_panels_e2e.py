@@ -8,6 +8,7 @@ publish operation is performed. --clicks-only covers only the safe action pass.
 import argparse, asyncio, json, math, os, sys, uuid
 from pathlib import Path
 import numpy as np
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tests'))
@@ -90,7 +91,7 @@ async def main(args):
                         center=np.array(base['pose']['position'])+basis[:,0]*((hx/1920-.5)*base['size'][0])+basis[:,1]*((.5-hy/1080)*base['size'][1])
                         offsets=[(basis.T@(np.array(t['pose']['position'])-center)).tolist() for t in composed['geometry']['surfaces']
                                  if np.linalg.norm(quaternion_matrix(t['pose']['orientation'])-basis)<1e-4]
-                        assert any(np.linalg.norm(d[:2])<.01 and abs(d[2]-.015)<.001 for d in offsets),offsets
+                        assert any(np.linalg.norm(d[:2])<.01 and abs(d[2]-HOVER_LIFT_METERS)<.001 for d in offsets),offsets
                         stem=side+'-'+hand
                         (args.evidence/(stem+'-state.json')).write_text(json.dumps(state,indent=2))
                         report['cases'].append(dict(case=stem,passed=True,hit=hit,offsets=offsets))

@@ -10,10 +10,27 @@ import os
 from pathlib import Path
 import sys
 import uuid
+import numpy as np
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from flatout_frontend_e2e import Frontend, ROOT
+from flatout_livery_e2e import ui_surface
+
+
+def check_category_planes(cases):
+    observations=[c for c in cases if c['case']=='category-plane-observed']
+    assert {c['category'] for c in observations}=={0,1,2,3}, 'Observe every customization category'
+    first=observations[0]['surface']
+    maximum=0.
+    for observed in observations:
+        surface=observed['surface']
+        distance=float(np.linalg.norm(np.array(surface['pose']['position'])-first['pose']['position']))
+        maximum=max(maximum,distance)
+        assert distance<.003, ('Category change moved the action dock',observed['category'],distance)
+        assert np.allclose(surface['size'],first['size'],atol=.001), 'Category change resized the action dock'
+        assert abs(np.dot(surface['pose']['orientation'],first['pose']['orientation']))>.99999, 'Category change rotated the action dock'
+    return {'case':'category-plane-consistency','passed':True,'observations':len(observations),'maximum_displacement_m':maximum}
 
 
 class CustomizationUI(Frontend):
@@ -57,6 +74,9 @@ class CustomizationUI(Frontend):
         cards=[t for t in targets if t['name'].startswith('legacy.')]
         assert cards and min(t['rect'][1] for t in cards)-max(t['rect'][3] for t in controls)>=40, ('Categories crowd the carousel',controls,cards)
         await self.audit('customization-controls-do-not-overlap')
+        frame=(await self.query('vr.targets'))['vr_frame']
+        self.cases.append({'case':'category-plane-observed','passed':True,'category':category,
+                           'surface':ui_surface({'vr':{'frame':frame}}),'frame':frame})
         return controls
 
     async def inert(self,name):
@@ -102,6 +122,7 @@ class CustomizationUI(Frontend):
         await self.orbit()
         assert await self.category()==initial
         await self.layout()
+        self.cases.append(check_category_planes(self.cases))
         self.cases.append({'case':'orbit-hides-and-restores-category-navigation','passed':True})
 
     async def orbit(self):

@@ -25,8 +25,9 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = Path(__file__).with_name("flatout_ui_atlas_manifest.json")
 READ_METHODS = {"game.get_state", "game.errors", "menu.get_state", "vr.targets", "vr.get_state",
-                "hud.rects", "ui.get_message_box", "options.get_state", "statistics.get_state",
-                "party.get_state", "leaderboard.get_state", "race.end_screen", "hud.pause_menu", "ui.reward_state"}
+                "hud.rects", "hud.get_node", "ui.get_message_box", "options.get_state", "statistics.get_state",
+                "party.get_state", "leaderboard.get_state", "race.end_screen", "hud.pause_menu", "ui.reward_state",
+                "net.get_state"}
 STAGE_METHODS = {"menu.go_to", "menu.navigate", "menu.select", "menu.back", "menu.validate",
                  "ui.confirm_message_box", "ui.pop_message_box", "ui.preview_reward", "livery.command"}
 LIVERY_OPS = {"state", "catalog", "browse", "view", "input", "vr_keyboard"}
@@ -80,7 +81,8 @@ def loading_widgets(nodes):
 
 def career_car_caption(nodes):
     return next((n["text"].strip() for n in nodes if n.get("visible") and n.get("text","").strip() and
-                 "/info_3d_c/" in n.get("path","").casefold() and n["path"].casefold().endswith("/txt_value")),None)
+                 (("/info_3d_c/" in n.get("path","").casefold() and n["path"].casefold().endswith("/txt_value")) or
+                  n.get("path","").endswith("/CareerWorkspace/CareerGarage/CareerGarageCar"))),None)
 
 
 def livery_ready(state):

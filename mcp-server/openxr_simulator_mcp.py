@@ -761,6 +761,15 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="set_session_focus",
+            description=("Explicitly simulate an OpenXR input-focus handoff: false enters VISIBLE, "
+                         "true returns to FOCUSED. The scene keeps rendering and held automation "
+                         "inputs release on focus loss. This does not emulate SteamVR dashboard compositing. "
+                         "Restore focused=true after testing; requires a live runtime."),
+            inputSchema={"type":"object","properties":{"focused":{"type":"boolean"}},
+                         "required":["focused"],"additionalProperties":False}
+        ),
+        Tool(
             name="set_head_pose",
             description=("Set the simulator's head pose. Use a non-identity pose "
                          "(yaw/pitch/roll != 0) to surface coordinate-system "
@@ -1337,6 +1346,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 type="text",
                 text=f"Failed to clear log file: {e}"
             )]
+
+    elif name == "set_session_focus":
+        focused = arguments.get("focused")
+        if type(focused) is not bool:
+            raise ValueError("focused must be an explicit boolean")
+        err = _write_control_command(SIMULATOR_DIR / "session_focus_command.json", {"focused":focused})
+        if err:
+            return [TextContent(type="text", text=err)]
+        return [TextContent(type="text", text=json.dumps({"queued":True,"focused":focused}))]
 
     elif name == "set_head_pose":
         payload = {

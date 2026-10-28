@@ -7,6 +7,7 @@ capture without connecting to or sending input to the game.
 import argparse, asyncio, json, os, sys, uuid
 from pathlib import Path
 import numpy as np
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from flatout_frontend_e2e import Frontend, ROOT
@@ -42,7 +43,7 @@ class ResultNavigation(Frontend):
         rotation = quaternion_matrix(base["pose"]["orientation"])
         expected_size = np.array([(r-l)/1920*base["size"][0],(b-t)/1080*base["size"][1]])
         expected_center = np.array(base["pose"]["position"]) + rotation @ np.array([
-            ((l+r)/3840-.5)*base["size"][0],(.5-(t+b)/2160)*base["size"][1],.015])
+            ((l+r)/3840-.5)*base["size"][0],(.5-(t+b)/2160)*base["size"][1],HOVER_LIFT_METERS])
         matching = [tile for tile in tiles if np.allclose(tile["size"],expected_size,atol=.002) and
                     np.linalg.norm(np.array(tile["pose"]["position"])-expected_center)<.003]
         if enabled:

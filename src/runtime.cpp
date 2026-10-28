@@ -144,53 +144,17 @@ inline UINT D3D12CalcSubresource(UINT MipSlice, UINT ArraySlice, UINT PlaneSlice
 }
 
 
-// Simple logging (debug output + file log)
-static FILE* g_LogFile = nullptr;
-static std::mutex g_LogMutex;
-
-// Log() is deliberately expensive: OutputDebugStringA takes a process-global lock and
-// the fflush makes every line survive a crash, which is what makes the log worth having.
-// Neither is affordable per frame -- a handful of calls in the frame loop cost more than
-// the compositing does. Anything on the frame path goes through LogV/LogVf, which cost a
-// predicted-taken branch unless SIMXR_VERBOSE is set to something other than 0.
+// Debugger and file writes can block unpredictably even for one log per second.
+// Keep them on the bounded diagnostics worker; frame calls only publish memory.
+// Verbose per-frame messages remain opt-in to keep that queue useful.
 static const bool g_logVerbose = []() {
     char v[16]{};
     const DWORD n = GetEnvironmentVariableA("SIMXR_VERBOSE", v, (DWORD)sizeof(v));
     return n > 0 && n < sizeof(v) && v[0] != '0';
 }();
 
-static void EnsureLogFile() {
-    if (g_LogFile) return;
-    char base[MAX_PATH]{};
-    char path[MAX_PATH]{};
-    const DWORD overrideLen = GetEnvironmentVariableA("SIMXR_DATA_DIR", base, (DWORD)sizeof(base));
-    if (overrideLen > 0 && overrideLen < sizeof(base)) {
-        CreateDirectoryA(base, nullptr);
-        snprintf(path, sizeof(path), "%s\\openxr_simulator.%lu.log", base, GetCurrentProcessId());
-    } else if (const DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
-               len > 0 && len < sizeof(base)) {
-        snprintf(path, sizeof(path), "%s\\OpenXR-Simulator", base);
-        CreateDirectoryA(path, nullptr);
-        snprintf(path, sizeof(path), "%s\\OpenXR-Simulator\\openxr_simulator.%lu.log", base, GetCurrentProcessId());
-    } else {
-        snprintf(path, sizeof(path), ".\\openxr_simulator.%lu.log", GetCurrentProcessId());
-    }
-    // Permit diagnostics readers and sibling host processes to open the log while
-    // keeping frame-path logging buffered instead of flushing on every line.
-    g_LogFile = _fsopen(path, "a", _SH_DENYNO);
-    if (g_LogFile) setvbuf(g_LogFile, nullptr, _IOFBF, 64 * 1024);
-}
 static void Log(const char* msg) {
-    OutputDebugStringA(msg);
-    std::lock_guard<std::mutex> guard(g_LogMutex);
-    EnsureLogFile();
-    if (g_LogFile) {
-        fputs(msg, g_LogFile);
-        if (msg[0] && msg[strlen(msg)-1] != '\n') fputc('\n', g_LogFile);
-        // Roughly a syscall a second (the frame path uses LogV/LogVf, see above), and the
-        // log survives a crash or a DLL unload with its tail intact.
-        fflush(g_LogFile);
-    }
+    flicker::PublishRuntimeLog(msg);
 }
 static void Log(const std::string& msg) { Log(msg.c_str()); }
 static void Logf(const char* fmt, ...) {
@@ -357,6 +321,9 @@ void PushState(XrSession s, XrSessionState newState);
 // Event queue drained by xrPollEvent. Lives in this early block so functions like
 // xrDestroySession can discard queued events that reference destroyed handles.
 static std::vector<XrEventDataBuffer> g_eventQueue;
+// MCP is consumed by the frame thread. Deliver focus events on xrPollEvent's
+// thread rather than concurrently mutating its event queue from xrWaitFrame.
+static std::atomic<int> g_requestedSessionFocus{-1};
 
 // Global adapter LUID that we'll use consistently
 static LUID g_adapterLuid = {};
@@ -367,8 +334,8 @@ static bool g_adapterLuidSet = false;
 // it on the app's render thread instead wedged Cemu inside SetWindowText on the first
 // composited frame.
 //
-// The frame path calls in synchronously (SetWindowText, SetWindowPos), so this thread must
-// stay in its message loop: whatever blocks here stalls the application's rendering.
+// Captions are coalesced onto this thread without blocking the frame path.
+// Window resizing still needs this message loop to remain responsive.
 struct PreviewUi {
     std::thread       thread;
     std::atomic<HWND> hwnd{nullptr};
@@ -1604,6 +1571,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return darkMenuResult;
     }
     switch (msg) {
+        case preview_title::kApplyMessage:
+            ui::g_previewTitle.Apply(hWnd);
+            return 0;
         case WM_CLOSE:
             if (rt::g_session.handle != XR_NULL_HANDLE) {
                 bool running = false;
@@ -1618,6 +1588,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hWnd);
             return 0;
         case WM_DESTROY:
+            ui::g_previewTitle.Forget(hWnd);
             // DON'T call PostQuitMessage - we're a DLL, not the main app!
             // PostQuitMessage would tell the host application to exit.
             Log("[SimXR] WndProc: WM_DESTROY received");
@@ -2696,7 +2667,6 @@ static XrResult XRAPI_PTR xrGetInstanceProcAddr_runtime(XrInstance, const char* 
 extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInterface(const XrNegotiateLoaderInfo* loaderInfo,
                                                                             XrNegotiateRuntimeRequest* runtimeRequest) {
     try {
-        EnsureLogFile();
         Log("\n[SimXR] ========== OpenXR Simulator Runtime Starting ==========\n");
         if (!loaderInfo || !runtimeRequest) {
             Log("[SimXR] xrNegotiateLoaderRuntimeInterface: ERROR - null parameters");
@@ -4508,6 +4478,12 @@ namespace rt {
     }
 }
 static XrResult XRAPI_PTR xrPollEvent_runtime(XrInstance, XrEventDataBuffer* b) {
+    const int requestedFocus = rt::g_requestedSessionFocus.exchange(-1);
+    if (requestedFocus >= 0 && rt::g_session.running &&
+        (rt::g_session.state == XR_SESSION_STATE_FOCUSED || rt::g_session.state == XR_SESSION_STATE_VISIBLE)) {
+        const XrSessionState desired = requestedFocus ? XR_SESSION_STATE_FOCUSED : XR_SESSION_STATE_VISIBLE;
+        if (rt::g_session.state != desired) rt::PushState(rt::g_session.handle, desired);
+    }
     static int pollCount = 0;
     pollCount++;
     
@@ -4571,6 +4547,7 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
     }
 
 
+    rt::g_requestedSessionFocus.store(-1);
     rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
     rt::PushState(s, XR_SESSION_STATE_VISIBLE);
     // A simulator has no physical HMD focus hand-off. Keep the OpenXR application
@@ -4619,6 +4596,24 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (!s || s->type != XR_TYPE_FRAME_STATE ||
         (info && info->type != XR_TYPE_FRAME_WAIT_INFO)) return XR_ERROR_VALIDATION_FAILURE;
+    // Distinguish an actual pacing wait from message dispatch, command polling,
+    // or lock contention when the host profiler reports a long xrWaitFrame.
+    // Stack-only and allocation-free; ordinary frames do not write a log.
+    struct WaitTiming {
+        ULONGLONG start = GetTickCount64(), last = start, phases[7]{};
+        ULONGLONG commandWatchMs = 0, commandApplyMs = 0;
+        void Mark(unsigned phase) {
+            const ULONGLONG now = GetTickCount64();
+            phases[phase] += now - last; last = now;
+        }
+        ~WaitTiming() {
+            const ULONGLONG total = GetTickCount64() - start;
+            if (total >= 40) {
+                Logf("[SimXR] xrWaitFrame slow: total=%llums lifecycle=%llu preview=%llu messages=%llu controlLock=%llu inputCommands=%llu pointer=%llu pacing=%llu commandWatch=%llu commandApply=%llu thread=%lu",
+                    total, phases[0], phases[1], phases[2], phases[3], phases[4], phases[5], phases[6], commandWatchMs, commandApplyMs, GetCurrentThreadId());
+            }
+        }
+    } timing;
     {
         std::unique_lock<std::mutex> lock(rt::g_session.frameMutex);
         if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
@@ -4629,6 +4624,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         const XrResult result = rt::g_session.frameLifecycle.MarkWaited();
         if (XR_FAILED(result)) return result;
     }
+    timing.Mark(0);
     if (!rt::g_session.hwnd) {
         ensurePreviewWithoutProjection(rt::g_session);
         if (rt::g_session.hwnd) {
@@ -4636,10 +4632,12 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
                  GetWindowThreadProcessId(rt::g_session.hwnd, nullptr), GetCurrentThreadId());
         }
     }
+    timing.Mark(1);
 
     // Not the preview window -- that has its own thread. This drains whatever host windows
     // happen to live on the render thread, which the runtime has always done from here.
     PumpMessages(nullptr);
+    timing.Mark(2);
     static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
     static double periodSec = 1.0 / 90.0;
     static long long periodNs = (long long)(periodSec * 1e9);
@@ -4648,6 +4646,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     // Handle WASD keyboard input for movement (relative to head orientation).
     //
     std::unique_lock<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    timing.Mark(3);
     // The PID check is what makes AppForeground the default: the runtime is in-process with
     // the host, so the game's own window counts as ours. PreviewFocused was once the only
     // behaviour and left WASD dead in any game that takes the foreground on launch.
@@ -4894,10 +4893,24 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     }
 
     // MCP commands work regardless of window focus (file-based IPC).
-    // RefreshCommandsDue keeps this whole block off the frame path until the command
-    // directory actually changes; see its comment for why that matters.
+    // RefreshCommandsDue only checks the worker inbox. Directory notification and
+    // command-file IO remain on that worker even when filesystem filters stall.
+    const ULONGLONG commandWatchStart = GetTickCount64();
     mcp::RefreshCommandsDue();
-    if (mcp::g_commandsDue) {
+    timing.commandWatchMs = GetTickCount64() - commandWatchStart;
+    const ULONGLONG commandApplyStart = GetTickCount64();
+    static std::uint64_t controlCommandEpoch = 0;
+    const bool controlsChanged = mcp::g_commandEpoch.ChangedSince(controlCommandEpoch);
+    if (mcp::g_commandsDue || controlsChanged) {
+        const mcp::SessionFocusCommand focus = mcp::CheckSessionFocusCommand();
+        if (focus.valid) {
+            const bool eligible = rt::g_session.running &&
+                (rt::g_session.state == XR_SESSION_STATE_FOCUSED || rt::g_session.state == XR_SESSION_STATE_VISIBLE);
+            if (eligible) {
+                rt::g_requestedSessionFocus.store(focus.focused ? 1 : 0);
+            }
+            mcp::WriteCommandAck("session_focus", eligible);
+        }
         mcp::HeadPoseCommand cmd = mcp::CheckHeadPoseCommand();
         if (cmd.valid) {
             rt::g_headPos.x = cmd.x;
@@ -5026,9 +5039,12 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         }
     }
 
+    timing.commandApplyMs = GetTickCount64() - commandApplyStart;
+    timing.Mark(4);
     PollUiPointerCommand();
     ApplyUiPointerButtons();
     controlLock.unlock();
+    timing.Mark(5);
 
     // Pace on a high-resolution waitable timer. Plain Sleep() rounds up to the
     // system timer interval â€” as much as 15.6ms when the host never raised it â€”
@@ -5063,6 +5079,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     if ((double)now.QuadPart - nextTick > periodSec * (double)freq.QuadPart) {
         nextTick = (double)now.QuadPart;
     }
+    timing.Mark(6);
     // Exact integer conversion - the same math xrConvertWin32PerformanceCounterToTimeKHR
     // performs, so predicted display times and converted times agree for one instant.
     const XrTime nowTime = QpcToNs(now.QuadPart, freq.QuadPart);
@@ -6824,7 +6841,13 @@ static void updatePreviewTitle(rt::Session& s) {
         return;
     }
     ui::StatsInfo si = rt::BuildStatsInfo(s);
+    LARGE_INTEGER titleStart{}, titleEnd{}, titleFrequency{};
+    QueryPerformanceCounter(&titleStart);
     ui::UpdateWindowTitle(s.hwnd, &si);
+    QueryPerformanceCounter(&titleEnd);
+    QueryPerformanceFrequency(&titleFrequency);
+    const double titleMs=1000.0*(titleEnd.QuadPart-titleStart.QuadPart)/titleFrequency.QuadPart;
+    if (titleMs>=40.0) Logf("[SimXR] preview title slow: %.3fms thread=%lu",titleMs,GetCurrentThreadId());
 }
 
 static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj,
@@ -8464,6 +8487,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     }
     // Every command file has been looked at for this change notification.
     mcp::g_commandsDue = false;
+    LARGE_INTEGER afterStatus{};
+    QueryPerformanceCounter(&afterStatus);
 
     // Consume older D3D11 staging slots without flushing or waiting, then queue this
     // xrEndFrame's fully composed two-eye backbuffer before flip-model Present makes its
@@ -8480,6 +8505,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
             }
         }
     }
+    LARGE_INTEGER afterReadbacks{};
+    QueryPerformanceCounter(&afterReadbacks);
 
     // D3D11 and OpenGL capture from the preview swapchain inside presentProjection, which a
     // frame carrying no projection layer never reaches - so on a 2D-only frame the request
@@ -8494,7 +8521,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         const std::string shotPath = mcp::GetSimulatorDataPath() + "\\screenshot.bmp";
         ui::NotifyScreenshotSaved(std::wstring(shotPath.begin(), shotPath.end()));
     }
-
+    LARGE_INTEGER afterScreenshot{};
+    QueryPerformanceCounter(&afterScreenshot);
 
     // Now Present after all layers are rendered (D3D11/GL only; D3D12 uses GDI in blit function)
     if (g_presentPending) {
@@ -8511,6 +8539,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         }
         g_presentPending = false;
     }
+    LARGE_INTEGER afterPresent{};
+    QueryPerformanceCounter(&afterPresent);
 
     // Keep the measurement visible without drawing into the eye images (and
     // therefore without contaminating screenshots or flicker/color analysis).
@@ -8548,6 +8578,22 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         const auto elapsedMs = [&](const LARGE_INTEGER& begin, const LARGE_INTEGER& end) {
             return 1000.0 * (double)(end.QuadPart - begin.QuadPart) / (double)frequency.QuadPart;
         };
+        // The historical "status" bucket also includes readback, screenshots and
+        // DXGI Present. Preserve it for comparisons, but identify individual stalls
+        // before attributing compositor/driver waits to the application's UI.
+        const double frameMs = elapsedMs(endFrameStart, endFrameFinish);
+        if (frameMs >= 40.0) {
+            Logf("[SimXR] xrEndFrame slow: frame=%u total=%.3fms projection=%.3f overlay=%.3f detectPaint=%.3f status=%.3f readback=%.3f screenshot=%.3f present=%.3f titleLog=%.3f thread=%lu",
+                 frameCount, frameMs,
+                 1000.0 * (double)projectionTicks / (double)frequency.QuadPart,
+                 1000.0 * (double)overlayTicks / (double)frequency.QuadPart,
+                 elapsedMs(afterLayers, afterDetectionAndPaint),
+                 elapsedMs(afterDetectionAndPaint, afterStatus),
+                 elapsedMs(afterStatus, afterReadbacks),
+                 elapsedMs(afterReadbacks, afterScreenshot),
+                 elapsedMs(afterScreenshot, afterPresent),
+                 elapsedMs(afterPresent, endFrameFinish), GetCurrentThreadId());
+        }
         projectionMs += 1000.0 * (double)projectionTicks / (double)frequency.QuadPart;
         overlayMs += 1000.0 * (double)overlayTicks / (double)frequency.QuadPart;
         detectPaintMs += elapsedMs(afterLayers, afterDetectionAndPaint);

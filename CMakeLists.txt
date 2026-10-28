@@ -43,6 +43,7 @@ add_library(openxr_simulator SHARED
     src/mcp_integration.h
     src/projection_timing.h
     src/preview_focus.h
+    src/command_epochs.h
     src/ui_enhancements.h
 )
 if(CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -51,6 +52,9 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(runtime_command_worker_tests tests/runtime_command_worker_tests.cpp src/flicker_detector.cpp)
+    target_compile_definitions(runtime_command_worker_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME runtime_command_worker COMMAND runtime_command_worker_tests)
     add_executable(xr_ui_probe probe/xr_probe.cpp)
     target_compile_definitions(xr_ui_probe PRIVATE XR_PROBE_DIRECT_RUNTIME)
     target_link_libraries(xr_ui_probe PRIVATE d3d12 dxgi d3dcompiler)
@@ -67,6 +71,10 @@ if(BUILD_TESTING)
     add_executable(projection_timing_tests tests/projection_timing_tests.cpp)
     target_include_directories(projection_timing_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME projection_timing COMMAND projection_timing_tests)
+
+    add_executable(command_epochs_tests tests/command_epochs_tests.cpp)
+    target_include_directories(command_epochs_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME command_epochs COMMAND command_epochs_tests)
 
     add_executable(ui_resolution_tests tests/ui_resolution_tests.cpp)
     target_include_directories(ui_resolution_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -166,6 +174,11 @@ if(BUILD_TESTING)
     add_executable(preview_focus_tests tests/preview_focus_tests.cpp)
     target_include_directories(preview_focus_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME preview_focus COMMAND preview_focus_tests)
+
+    add_executable(preview_title_tests tests/preview_title_tests.cpp)
+    target_include_directories(preview_title_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(preview_title_tests PRIVATE user32)
+    add_test(NAME preview_title COMMAND preview_title_tests)
 
 
     add_executable(composition_validation_tests tests/composition_validation_tests.cpp)

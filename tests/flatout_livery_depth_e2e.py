@@ -1,4 +1,4 @@
-"""Verify an actual livery control moves onto a 15 mm closer stereo plane.
+"""Verify an actual livery control moves onto a 20 mm closer stereo plane.
 
 Start in the livery editor with an isolated profile. The game bridge is read
 only; all interaction goes through screenshot-targeted simulator XR input.
@@ -13,6 +13,7 @@ import sys
 import uuid
 
 import numpy as np
+from flatout_ui_motion_policy import HOVER_LIFT_METERS
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from flatout_livery_e2e import LiveryTest, ROOT, screenshot_pixel, ui_surface, ui_frame_at, quaternion_matrix
@@ -54,12 +55,12 @@ class LiveryDepth(LiveryTest):
                 delta = basis.T @ (np.array(tile['pose']['position']) - center)
                 if tile['visibility'] == 0 and np.linalg.norm(delta[:2]) < .01:
                     candidates.append({'tile': tile, 'offset_meters': delta.tolist()})
-            passed = any(abs(t['offset_meters'][2] - .015) < .001 for t in candidates)
+            passed = any(abs(t['offset_meters'][2] - HOVER_LIFT_METERS) < .001 for t in candidates)
             self.cases.append({'case': 'physical-livery-hover-' + label, 'passed': passed,
                                'control': control, 'base': base, 'candidates': candidates,
                                'submitted_surfaces': raised['geometry']['surfaces'],
                                'native_hover': hit})
-            assert passed, (label, 'No matching 15mm stereo control plane', candidates)
+            assert passed, (label, 'No matching 20mm stereo control plane', candidates)
             if self.args.gpu_capture:
                 queued = await asyncio.to_thread(read_game, self.args.pid, 'renderdoc.capture',
                     {'frames': 1, 'path': str(self.args.gpu_capture.resolve()) + '-' + label})
@@ -73,7 +74,7 @@ class LiveryDepth(LiveryTest):
             panel = frame['panel']
             normal = -np.array(panel['back'])
             normal /= np.linalg.norm(normal)
-            plane = np.array(panel['origin']) + normal * .015
+            plane = np.array(panel['origin']) + normal * HOVER_LIFT_METERS
             origin, direction = np.array(hit['origin']), np.array(hit['direction'])
             distance = np.dot(plane-origin, normal) / np.dot(direction, normal)
             point = origin + distance * direction
@@ -84,7 +85,7 @@ class LiveryDepth(LiveryTest):
             assert np.linalg.norm(np.array(hit['end'])-point) < .002, ('Ray misses raised face', hit, point.tolist())
             self.cases.append({'case': 'raised-face-ray-intersection', 'passed': True, 'expected_uv': expected_uv})
             if self.args.raised_edge_top:
-                tile = next(t['tile'] for t in candidates if abs(t['offset_meters'][2]-.015) < .001)
+                tile = next(t['tile'] for t in candidates if abs(t['offset_meters'][2]-HOVER_LIFT_METERS) < .001)
                 edge_state = copy.deepcopy(hovered)
                 ui_frame_at(edge_state, hx, hy)['panel']['origin'] = plane.tolist()
                 ex, ey = screenshot_pixel(edge_state, raised, hx, control['y'] + .25)

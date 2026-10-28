@@ -13,11 +13,14 @@
 #include <cstdlib>
 
 #include "json.h"
+#include "preview_title.h"
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
 
 namespace ui {
+
+inline preview_title::Mailbox g_previewTitle;
 
 // Menu command IDs
 enum MenuCommand {
@@ -1730,7 +1733,7 @@ inline void UpdateWindowTitle(HWND hwnd, const StatsInfo* stats = nullptr) {
         }
     }
 
-    SetWindowTextW(hwnd, title);
+    g_previewTitle.Publish(hwnd,title);
 }
 
 } // namespace ui

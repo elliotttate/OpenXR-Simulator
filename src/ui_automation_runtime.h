@@ -113,16 +113,14 @@ static ui_auto::Frame BuildUiFrame(const XrFrameEndInfo* info, uint64_t frame) {
 
 static void WriteUiResult(ui_auto::Pointer& p, bool success, const char* error="") {
     if (!ui_auto::ValidId(p.id)) return;
-    const std::string path=mcp::GetSimulatorDataPath()+"\\ui_pointer_result."+p.id+".json";
-    const std::string tmp=path+".tmp";
-    FILE* f=nullptr;
-    if (fopen_s(&f,tmp.c_str(),"w")!=0 || !f) return;
-    fprintf(f,"{\"command_id\":\"%s\",\"session_id\":\"%s\",\"request_digest\":\"%s\",\"success\":%s,\"error\":\"%s\","
+    if (!ui_auto::g_completedCommands.insert(p.id).second) {p.pending=false;return;}
+    char result[2048];
+    const int length=snprintf(result,sizeof(result),"{\"command_id\":\"%s\",\"session_id\":\"%s\",\"request_digest\":\"%s\",\"success\":%s,\"error\":\"%s\","
               "\"applied_frame\":%llu,\"frame_id\":%llu,\"sync_id\":%llu,\"button_down\":%s}\n",
             p.id.c_str(),p.session.empty() ? ui_auto::g_session.c_str():p.session.c_str(),p.requestDigest.c_str(),success ? "true":"false",error,p.appliedFrame,
             mcp::g_runtimeFrameCount.load(),ui_auto::g_sync,p.down ? "true":"false");
-    fclose(f);
-    MoveFileExA(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
+    if (length>0 && length<(int)sizeof(result))
+        flicker::PublishRuntimeResult("ui_pointer_result."+p.id+".json",std::string(result,(size_t)length));
     p.pending=false;
 }
 
@@ -146,6 +144,7 @@ static void ResetUiAutomation() {
     static unsigned serial=0;
     ui_auto::g_session=std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64())+"-"+std::to_string(++serial);
     ui_auto::g_sync=0; ui_auto::g_frame={}; ui_auto::g_captures.clear();
+    ui_auto::g_completedCommands.clear();
     for (auto& action:rt::g_actions) action.second.slots={};
 }
 
@@ -205,9 +204,7 @@ static void PollUiPointerCommand() {
     }
     if (!mcp::g_commandsDue) return;
     const std::string path=mcp::GetSimulatorDataPath()+"\\ui_pointer_command.json";
-    FILE* f=nullptr; if (fopen_s(&f,path.c_str(),"r")!=0 || !f) return;
-    char buffer[4096]; size_t n=fread(buffer,1,sizeof(buffer)-1,f); fclose(f); buffer[n]=0;
-    DeleteFileA(path.c_str());
+    char buffer[4096]; if (!mcp::ReadPendingCommand(path.c_str(),buffer,sizeof(buffer))) return;
     json::Object o(buffer);
     Pointer incoming;
     incoming.id=o.string("command_id"); incoming.session=o.string("session_id"); incoming.action=o.string("action"); incoming.button=o.string("button","trigger");
@@ -216,8 +213,7 @@ static void PollUiPointerCommand() {
     if (!ValidId(incoming.id)) return;
     if (!ValidId(incoming.session)) { incoming.session.clear(); WriteUiResult(incoming,false,"Invalid session ID"); return; }
     // A replayed request must never activate twice, even after an MCP restart.
-    const std::string result=mcp::GetSimulatorDataPath()+"\\ui_pointer_result."+incoming.id+".json";
-    if (GetFileAttributesA(result.c_str())!=INVALID_FILE_ATTRIBUTES) return;
+    if (g_completedCommands.count(incoming.id)) return;
     if (o.string("session_id")!=g_session) { WriteUiResult(incoming,false,"Session changed; recapture"); return; }
     const int hand=o.number("hand",1);
     if (hand<0 || hand>1) { WriteUiResult(incoming,false,"Invalid hand"); return; }

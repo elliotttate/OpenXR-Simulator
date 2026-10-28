@@ -17,7 +17,7 @@ from ui_comfort import analyze_visibility
 
 
 def placement_metrics(snapshot):
-    """Measure rest geometry, so a legitimate 15 mm hover is not drift."""
+    """Measure rest geometry, so a legitimate 20 mm hover is not drift."""
     menu=snapshot['menu'];layout=menu['spatial_layout']
     camera=snapshot['targets']['vr_frame']['camera']
     head=snapshot['capture']['geometry']['head']['position']

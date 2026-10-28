@@ -8,6 +8,7 @@
 #include <string>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ui_auto {
@@ -104,6 +105,8 @@ inline std::string g_session;
 inline uint64_t g_sync = 0;
 inline Frame g_frame;
 inline std::unordered_map<std::string, SavedCapture> g_captures;
+// Session-lifetime replay guard, including results not yet durable on the I/O worker.
+inline std::unordered_set<std::string> g_completedCommands;
 
 struct Pointer {
     bool owned = false, pending = false;

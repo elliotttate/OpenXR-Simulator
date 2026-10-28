@@ -48,7 +48,7 @@ class CareerResults(Frontend):
         labels=[]
         for root in ('menu','hud'):
             labels+=(await self.query('hud.rects',{'root':root,'max_depth':22}))['nodes']
-        captions=[n['text'] for n in labels if n['visible'] and n['path'].endswith('/RayActionLabel')]
+        captions=[n['text'] for n in labels if n['visible'] and n['path'].endswith(('/RayActionLabel','/CupActionLabel'))]
         assert 'Continue' in captions and 'Confirm' not in captions and 'Start' not in captions,('Next round must say Continue',captions)
         self.cases.append({'case':'next-race-names-continue-action','passed':True,'captions':captions})
         targets=(await self.query('vr.targets'))['targets']

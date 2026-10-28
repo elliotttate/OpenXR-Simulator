@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 // Continuous diagnostics over the exact fully-composed simulator preview. D3D12/Vulkan
 // hand the detector their existing CPU DIB readback; D3D11 supplies frames through an
@@ -9,10 +10,25 @@
 // application's swapchain images remain perfectly stable.
 //
 // Threading: every Observe* call runs its sampling and classification inline on
-// the caller (the app's xrEndFrame thread), but all disk output — status JSON,
-// incident BMP packets, manual capture-request polling — happens on a private
+// the caller (the app's xrEndFrame thread), but all disk output â€” status JSON,
+// incident BMP packets, manual capture-request polling â€” happens on a private
 // worker thread. Nothing here blocks the frame loop on storage.
 namespace flicker {
+
+// Latest-only runtime telemetry. The frame thread hands off a memory snapshot;
+// the existing diagnostics worker owns all file creation and publication.
+void PublishRuntimeStatus(std::string snapshot);
+// Bounded FIFO diagnostics; debugger/file output belongs to the I/O worker,
+// never the application's pose, input or render thread.
+void PublishRuntimeLog(std::string message);
+// Atomic pointer receipts are durable on the worker, without write-through
+// disk flushes while the app synchronizes input actions.
+void PublishRuntimeResult(std::string filename,std::string contents);
+// The worker owns directory notifications, re-arming and command-file scans.
+// Frame-side calls only request a scan or consume its bounded in-memory inbox.
+void RequestRuntimeCommands();
+bool TakeRuntimeCommand(const std::string& name, std::string& contents);
+bool RuntimeCommandsReady();
 
 struct PreviewFrameInfo {
     uint32_t imageIndex[2] = {UINT32_MAX, UINT32_MAX};

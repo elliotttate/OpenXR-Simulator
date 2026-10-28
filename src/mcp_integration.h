@@ -16,7 +16,9 @@
 #include <atomic>
 
 #include "json.h"
+#include "command_epochs.h"
 #include "ui_automation.h"
+#include "flicker_detector.h"
 
 namespace mcp {
 
@@ -60,90 +62,23 @@ inline const std::string& GetSimulatorDataPath() {
     return path;
 }
 
-// The Check*Command functions below each open a file that is almost never there, and
-// there are ten of them on the frame path. A failed CreateFile is not free once a
-// real-time AV filter sits on %LOCALAPPDATA%, and ten of them per frame is milliseconds.
-//
-// The commands come from the MCP server, driven by an agent or a human, so they arrive
-// thousands of frames apart. Watch the directory, but filter by FILENAME: the runtime
-// itself writes status JSONs and logs into this same folder several times a second, and
-// an unfiltered change notification re-armed the polls on every one of those writes,
-// defeating the point of watching. Only a name matching a command/request file counts.
-// The 500ms backstop covers what the watch cannot: an overflowed notification buffer,
-// and the handle going stale if the folder is deleted and recreated underneath us.
-inline std::atomic_bool g_commandsDue{true};   // poll once on the first frame to drain anything stale
-
-inline bool IsCommandFileName(const wchar_t* name, size_t chars) {
-    wchar_t lowered[96];
-    if (chars == 0 || chars >= sizeof(lowered) / sizeof(lowered[0])) return false;
-    for (size_t i = 0; i < chars; ++i) {
-        lowered[i] = (wchar_t)towlower(name[i]);
-    }
-    lowered[chars] = 0;
-    const std::wstring_view view(lowered, chars);
-    constexpr std::wstring_view commandSuffix = L"_command.json";
-    if (view.size() >= commandSuffix.size() &&
-        view.compare(view.size() - commandSuffix.size(), commandSuffix.size(), commandSuffix) == 0) {
-        return true;
-    }
-    return view.find(L"_request") != std::wstring_view::npos;
-}
+// Frame-side command discovery only inspects the background worker inbox.
+// Even an overlapped ReadDirectoryChangesW re-arm can stall under a filesystem
+// filter (578 ms observed). The watcher and its 500 ms backstop live on the I/O
+// worker; neither directory operations nor command-file reads belong here.
+inline std::atomic_bool g_commandsDue{true};
+inline CommandEpoch g_commandEpoch;
 
 inline void RefreshCommandsDue() {
     std::lock_guard<std::recursive_mutex> lock(ui_auto::g_mutex);
-    static HANDLE directory = INVALID_HANDLE_VALUE;
-    static HANDLE event = nullptr;
-    static OVERLAPPED overlapped = {};
-    alignas(DWORD) static char buffer[4096];
-    static bool pending = false;
-    static ULONGLONG lastPoll = 0;
-    static bool init = false;
-
-    const auto rearm = []() {
-        ResetEvent(event);
-        pending = ReadDirectoryChangesW(directory, buffer, sizeof(buffer), FALSE,
-                                        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
-                                        nullptr, &overlapped, nullptr) != 0;
-    };
-
-    if (!init) {
-        init = true;
-        CreateDirectoryA(GetSimulatorDataPath().c_str(), nullptr);
-        directory = CreateFileA(GetSimulatorDataPath().c_str(), FILE_LIST_DIRECTORY,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-                                nullptr);
-        event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        overlapped.hEvent = event;
-        if (directory != INVALID_HANDLE_VALUE && event) rearm();
-    }
-
-    if (pending && WaitForSingleObject(event, 0) == WAIT_OBJECT_0) {
-        DWORD bytes = 0;
-        bool commandTouched = false;
-        if (GetOverlappedResult(directory, &overlapped, &bytes, FALSE) && bytes > 0) {
-            const char* record = buffer;
-            for (;;) {
-                const FILE_NOTIFY_INFORMATION* info =
-                    reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(record);
-                if (IsCommandFileName(info->FileName, info->FileNameLength / sizeof(wchar_t))) {
-                    commandTouched = true;
-                    break;
-                }
-                if (!info->NextEntryOffset) break;
-                record += info->NextEntryOffset;
-            }
-        } else {
-            // Zero bytes means the buffer overflowed: too many changes to name
-            // them, so assume a command may be among them.
-            commandTouched = true;
-        }
-        rearm();
-        if (commandTouched) g_commandsDue = true;
-    }
+    static ULONGLONG lastRequest = 0;
     const ULONGLONG now = GetTickCount64();
-    if (now - lastPoll >= 500) {
-        lastPoll = now;
+    if (now - lastRequest >= 500) {
+        lastRequest = now;
+        flicker::RequestRuntimeCommands();
+    }
+    if (flicker::RuntimeCommandsReady()) {
+        g_commandEpoch.Notify();
         g_commandsDue = true;
     }
 }
@@ -207,15 +142,23 @@ inline uint32_t g_quadLayerWidth = 0;
 inline uint32_t g_quadLayerHeight = 0;
 inline bool g_quadLayerCaptured = false;
 
+// Consume the worker's bounded command inbox; no filesystem access here.
+inline bool ReadPendingCommand(const char* path, char* buffer, size_t capacity) {
+    const std::string fullPath(path);
+    const size_t slash = fullPath.find_last_of("\\/");
+    std::string contents;
+    if (!flicker::TakeRuntimeCommand(fullPath.substr(slash == std::string::npos ? 0 : slash+1), contents)) return false;
+    const size_t count = (std::min)(contents.size(), capacity-1);
+    memcpy(buffer, contents.data(), count);
+    buffer[count] = 0;
+    return true;
+}
+
 // Check if MCP has requested a screenshot
 inline void CheckScreenshotRequest() {
     std::string reqPath = GetSimulatorDataPath() + "\\screenshot_request.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, reqPath.c_str(), "r") == 0 && f) {
-        char buf[512];
-        size_t n = fread(buf, 1, sizeof(buf)-1, f);
-        buf[n] = 0;
-        fclose(f);
+    char buf[512];
+    if (ReadPendingCommand(reqPath.c_str(), buf, sizeof(buf))) {
 
         json::Object o(buf);
         g_screenshotRequested = true;
@@ -229,7 +172,6 @@ inline void CheckScreenshotRequest() {
         }
         g_screenshotAfterSync = (uint64_t)o.number("after_sync", 0.0);
 
-        DeleteFileA(reqPath.c_str());
         McpLogf("Screenshot request detected: layer=%s, eye=%s", g_screenshotLayer.c_str(), g_screenshotEye.c_str());
     }
 }
@@ -508,32 +450,21 @@ inline void WriteFrameStatus(uint32_t frameCount, uint32_t width, uint32_t heigh
     if (lastWriteMs != 0 && nowMs - lastWriteMs < 500) return;
     lastWriteMs = nowMs;
 
-    std::string path = GetSimulatorDataPath() + "\\runtime_status.json";
-    FILE* file = nullptr;
-    if (fopen_s(&file, path.c_str(), "w") != 0 || !file) return;
-
-    // Get current timestamp
     SYSTEMTIME st;
     GetLocalTime(&st);
-
-    fprintf(file, "{\n");
-    fprintf(file, "  \"timestamp\": \"%04d-%02d-%02dT%02d:%02d:%02d\",\n",
-            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    fprintf(file, "  \"frame_count\": %u,\n", frameCount);
-    fprintf(file, "  \"preview_width\": %u,\n", width);
-    fprintf(file, "  \"preview_height\": %u,\n", height);
-    fprintf(file, "  \"format\": \"%s\",\n", format ? format : "unknown");
-    fprintf(file, "  \"session_state\": \"%s\",\n", sessionState ? sessionState : "unknown");
-    fprintf(file, "  \"target_fps\": 90,\n");
-    fprintf(file, "  \"frame_time_ms\": 11.1,\n");
-    fprintf(file, "  \"head_tracking\": {\n");
-    fprintf(file, "    \"position\": {\"x\": %.3f, \"y\": %.3f, \"z\": %.3f},\n", headX, headY, headZ);
-    fprintf(file, "    \"yaw\": %.3f,\n", headYaw);
-    fprintf(file, "    \"pitch\": %.3f,\n", headPitch);
-    fprintf(file, "    \"roll\": %.3f\n", headRoll);
-    fprintf(file, "  }\n");
-    fprintf(file, "}\n");
-    fclose(file);
+    char snapshot[1536];
+    const int length = snprintf(snapshot, sizeof(snapshot),
+        "{\n  \"timestamp\": \"%04d-%02d-%02dT%02d:%02d:%02d\",\n"
+        "  \"frame_count\": %u,\n  \"preview_width\": %u,\n  \"preview_height\": %u,\n"
+        "  \"format\": \"%s\",\n  \"session_state\": \"%s\",\n"
+        "  \"target_fps\": 90,\n  \"frame_time_ms\": 11.1,\n"
+        "  \"head_tracking\": {\n    \"position\": {\"x\": %.3f, \"y\": %.3f, \"z\": %.3f},\n"
+        "    \"yaw\": %.3f,\n    \"pitch\": %.3f,\n    \"roll\": %.3f\n  }\n}\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+        frameCount, width, height, format ? format : "unknown", sessionState ? sessionState : "unknown",
+        headX, headY, headZ, headYaw, headPitch, headRoll);
+    if (length > 0 && length < (int)sizeof(snapshot))
+        flicker::PublishRuntimeStatus(std::string(snapshot, (size_t)length));
 }
 
 // Get session state name
@@ -550,6 +481,24 @@ inline const char* GetSessionStateName(int state) {
         case 8: return "EXITING";
         default: return "UNKNOWN";
     }
+}
+
+// Explicit input-focus simulation; diagnostic-window activation remains separate.
+struct SessionFocusCommand {
+    bool valid = false;
+    bool focused = true;
+};
+
+inline SessionFocusCommand CheckSessionFocusCommand() {
+    SessionFocusCommand cmd;
+    const std::string path = GetSimulatorDataPath() + "\\session_focus_command.json";
+    char buffer[256];
+    if (!ReadPendingCommand(path.c_str(), buffer, sizeof(buffer))) return cmd;
+    json::Object object(buffer);
+    if (!object.valid() || !object.has("focused")) return cmd;
+    cmd.focused = object.boolean("focused", true);
+    cmd.valid = true;
+    return cmd;
 }
 
 // Head pose control structure for MCP
@@ -570,15 +519,9 @@ struct HeadPoseCommand {
 inline HeadPoseCommand CheckHeadPoseCommand() {
     HeadPoseCommand cmd;
     std::string cmdPath = GetSimulatorDataPath() + "\\head_pose_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, cmdPath.c_str(), "r") == 0 && f) {
-        char buf[512];
-        size_t n = fread(buf, 1, sizeof(buf)-1, f);
-        buf[n] = 0;
-        fclose(f);
+    char buf[512];
+    if (ReadPendingCommand(cmdPath.c_str(), buf, sizeof(buf))) {
 
-        // Delete the file after reading (one-shot command)
-        DeleteFileA(cmdPath.c_str());
 
         json::Object o(buf);
         if (!o.valid()) return cmd;
@@ -623,13 +566,8 @@ struct FovCommand {
 inline FovCommand CheckFovCommand() {
     FovCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\fov_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[1024];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -666,13 +604,8 @@ struct IpdCommand {
 inline IpdCommand CheckIpdCommand() {
     IpdCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\ipd_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -699,13 +632,8 @@ struct HeadsetProfileCommand {
 inline HeadsetProfileCommand CheckHeadsetProfileCommand() {
     HeadsetProfileCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\headset_profile_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     std::string name = json::Object(buf).string("name");
     if (name.empty()) return cmd;
@@ -729,13 +657,8 @@ struct PoseSweepCommand {
 inline PoseSweepCommand CheckPoseSweepCommand() {
     PoseSweepCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\pose_sweep_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -760,13 +683,8 @@ struct AnaglyphCommand {
 inline AnaglyphCommand CheckAnaglyphCommand() {
     AnaglyphCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\anaglyph_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[256];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -841,10 +759,8 @@ inline void DumpProjectionLog() {
 
 // MCP polls a ".dump_request" file to ask us to write the log.
 inline bool CheckProjLogDumpRequest() {
-    std::string p = GetSimulatorDataPath() + "\\projection_log_dump_request";
-    if (GetFileAttributesA(p.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
-    DeleteFileA(p.c_str());
-    return true;
+    std::string contents;
+    return flicker::TakeRuntimeCommand("projection_log_dump_request", contents);
 }
 
 // ---------- Frame-burst capture ----------
@@ -878,13 +794,8 @@ struct BurstCommand {
 inline BurstCommand CheckBurstCommand() {
     BurstCommand cmd;
     std::string p = GetSimulatorDataPath() + "\\burst_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, p.c_str(), "r") != 0 || !f) return cmd;
     char buf[512];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = 0;
-    fclose(f);
-    DeleteFileA(p.c_str());
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return cmd;
 
     json::Object o(buf);
     if (!o.valid()) return cmd;
@@ -1044,15 +955,9 @@ struct ControllerPoseCommand {
 inline ControllerPoseCommand CheckControllerPoseCommand() {
     ControllerPoseCommand cmd;
     std::string cmdPath = GetSimulatorDataPath() + "\\controller_pose_command.json";
-    FILE* f = nullptr;
-    if (fopen_s(&f, cmdPath.c_str(), "r") == 0 && f) {
-        char buf[512];
-        size_t n = fread(buf, 1, sizeof(buf)-1, f);
-        buf[n] = 0;
-        fclose(f);
+    char buf[512];
+    if (ReadPendingCommand(cmdPath.c_str(), buf, sizeof(buf))) {
 
-        // Delete the file after reading (one-shot command)
-        DeleteFileA(cmdPath.c_str());
 
         json::Object o(buf);
         if (!o.valid()) return cmd;

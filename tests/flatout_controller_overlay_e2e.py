@@ -3,8 +3,9 @@
 Start a fresh build in Options with a level, forward-looking simulator head and
 an isolated test profile. Uses real runtime poses and rendered screenshots. Only
 the diagnostic overlay switch changes game state; no gameplay input is injected.
-The old path must hide both controller models behind the opaque menu; the new
-path must expose both, independently in each eye. Original poses/switch restored.
+Options uses an opaque occlusion control. The next-round board is translucent,
+so its disabled control must darken the same controller pixels substantially.
+The overlay must expose both controllers independently in each eye. Original poses/switch restored.
 """
 import argparse
 import asyncio
@@ -23,7 +24,7 @@ from flatout_livery_e2e import quaternion_matrix
 
 
 def game(pid, method, params=None):
-    assert method in ('vr.controller_overlay', 'vr.get_state', 'menu.get_state', 'options.get_state', 'game.errors', 'renderdoc.capture')
+    assert method in ('vr.controller_overlay', 'vr.get_state', 'menu.get_state', 'options.get_state', 'race.end_screen', 'hud.pause_menu', 'ui.get_message_box', 'game.errors', 'renderdoc.capture')
     payload = json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params or {}}).encode()
     with open(r'\\.\pipe\FlatoutMCP_'+str(pid), 'r+b', buffering=0) as pipe:
         pipe.write(struct.pack('<I',len(payload))+payload)
@@ -64,11 +65,18 @@ def project(capture, eye_name, point):
 
 async def run(args):
     args.evidence.mkdir(parents=True,exist_ok=False)
-    result = {'passed':False,'eyes':{}}
+    result = {'passed':False,'eyes':{},'screen':args.screen}
     original = game(args.pid,'vr.controller_overlay')
     assert original['available'], 'Build has no controller overlay resources'
     assert original.get('composition')=='stereo_quads', 'Controller overlay must use per-eye quad composition on SteamVR'
-    assert game(args.pid,'options.get_state')['open'], 'Start in front-end or in-race Options'
+    if args.screen=='next-race':
+        assert game(args.pid,'race.end_screen')['screen']==7, 'Start on the actual in-race next-round preview'
+        assert game(args.pid,'menu.get_state')['current_menu']=='in_game'
+        assert not game(args.pid,'options.get_state')['open']
+        assert not game(args.pid,'hud.pause_menu',{'action':'list'})['is_open']
+        assert not game(args.pid,'ui.get_message_box')['open']
+    else:
+        assert game(args.pid,'options.get_state')['open'], 'Start in front-end or in-race Options'
     env = {**os.environ,'SIMXR_DATA_DIR':str(args.data_dir.resolve())}
     params = StdioServerParameters(command=sys.executable,args=[str(ROOT/'mcp-server/openxr_simulator_mcp.py')],env=env)
     restore = []
@@ -129,8 +137,20 @@ async def run(args):
                         count,hidden = int(visible.sum()),int((orange(z)&visible).sum())
                         result['eyes'][eye].append({'hand':hand,'roi':rect,'visible_controller_pixels':count,'control_orange_pixels':hidden})
                         assert count>100, ('Controller did not appear above the menu',eye,hand,count)
-                        assert hidden<count*.15, ('Negative control was not occluded by the menu',eye,hand,hidden,count)
+                        if args.screen=='next-race':
+                            # Native Cup panels intentionally retain scene alpha.
+                            # Models may show dimly through them when the overlay
+                            # is disabled; require strong restoration of the same
+                            # orange silhouette instead of assuming opaque art.
+                            red_on = float(np.median(a[:,:,0][visible]))
+                            red_off = float(np.median(z[:,:,0][visible]))
+                            restored = float((a[:,:,0][visible]>z[:,:,0][visible]+50).mean())
+                            result['eyes'][eye][-1].update(median_red_on=red_on,median_red_off=red_off,restored_fraction=restored)
+                            assert red_off<red_on*.5 and restored>.8, ('Translucent-menu control did not darken controller pixels',eye,hand,red_on,red_off,restored)
+                        else:
+                            assert hidden<count*.15, ('Negative control was not occluded by the menu',eye,hand,hidden,count)
                 result['game_errors'] = game(args.pid,'game.errors')
+                assert result['game_errors']['total']==0, result['game_errors']
                 result['passed'] = True
     except BaseException as error:
         result['error'] = repr(error)
@@ -148,5 +168,6 @@ if __name__=='__main__':
     parser.add_argument('--pid',type=int,required=True)
     parser.add_argument('--data-dir',type=Path,required=True)
     parser.add_argument('--evidence',type=Path,required=True)
+    parser.add_argument('--screen',choices=('options','next-race'),default='options',help='Require the named actual UI context before moving controllers')
     parser.add_argument('--gpu-capture',type=Path,help='Optional RenderDoc capture prefix; launch with injection')
     asyncio.run(run(parser.parse_args()))
