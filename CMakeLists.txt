@@ -264,6 +264,9 @@ if(SIMXR_BUILD_FRAMETIME_VIEWER)
     target_link_libraries(openxr_sim_frametime PRIVATE d3d11 dxgi d3dcompiler dwmapi)
     if(MSVC)
         target_compile_options(openxr_sim_frametime PRIVATE /utf-8)
+        # Static CRT, like the runtime DLL: the viewer ships beside it in the release
+        # package and must start on a machine without the Visual C++ redistributable.
+        set_property(TARGET openxr_sim_frametime PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 endif()
 
