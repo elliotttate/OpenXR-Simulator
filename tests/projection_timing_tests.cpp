@@ -1,8 +1,15 @@
 #include "projection_timing.h"
 
+// These checks must also run in the Release configuration used for the DLL.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <thread>
 
 namespace {
 
@@ -10,6 +17,58 @@ using Tracker = perf::ProjectionTimingTracker;
 
 bool Near(double actual, double expected, double tolerance) {
     return std::abs(actual - expected) <= tolerance;
+}
+
+void ConcurrentTitleSnapshots() {
+    Tracker tracker;
+    std::atomic<bool> start{false};
+    std::atomic<int> ready{0};
+    std::atomic<int> failures{0};
+    std::atomic<int> populated{0};
+    constexpr auto frame = std::chrono::milliseconds(10);
+    const auto epoch = Tracker::Clock::time_point{};
+    tracker.Observe(true, epoch);
+    tracker.Observe(true, epoch + frame);
+    // Publish time separately: Snapshot may see an earlier time than the newest
+    // sample, just as a caller can be descheduled between reading its clock and
+    // entering Snapshot. The copied fields must nevertheless remain consistent.
+    std::atomic<int64_t> nowMs{10};
+    auto reader = [&] {
+        ++ready;
+        while (!start.load()) std::this_thread::yield();
+        for (int i = 0; i < 20000; ++i) {
+            const auto now = epoch + std::chrono::milliseconds(nowMs.load());
+            const auto s = tracker.Snapshot(now);
+            tracker.ShouldRefreshTitle(now);
+            if (s.sampleCount > 240) ++failures;
+            if (s.active && s.sampleCount) {
+                ++populated;
+                if (!Near(s.fps, 100.0, 0.0001) ||
+                    !Near(s.latestFrameMs, 10.0, 0.0001) ||
+                    !Near(s.p50FrameMs, 10.0, 0.0001) ||
+                    !Near(s.p95FrameMs, 10.0, 0.0001)) ++failures;
+            }
+        }
+    };
+    std::thread readers[] = {std::thread(reader), std::thread(reader), std::thread(reader)};
+    while (ready.load() != 3) std::this_thread::yield();
+    start.store(true);
+    int64_t ms = 10;
+    for (int i = 0; i < 60000; ++i) {
+        if (i % 500 == 499) {
+            ms += 600;
+            tracker.Observe(false, epoch + std::chrono::milliseconds(ms));
+            tracker.Observe(true, epoch + std::chrono::milliseconds(ms));
+        }
+        ms += 10;
+        tracker.Observe(true, epoch + std::chrono::milliseconds(ms));
+        nowMs.store(ms);
+        tracker.ShouldRefreshTitle(epoch + std::chrono::milliseconds(ms));
+    }
+    for (auto& thread : readers) thread.join();
+    assert(populated.load() > 0);
+    assert(failures.load() == 0);
+    assert(Near(tracker.Snapshot(epoch + std::chrono::milliseconds(ms)).fps, 100.0, 0.0001));
 }
 
 } // namespace
@@ -61,6 +120,7 @@ int main() {
     assert(!stats.active);
     assert(stats.sampleCount == 0);
 
-    std::cout << "projection timing tests passed\n";
+    ConcurrentTitleSnapshots();
+    std::cout << "projection timing tests passed, including concurrent title snapshots\n";
     return 0;
 }

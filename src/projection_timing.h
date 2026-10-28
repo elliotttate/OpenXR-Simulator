@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <deque>
+#include <mutex>
 #include <vector>
 
 namespace perf {
@@ -26,15 +27,16 @@ public:
     using Clock = std::chrono::steady_clock;
 
     void Observe(bool hasStereoProjection, Clock::time_point now) {
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (!hasStereoProjection) {
             if (m_hasLastProjection && now - m_lastProjection > kInactiveGap) {
-                Reset();
+                ResetLocked();
             }
             return;
         }
 
         if (!m_hasLastProjection || now - m_lastProjection > kInactiveGap) {
-            Reset();
+            ResetLocked();
             m_hasLastProjection = true;
             m_lastProjection = now;
             return;
@@ -56,15 +58,20 @@ public:
 
     ProjectionTimingSnapshot Snapshot(Clock::time_point now) const {
         ProjectionTimingSnapshot result;
-        result.active = m_hasLastProjection &&
-            now - m_lastProjection <= kInactiveGap;
-        result.sampleCount = m_frameTimes.size();
-        if (!result.active || m_frameTimes.empty()) return result;
-
-        result.fps = 1000.0 * (double)m_frameTimes.size() / m_sumFrameMs;
-        result.latestFrameMs = m_latestFrameMs;
-
-        std::vector<double> sorted(m_frameTimes.begin(), m_frameTimes.end());
+        std::vector<double> sorted;
+        {
+            // The window can request a title refresh while the XR caller adds
+            // or clears samples. Copy one consistent snapshot, then release
+            // the lock before percentile sorting or any window API call.
+            std::lock_guard<std::mutex> lock(m_mutex);
+            result.active = m_hasLastProjection &&
+                now - m_lastProjection <= kInactiveGap;
+            result.sampleCount = m_frameTimes.size();
+            if (!result.active || m_frameTimes.empty()) return result;
+            result.fps = 1000.0 * (double)m_frameTimes.size() / m_sumFrameMs;
+            result.latestFrameMs = m_latestFrameMs;
+            sorted.assign(m_frameTimes.begin(), m_frameTimes.end());
+        }
         std::sort(sorted.begin(), sorted.end());
         result.p50FrameMs = Percentile(sorted, 0.50);
         result.p95FrameMs = Percentile(sorted, 0.95);
@@ -72,6 +79,7 @@ public:
     }
 
     bool ShouldRefreshTitle(Clock::time_point now) {
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_hasTitleUpdate ||
             now - m_lastTitleUpdate >= std::chrono::milliseconds(250)) {
             m_hasTitleUpdate = true;
@@ -91,13 +99,14 @@ private:
         return sorted[(std::min)(index, sorted.size() - 1)];
     }
 
-    void Reset() {
+    void ResetLocked() {
         m_frameTimes.clear();
         m_sumFrameMs = 0.0;
         m_latestFrameMs = 0.0;
         m_hasLastProjection = false;
     }
 
+    mutable std::mutex m_mutex;
     std::deque<double> m_frameTimes;
     double m_sumFrameMs = 0.0;
     double m_latestFrameMs = 0.0;
