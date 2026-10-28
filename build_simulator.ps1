@@ -111,6 +111,9 @@ function Install-Artifact {
 }
 
 Install-Artifact (Join-Path $root 'bin\openxr_simulator.dll') $InstallTo
+# Tools > Frame Timing (F4) starts the viewer from beside the DLL.
+$viewer = Join-Path $root 'bin\openxr_sim_frametime.exe'
+if (Test-Path $viewer) { Install-Artifact $viewer $InstallTo }
 Install-Artifact (Join-Path $root 'activate_simulator.ps1') $InstallTo
 Install-Artifact (Join-Path $root 'deactivate_simulator.ps1') $InstallTo
 

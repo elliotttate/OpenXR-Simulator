@@ -65,6 +65,7 @@ enum MenuCommand {
     ID_TOOLS_SCREENSHOT = 1401,
     ID_TOOLS_RESET_VIEW = 1402,
     ID_TOOLS_TOGGLE_STATS = 1403,
+    ID_TOOLS_FRAME_TIMING = 1404,
     ID_TOOLS_GPU_TIMING = 1405,
 
     // Help
@@ -191,6 +192,9 @@ inline UIState g_uiState;
 // outside the loop (a menu toggle, say) can keep the FPS field rather than
 // blanking it until the next tick.
 inline int g_lastFps = 0;
+
+// Tools > Frame Timing (F4). Set by the runtime, which knows where the viewer lives.
+inline void (*g_openFrameTiming)() = nullptr;
 
 // Tools > GPU Timing: GPU timestamps around each frame on the app's queue, for the
 // frame timeline. Saved with the settings; the runtime reads it as each frame
@@ -1013,6 +1017,7 @@ inline HMENU CreateAppMenu() {
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_RESET_VIEW, L"&Reset View\tHome");
     AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_TOGGLE_STATS, L"Show &Statistics\tF3");
+    AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_FRAME_TIMING, L"&Frame Timing...\tF4");
     AppendMenuW(toolsMenu, MF_STRING, ID_TOOLS_GPU_TIMING,
                 GpuTimingForced() >= 0 ? L"&GPU Timing (set by OPENXR_SIM_GPU_TIMING)" : L"&GPU Timing");
     AppendMenuW(toolsMenu, MF_SEPARATOR, 0, nullptr);
@@ -1196,6 +1201,7 @@ inline void ShowControlsDialog(HWND parent) {
         L"Other:\n"
         L"  F12 - Screenshot\n"
         L"  F3 - Toggle stats\n"
+        L"  F4 - Frame timing window (every frame, hitch and late frame)\n"
         L"  Home - Reset view (head pose, zoom and pan)";
 
     MessageBoxW(parent, helpText, L"Controls", MB_OK | MB_ICONINFORMATION);
@@ -1511,6 +1517,9 @@ inline bool HandleMenuCommand(HWND hwnd, WPARAM wParam,
             if (menuT) UpdateMenuState(menuT);
             return true;
         }
+        case ID_TOOLS_FRAME_TIMING:
+            if (g_openFrameTiming) g_openFrameTiming();
+            return true;
         case ID_TOOLS_GPU_TIMING: {
             if (GpuTimingForced() < 0) g_gpuTiming = !g_gpuTiming;
             SaveSettings();
@@ -1644,6 +1653,8 @@ inline bool HandleKeyboardShortcut(HWND hwnd, WPARAM vk,
             return true;
         case VK_F3:
             return HandleMenuCommand(hwnd, ID_TOOLS_TOGGLE_STATS, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
+        case VK_F4:
+            return HandleMenuCommand(hwnd, ID_TOOLS_FRAME_TIMING, resizeCallback, screenshotCallback, resetViewCallback, settingsChangedCallback);
         case VK_F12:
             if (screenshotCallback) screenshotCallback();
             return true;

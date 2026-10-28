@@ -3517,6 +3517,67 @@ static void PublishSessionInfo() {
     g_frameTimeline.SetSessionInfo(json);
 }
 
+// Tools > Frame Timing (F4). The viewer is a process of its own, so watching
+// costs the app no thread, lock or swapchain and survives the app hanging. It
+// lives beside this DLL - or beside the file a symlinked install points at -
+// unless OPENXR_SIM_FRAMETIME_VIEWER names it. A viewer already watching this
+// process comes forward instead of opening twice.
+static void OpenFrameTimingViewer() {
+    if (!g_frameTimeline.Enabled()) {
+        Log("[SimXR] frame timing: the frame timeline is off (OPENXR_SIM_FRAME_TIMELINE=0)");
+        return;
+    }
+    std::vector<std::wstring> candidates;
+    wchar_t overridePath[MAX_PATH]{};
+    const DWORD overrideLength = GetEnvironmentVariableW(L"OPENXR_SIM_FRAMETIME_VIEWER", overridePath, MAX_PATH);
+    if (overrideLength && overrideLength < MAX_PATH) candidates.push_back(overridePath);
+    HMODULE self = nullptr;
+    wchar_t modulePath[MAX_PATH]{};
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&OpenFrameTimingViewer), &self) &&
+        GetModuleFileNameW(self, modulePath, MAX_PATH)) {
+        auto besideFile = [&](std::wstring path) {
+            const size_t slash = path.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) candidates.push_back(path.substr(0, slash + 1) + L"openxr_sim_frametime.exe");
+        };
+        besideFile(modulePath);
+        HANDLE file = CreateFileW(modulePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            wchar_t finalPath[MAX_PATH]{};
+            const DWORD length = GetFinalPathNameByHandleW(file, finalPath, MAX_PATH, FILE_NAME_NORMALIZED);
+            CloseHandle(file);
+            if (length && length < MAX_PATH) {
+                std::wstring resolved = finalPath;
+                if (resolved.rfind(L"\\\\?\\", 0) == 0) resolved = resolved.substr(4);
+                besideFile(resolved);
+            }
+        }
+    }
+    for (const std::wstring& exe : candidates) {
+        if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        std::wstring commandLine = L"\"" + exe + L"\" --pid " + std::to_wstring(GetCurrentProcessId());
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        // Out of the app's job where allowed, so a game that exits (or crashes)
+        // does not take the viewer and its last records with it.
+        BOOL started = CreateProcessW(exe.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
+                                      CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr, &startup, &process);
+        if (!started) {
+            started = CreateProcessW(exe.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                                     &startup, &process);
+        }
+        if (started) {
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            return;
+        }
+        Logf("[SimXR] frame timing: could not start %ls (error %lu)", exe.c_str(), GetLastError());
+        return;
+    }
+    Log("[SimXR] frame timing: openxr_sim_frametime.exe not found beside the runtime DLL");
+}
+
 static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* createInfo, XrInstance* instance) {
     if (!createInfo || !instance || createInfo->type != XR_TYPE_INSTANCE_CREATE_INFO ||
         createInfo->createFlags != 0) {
@@ -3602,6 +3663,7 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
     }
     g_frameTimeline.SetApplicationName(appName);
     g_frameTimeline.Marker(perf::timeline::MarkerKind::Instance, 0, 0, appName);
+    ui::g_openFrameTiming = OpenFrameTimingViewer;
     g_sessionInfoDirty = true;
 
     rt::g_instance.handle = (XrInstance)1;
