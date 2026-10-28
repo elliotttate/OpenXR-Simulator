@@ -687,7 +687,12 @@ class Atlas:
         snapshot = {"menu": await self.query("menu.get_state"), "targets": await self.query("vr.targets"),
                     "message": await self.query("ui.get_message_box")}
         root = "msgbox" if snapshot["message"].get("open") else "menu"
-        snapshot["nodes"] = (await self.query("hud.rects", {"root": root, "max_depth": 48}))["nodes"]
+        node_request={"root":root,"max_depth":48}
+        if getattr(self.args,"button_audit",False):node_request["presentation"]=True
+        snapshot["nodes"] = (await self.query("hud.rects",node_request))["nodes"]
+        if getattr(self.args,"button_audit",False):
+            from flatout_button_audit import inspect
+            snapshot["button_audit"]=await inspect(snapshot,self.query,self.args.fox_root)
         expected_livery=(self.active_case.get("expand")=="livery" or "E_LIVERY" in self.active_case.get("source_enums",[]))
         known_customization=(self.active_case.get("id")=="customization" or "E_CUSTOMIZATION" in self.active_case.get("source_enums",[]))
         if snapshot["menu"].get("current_menu")=="SKINS" and (expected_livery or not known_customization):
@@ -711,6 +716,8 @@ class Atlas:
         return snapshot
 
     async def capture(self, title, kind="base", variant=None, view=None):
+        if getattr(self.args,"ray_presentation",False) and not self.args.current and not view and self.active_case.get("expand")!="livery":
+            await self.prepare_ray_presentation()
         snapshot = await self.observe()
         if view and not head_pose_matches(livery_tracking_state(snapshot["livery"]["vr"]["frame"]),view["head_pose"]):
             raise CaptureMismatch("Native livery frame no longer matches the acknowledged glance")
@@ -756,6 +763,32 @@ class Atlas:
         print(f"[{len(self.report['states']):03}] {self.active_case['id']}: {title}" + (" (deduplicated)" if state.get("duplicate_of") else ""), flush=True)
         write_report(self.output, self.report)
         return snapshot
+
+    async def prepare_ray_presentation(self):
+        """Return from native keyboard staging with actual wrist movement.
+
+        No click is sent. Two separated blank points ensure the last parked
+        wrist cannot remain below the deliberate-motion threshold. Capture the
+        resulting native ray layout, rather than its controller fallback.
+        """
+        from flatout_livery_e2e import screenshot_pixel,ui_surface
+        from flatout_ray_offset import native_pointer_offset
+        native=await self.query("vr.targets");frame=native.get("vr_frame")
+        if not frame:return
+        before=native["clicks"]
+        cap,_=await self.tool("capture_screenshot",{"eye":"left","max_width":1280,"timeout":30})
+        self.capture_cache=cap
+        calibration=native_pointer_offset(await self.query("vr.get_state"),self.args.hand) or RAY_OFFSET
+        for x,y in ((160,120),(1760,120)):
+            state={"vr":{"frame":frame}};px,py=screenshot_pixel(state,cap,x,y)
+            args={"capture_id":cap["capture_id"],"hand":self.args.hand,"origin_mode":"hand",
+                  "surface":ui_surface(state,x,y),"x":float(px),"y":float(py),"ray_offset":calibration,
+                  "dwell_frames":90,"timeout":30}
+            result,_=await self.tool("hover_ui_at",args)
+            if result.get("status")!="input_delivered":raise RuntimeError(result)
+            self.owned_pointers[self.args.hand]=cap["capture_id"]
+        await asyncio.sleep(self.args.settle)
+        if (await self.query("vr.targets"))["clicks"]!=before:raise RuntimeError("Hover-only ray preparation activated a control")
 
     async def capture_comfort_review(self, capture, snapshot, state):
         folder=self.output/"comfort";folder.mkdir(exist_ok=True)
@@ -1086,9 +1119,16 @@ class Atlas:
             finally:
                 await self.release_owned_pointers()
 
-    async def pages(self, title, target, max_pages=64):
+    async def pages(self, title, target, max_pages=64, sample_only=False):
         seen = set()
         for page in range(max_pages):
+            if self.active_case.get("expand")=="leaderboard":
+                deadline=time.monotonic()+20
+                while (await self.query("leaderboard.get_state"))["busy"]:
+                    if time.monotonic()>deadline:raise UnknownModal("Owned leaderboard page read did not settle")
+                    await asyncio.sleep(.1)
+                if (await self.query("ui.get_message_box")).get("open"):
+                    raise UnknownModal("Leaderboard page left a real service dialog; no confirmation was sent")
             snapshot = await self.capture(title + " — page " + str(page+1), "page")
             sig = state_signature(snapshot)
             if sig in seen:
@@ -1097,6 +1137,9 @@ class Atlas:
             await self.variants(title + " — page " + str(page+1))
             targets = snapshot["targets"]["targets"]
             if not any(t["name"] == target and t.get("enabled",True) for t in targets):
+                return
+            if sample_only and page==max_pages-1:
+                self.active_case.setdefault("fixture_checks",[]).append({"sampled_pages":max_pages,"more_pages_available":True})
                 return
             await self.ray(target)
         raise RuntimeError("Pagination exceeded explicit bound")
@@ -1361,6 +1404,15 @@ class Atlas:
             await asyncio.sleep(.08)
 
     async def leaderboard(self):
+        if getattr(self.args,"ray_presentation",False):
+            await self.prepare_ray_presentation()
+            # The preceding all-event pass can retain page fourteen, whose
+            # locked events cannot open a board. Rewind through real UI input.
+            for _ in range(64):
+                targets=(await self.query("vr.targets"))["targets"]
+                if not any(t["name"]=="challenge.page.prev" and t.get("enabled",True) for t in targets):break
+                await self.ray("challenge.page.prev")
+            else:raise RuntimeError("Challenge rewind exceeded its explicit bound")
         native=await self.query("vr.targets")
         events=sorted((t for t in native["targets"] if re.fullmatch(r"challenge\.event\.\d+",t["name"]) and t.get("enabled",True)),
                       key=lambda t:int(t["name"].split(".")[-1]))
@@ -1398,7 +1450,9 @@ class Atlas:
             reason="Leaderboard service read failed; network fixture unavailable (native error "+str(read["read_error"])+")"
             await self.capture("Leaderboard — read unavailable","blocked",{"reason":reason,"native_read":read})
             raise CaseBlocked(reason)
-        await self.pages("Leaderboard","page.down",64)
+        if hasattr(self.args,"leaderboard_pages"):
+            await self.pages("Leaderboard","page.down",self.args.leaderboard_pages,sample_only=True)
+        else:await self.pages("Leaderboard","page.down",64)
 
     async def run(self, manifest):
         try:
@@ -1530,6 +1584,9 @@ def cli():
     p.add_argument("--hover",choices=("none","sample","all"),default="none")
     p.add_argument("--items",choices=("pages","all"),default="pages",help="Fast default samples carousel pages; all captures every selection")
     p.add_argument("--comfort-guides",action="store_true",help="Analyze each fresh capture with read-only MCP comfort guides; save separate PNG/JSON without layout-only dedup")
+    p.add_argument("--button-audit",action="store_true",help="Measure native button glyph/icon centering and safe padding alongside each captured menu")
+    p.add_argument("--ray-presentation",action="store_true",help="Use actual hover-only wrist movement after keyboard staging so captures show the ray layout")
+    p.add_argument("--leaderboard-pages",type=int,choices=range(1,65),default=3,help="Sample this many settled real leaderboard pages; record remaining pages without querying every player")
     p.add_argument("--livery-overlays-only",action="store_true",help="Narrow livery pass: initial side panels, keyboard, Workshop, verified clean close; omit tab/view/category galleries")
     p.add_argument("--dialog-templates",action=argparse.BooleanOptionalAction,default=True)
     p.add_argument("--eye",choices=("left","right","both"),default="both")
