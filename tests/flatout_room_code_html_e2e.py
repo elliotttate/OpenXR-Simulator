@@ -82,7 +82,8 @@ class CodeTest(Frontend):
   _,_,aim=await self.hover('code.key.1')
   await self.tool('scroll_ui_at',{**aim,'hand':'left','stick':[0,-1],'hold_frames':8,'dwell_frames':2,'command_id':uuid.uuid4().hex},'keypad-real-stick-navigation')
   assert (await self.state())['code']=='' and (await self.state())['keypad_open']
-  nodes=await self.nodes();gold=next(n['color'] for n in nodes if n['effective_visible'] and n['path'].endswith('/RoomCodeHeading'))
+  # The heading is white with a gold last word, so compare with the shared accent (VRMenuPalette::Accent).
+  nodes=await self.nodes();gold={'r':1.,'g':.659,'b':0.}
   focus=next(n for n in nodes if n['effective_visible'] and n['path'].endswith('/RoomCodeKey4/RoomCodeKeyLabel'))
   assert all(abs(focus['color'][c]-gold[c])<.01 for c in ('r','g','b')),'Vertical stick did not move keypad focus from 1 to 4'
   await self.hover('code.key.9');assert (await self.state())['code']==''
