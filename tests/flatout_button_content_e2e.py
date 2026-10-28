@@ -30,7 +30,12 @@ async def run(a):
                         nodes=(await t.query('hud.rects',{'root':'menu','max_depth':48,'presentation':True}))['nodes']
                         audit=await inspect({'nodes':nodes,'message':message},t.query,a.fox_root)
                         assert audit['checks'] and audit['passed'],audit
-                        before=(await t.query('vr.targets'))['clicks'];await t.hover(target)
+                        available=(await t.query('vr.targets'))['targets'];primary=next((n['name'] for n in available if n['name'].startswith('helper.Validate.') and n.get('enabled',True)),None)
+                        before=(await t.query('vr.targets'))['clicks']
+                        if primary:
+                            await t.hover(primary);raised=await t.tool('capture_screenshot',{'eye':'both','max_width':4096},hand+'-'+route+'-primary-hover');t.last_capture=raised;assert_hover_lift(raised)
+                            assert (await t.query('vr.targets'))['clicks']==before
+                        await t.hover(target)
                         capture=await t.tool('capture_screenshot',{'eye':'both','max_width':4096},hand+'-'+route+'-hover');t.last_capture=capture
                         depth=assert_hover_lift(capture);assert (await t.query('vr.targets'))['clicks']==before
                         await t.click(target)

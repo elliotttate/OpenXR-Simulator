@@ -16,7 +16,8 @@ OPTIONS_ACTIONS={'OptionsBack','OptionsReset','OptionsDone','OptionsStep'}
 def issues(record,icon=None):
     ink=record['ink'];button=record['button'];errors=[]
     if max(abs(c) for c in record['center_error'])>1.5:errors.append('content group not centered')
-    if abs((ink[1]+ink[3]-button[1]-button[3])*.5)>1.5:errors.append('visible text not vertically centered')
+    expected_y=record.get('expected_center',[0,(button[1]+button[3])*.5])[1]
+    if abs((ink[1]+ink[3])*.5-expected_y)>1.5:errors.append('visible text not vertically centered')
     if icon and not 8<=ink[0]-icon['rect'][2]<=24:errors.append('icon/caption gap outside 8–24 canvas px')
     if min(record['padding'])<12:errors.append('less than 12 canvas px safe padding')
     if '/FO_' not in record['font'].upper():errors.append('original game font missing')
@@ -87,8 +88,9 @@ async def inspect(snapshot,query,fox_root):
         icon=next(iter(icons),None)
         group=ink[:] if icon is None else [min(ink[0],icon['rect'][0]),min(ink[1],icon['rect'][1]),max(ink[2],icon['rect'][2]),max(ink[3],icon['rect'][3])]
         padding=[group[0]-pr[0],group[1]-pr[1],pr[2]-group[2],pr[3]-group[3]]
-        center=[(group[0]+group[2]-pr[0]-pr[2])*.5,(group[1]+group[3]-pr[1]-pr[3])*.5]
-        record={'path':path,'text':node['text'],'button':pr,'ink':ink,'content':group,'padding':padding,'center_error':center,'font':resource,'node_index':node.get('node_index'),'parent_index':node.get('parent_index')}
+        relative=binding.get('content_center',[.5,.5]);expected=[pr[0]+(pr[2]-pr[0])*relative[0],pr[1]+(pr[3]-pr[1])*relative[1]]
+        center=[(group[0]+group[2])*.5-expected[0],(group[1]+group[3])*.5-expected[1]]
+        record={'path':path,'text':node['text'],'button':pr,'ink':ink,'content':group,'padding':padding,'center_error':center,'expected_center':expected,'font':resource,'node_index':node.get('node_index'),'parent_index':node.get('parent_index')}
         failure=issues(record,icon);record['passed']=not failure
         result['checks'].append(record)
         if failure:result['failures'].append({**record,'issues':failure})
