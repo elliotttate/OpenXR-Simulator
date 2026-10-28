@@ -74,6 +74,8 @@ PROJ_LOG_FILE            = SIMULATOR_DIR / "projection_log.json"
 
 import math as _math
 
+import frame_timing
+
 # Create MCP server
 server = Server("openxr-simulator")
 
@@ -917,6 +919,10 @@ async def list_tools() -> list[Tool]:
                 }
             }
         ),
+        # Frame timing: live summaries, captures, A/B comparisons (frame_timing.py).
+        *[Tool(name=tool_name, description=description,
+               inputSchema={"type": "object", "properties": properties, "required": required})
+          for tool_name, description, properties, required in frame_timing.TOOL_SPECS],
     ]
 
 
@@ -1473,6 +1479,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             return [TextContent(type="text", text=f"Stereo capture failed: {error}")]
         result = _validate_stereo_from_screenshot(screenshot_data)
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    elif name.startswith("perf_"):
+        result = frame_timing.dispatch(name, arguments)
+        if result is not None:
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
     else:
         return [TextContent(

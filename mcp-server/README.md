@@ -479,6 +479,37 @@ Parameters:
 - `roll_amp_deg`: default: 15.0
 - `freq_hz`: default: 0.25
 
+### Frame timing (`perf_*`)
+Careful frame-time measurement of a running app, using the same analysis as the
+frame-timing viewer (`bin\openxr_sim_frametime.exe`, Tools > Frame Timing or F4 in the
+preview; these tools run it headless, and `OPENXR_SIM_FRAMETIME_VIEWER` names it if it
+lives elsewhere). Frame time is what each frame really took, pacing removed; "over budget"
+frames would have missed a refresh on a headset, and "hitches" cost at least
+`hitch_budgets` refresh budgets.
+
+The runtime also times each frame's GPU work on the app's own queue, from
+`xrBeginFrame` to `xrEndFrame` (D3D12, Vulkan and OpenGL on the CPU clock, D3D11 as
+durations only). Tools > GPU Timing in the preview window switches it on and off live and
+is saved with the other settings; `OPENXR_SIM_GPU_TIMING=0` or `=1` overrides the menu,
+which then greys out. Summaries carry a `gpu` block and per-frame `cpu_ms`, `gpu_ms` and
+`gpu_wait_ms`; a frame's time is the larger of its CPU and GPU time, and GPU-bound frames
+are blamed on the GPU. Time the CPU spends waiting for the previous frame's GPU work is
+charged to that frame, so a GPU spike counts once rather than again on the frame that
+waited it out.
+
+- `perf_sessions` - apps running the simulator that publish a frame timeline
+- `perf_live_summary` - the last `seconds` of a running app: fps, percentiles, 1% low,
+  late frames and hitches with their likely cause, worst frames, recent events
+- `perf_start_capture` / `perf_stop_capture` - record every frame to a `.xrft` capture;
+  stopping returns the full analysis
+- `perf_add_marker` - name a moment ("enter combat") in the timeline and in captures
+- `perf_list_captures`, `perf_analyze_capture` - saved captures, re-scored at any `target_hz`
+- `perf_compare_captures` - A/B two captures at the same refresh rate: each key metric's
+  change, and which improved or regressed
+
+`scripts\verify_frame_timing.py` checks the whole chain against probe runs with a known
+injected CPU and GPU load.
+
 ## File Locations
 
 The MCP server and runtime exchange files in `%LOCALAPPDATA%\OpenXR-Simulator\`.
@@ -492,6 +523,8 @@ folder, for example to run instances side by side.
 - `ui_flicker_status.json`, `ui_flicker_capture_request.json`, `ui_flicker_incidents\` - UI-only flicker status, forced captures and evidence
 - `head_pose_command.json`, `fov_command.json`, `ipd_command.json`, `headset_profile_command.json`, `anaglyph_command.json`, `pose_sweep_command.json` - Control commands the runtime consumes
 - `projection_log_dump_request` / `projection_log.json` - Projection log request and result
+- `perf_marker_command.json` - Frame-timeline marker request from `perf_add_marker`
+- `captures\` - Frame-timing captures (`.xrft`), always under `%LOCALAPPDATA%\OpenXR-Simulator`
 
 - `screenshot.<capture_id>.bmp` / `screenshot_status.<capture_id>.json` - Correlated pixels and frame metadata
 - `ui_pointer_command.json` / `ui_pointer_result.<command_id>.json` - Atomic interaction requests and delivery acknowledgments

@@ -411,6 +411,72 @@ int main() {
     int sleepMs = 0;
     if (const char* env = getenv("XR_PROBE_SLEEP_MS")) sleepMs = atoi(env);
     const bool projectionOnly = EnvOn("XR_PROBE_PROJECTION_ONLY");
+    // Known-shape load for checking frame-time tools against ground truth:
+    // XR_PROBE_WORK_MS busy-spins that long in every frame, XR_PROBE_JITTER_MS
+    // adds up to that much more at random, and every XR_PROBE_HITCH_EVERY-th
+    // frame also spins XR_PROBE_HITCH_MS more.
+    double workMs = 0.0, jitterMs = 0.0, hitchMs = 0.0;
+    int hitchEvery = 0;
+    if (const char* env = getenv("XR_PROBE_WORK_MS")) workMs = atof(env);
+    if (const char* env = getenv("XR_PROBE_JITTER_MS")) jitterMs = atof(env);
+    if (const char* env = getenv("XR_PROBE_HITCH_MS")) hitchMs = atof(env);
+    if (const char* env = getenv("XR_PROBE_HITCH_EVERY")) hitchEvery = atoi(env);
+    // XR_PROBE_GPU_COPIES queues that many 64 MB buffer copies on the app's queue
+    // every frame, just before xrEndFrame and never waited for: a GPU-bound app.
+    // Every XR_PROBE_HITCH_EVERY-th frame queues XR_PROBE_GPU_HITCH_COPIES more.
+    int gpuCopies = 0, gpuHitchCopies = 0;
+    if (const char* env = getenv("XR_PROBE_GPU_COPIES")) gpuCopies = atoi(env);
+    if (const char* env = getenv("XR_PROBE_GPU_HITCH_COPIES")) gpuHitchCopies = atoi(env);
+    struct GpuLoad { ComPtr<ID3D12CommandAllocator> alloc; ComPtr<ID3D12GraphicsCommandList> list; UINT64 lastRun = 0; };
+    GpuLoad gpuLoad, gpuHitchLoad;
+    ComPtr<ID3D12Resource> copyA, copyB;
+    ComPtr<ID3D12Fence> loadFence;
+    UINT64 loadFenceValue = 0;
+    if (gpuCopies > 0 || gpuHitchCopies > 0) {
+        constexpr UINT64 kCopyBytes = 64ull << 20;
+        D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = kCopyBytes;
+        bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        // Pre-recorded once; A to B every time, so the implicit COMMON promotions hold.
+        auto record = [&](GpuLoad& load, int copies) {
+            if (copies <= 0) return true;
+            if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&load.alloc))) ||
+                FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, load.alloc.Get(), nullptr, IID_PPV_ARGS(&load.list)))) return false;
+            for (int i = 0; i < copies; ++i) load.list->CopyBufferRegion(copyB.Get(), 0, copyA.Get(), 0, kCopyBytes);
+            return SUCCEEDED(load.list->Close());
+        };
+        const bool made =
+            SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&copyA))) &&
+            SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&copyB))) &&
+            SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&loadFence))) &&
+            record(gpuLoad, gpuCopies) && record(gpuHitchLoad, gpuHitchCopies > 0 ? gpuCopies + gpuHitchCopies : 0);
+        if (!made) { printf("  [FAIL] could not set up the XR_PROBE_GPU_COPIES load\n"); g_fail++; gpuLoad = {}; gpuHitchLoad = {}; }
+    }
+    // A pre-recorded list must not run twice at once, so wait out its previous
+    // run (normally long done: the next frame's rendering queues behind it).
+    auto queueLoad = [&](GpuLoad& load) {
+        if (!load.list) return;
+        if (loadFence->GetCompletedValue() < load.lastRun) {
+            loadFence->SetEventOnCompletion(load.lastRun, fenceEvent);
+            WaitForSingleObject(fenceEvent, 5000);
+        }
+        ID3D12CommandList* lists[] = { load.list.Get() };
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(loadFence.Get(), ++loadFenceValue);
+        load.lastRun = loadFenceValue;
+    };
+    LARGE_INTEGER spinFrequency;
+    QueryPerformanceFrequency(&spinFrequency);
+    auto spin = [&](double ms) {
+        LARGE_INTEGER start, now;
+        QueryPerformanceCounter(&start);
+        do QueryPerformanceCounter(&now);
+        while (double(now.QuadPart - start.QuadPart) * 1000.0 / double(spinFrequency.QuadPart) < ms);
+    };
 
     char stepLabel[128];
     snprintf(stepLabel, sizeof(stepLabel), "frame loop x %d (waitFrame/beginFrame/locateViews/acquire/release/endFrame + syncActions)", totalFrames);
@@ -433,6 +499,8 @@ int main() {
         if (XR_FAILED(r)) { fail("xrWaitFrame", r); break; }
         if (f == 0) printf("       predictedDisplayTime=%lld period=%lld shouldRender=%d\n", (long long)fs.predictedDisplayTime, (long long)fs.predictedDisplayPeriod, fs.shouldRender);
         if (fs.predictedDisplayTime <= 0) { printf("  [FAIL] predictedDisplayTime is not positive\n"); g_fail++; break; }
+        if (workMs > 0.0 || jitterMs > 0.0) spin(workMs + jitterMs * double(rand()) / double(RAND_MAX));
+        if (hitchEvery > 0 && hitchMs > 0.0 && f % hitchEvery == hitchEvery - 1) spin(hitchMs);
 
         XrFrameBeginInfo fbi = { XR_TYPE_FRAME_BEGIN_INFO };
         r = xrBeginFrame(session, &fbi);
@@ -603,6 +671,8 @@ int main() {
         if (!cycled) { printf("  [FAIL] swapchain acquire/render/release cycle failed on frame %d\n", f); g_fail++; break; }
 
         if (FAILED(device->GetDeviceRemovedReason())) { printf("  [FAIL] D3D12 device removed on frame %d (reason 0x%08X)\n", f, (unsigned)device->GetDeviceRemovedReason()); g_fail++; break; }
+        const bool gpuHitch = hitchEvery > 0 && f % hitchEvery == hitchEvery - 1 && gpuHitchLoad.list;
+        queueLoad(gpuHitch ? gpuHitchLoad : gpuLoad);
 
         XrCompositionLayerDepthInfoKHR depthInfo[2] = {};
         XrCompositionLayerProjectionView projViews[2] = {};
@@ -685,6 +755,10 @@ int main() {
         if (uiTest) fixture.Write(f);
         framesRendered++;
         if (sleepMs > 0) Sleep((DWORD)sleepMs);
+    }
+    if (loadFence && loadFence->GetCompletedValue() < loadFenceValue) {
+        loadFence->SetEventOnCompletion(loadFenceValue, fenceEvent);
+        WaitForSingleObject(fenceEvent, 5000);
     }
     printf("       rendered %d/%d frames (%d quad-only), %d of them with state==FOCUSED\n",
            framesRendered, totalFrames, quadOnlyFrames, focusedFrames);

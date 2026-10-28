@@ -1048,6 +1048,7 @@ void WorkerMain() {
                 "session_focus_command.json", "head_pose_command.json", "fov_command.json",
                 "ipd_command.json", "headset_profile_command.json", "pose_sweep_command.json",
                 "anaglyph_command.json", "burst_command.json", "controller_pose_command.json",
+                "perf_marker_command.json",
                 "projection_log_dump_request"};
             for (const char* name : names) {
                 {

@@ -9083,6 +9083,13 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     if (mcp::g_commandsDue && mcp::CheckProjLogDumpRequest()) {
         mcp::DumpProjectionLog();
     }
+    if (mcp::g_commandsDue) {
+        std::string markerText;
+        if (mcp::CheckPerfMarkerCommand(markerText)) {
+            g_frameTimeline.Marker(perf::timeline::MarkerKind::User, 0, 0, markerText.c_str());
+            mcp::WriteCommandAck("perf_marker", g_frameTimeline.Enabled());
+        }
+    }
     // Every command file has been looked at for this change notification. Any of
     // them may have changed what the timeline's session info describes.
     if (mcp::g_commandsDue) g_sessionInfoDirty = true;

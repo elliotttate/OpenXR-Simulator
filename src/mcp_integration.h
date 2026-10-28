@@ -980,6 +980,19 @@ inline ControllerPoseCommand CheckControllerPoseCommand() {
     return cmd;
 }
 
+// perf_marker_command.json: {"text": "boss fight starts"} drops a named marker
+// into the frame timeline, so a frame-timing capture shows where it happened.
+inline bool CheckPerfMarkerCommand(std::string& text) {
+    std::string p = GetSimulatorDataPath() + "\\perf_marker_command.json";
+    char buf[1024];
+    if (!ReadPendingCommand(p.c_str(), buf, sizeof(buf))) return false;
+    json::Object o(buf);
+    if (!o.valid()) return false;
+    text = o.string("text");
+    McpLogf("Perf marker command: %s", text.c_str());
+    return true;
+}
+
 // Write acknowledgment that command was processed
 inline void WriteCommandAck(const char* cmdType, bool success) {
     std::string ackPath = GetSimulatorDataPath() + "\\command_ack.json";
