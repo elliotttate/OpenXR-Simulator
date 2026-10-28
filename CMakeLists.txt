@@ -41,6 +41,7 @@ add_library(openxr_simulator SHARED
     src/flicker_detector.h
     src/json.h
     src/mcp_integration.h
+    src/frame_timeline.h
     src/projection_timing.h
     src/preview_focus.h
     src/command_epochs.h
@@ -198,6 +199,10 @@ if(BUILD_TESTING)
         target_compile_options(ui_input_polling_tests PRIVATE /utf-8)
     endif()
     add_test(NAME ui_input_polling COMMAND ui_input_polling_tests)
+    add_executable(frame_timeline_tests tests/frame_timeline_tests.cpp)
+    target_include_directories(frame_timeline_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME frame_timeline COMMAND frame_timeline_tests)
+    set_tests_properties(frame_timeline PROPERTIES TIMEOUT 60)
 endif()
 
 # Link libraries
@@ -239,6 +244,20 @@ if(WIN32)
             $<$<CONFIG:RelWithDebInfo>:/NODEFAULTLIB:MSVCRT.lib>)
     endif()
 endif()
+
+# Stamped into the frame timeline's session info, so a capture names the build
+# it came from. Taken at configure time.
+execute_process(COMMAND git rev-parse --short=10 HEAD WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE SIMXR_BUILD_ID OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git status --porcelain --untracked-files=no WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE SIMXR_TREE_CHANGES OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT SIMXR_BUILD_ID)
+    set(SIMXR_BUILD_ID unknown)
+endif()
+if(SIMXR_TREE_CHANGES)
+    string(APPEND SIMXR_BUILD_ID "-dirty")
+endif()
+target_compile_definitions(openxr_simulator PRIVATE SIMXR_BUILD_ID="${SIMXR_BUILD_ID}")
 
 # Generate OpenXR runtime manifest
 set(RUNTIME_MANIFEST_CONTENT "{

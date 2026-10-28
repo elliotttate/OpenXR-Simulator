@@ -24,6 +24,15 @@
 #include <vulkan/vulkan.h>
 
 #include "flicker_detector.h"
+#include "frame_timeline.h"
+namespace {
+// Per-frame timing feed for the frame-time viewer (shared memory, always on
+// unless OPENXR_SIM_FRAME_TIMELINE=0).
+perf::timeline::Recorder g_frameTimeline;
+// Set by anything that changes what the timeline's session info describes;
+// xrEndFrame, the timeline's one writer, republishes it.
+std::atomic<bool> g_sessionInfoDirty{true};
+}
 
 // OpenGL headers - minimal definitions for what we need
 #include <GL/gl.h>
@@ -767,6 +776,8 @@ static POINT g_panLastPos = {0, 0};
 // Inside a WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE pair: the user is dragging the window's
 // frame, and every step of it would otherwise rewrite settings.json.
 static bool g_sizingDrag = false;
+// The drag changed the client size, so its end gets one frame-timeline marker.
+static bool g_resizedDuringDrag = false;
 
 // Controller tracking state for motion controller emulation
 // Positions are relative to head position, orientation follows head by default
@@ -1662,6 +1673,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_EXITSIZEMOVE:
             rt::g_sizingDrag = false;
             ui::SaveSettings();
+            if (rt::g_resizedDuringDrag) {
+                rt::g_resizedDuringDrag = false;
+                RECT client{};
+                GetClientRect(hWnd, &client);
+                g_frameTimeline.Marker(perf::timeline::MarkerKind::WindowResize,
+                                       client.right - client.left, client.bottom - client.top);
+                g_sessionInfoDirty = true;
+            }
             return 0;
         case WM_SIZING: {
             // Fill mode accepts arbitrary window shapes and performs the up/downscale in
@@ -1798,6 +1817,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             ui::g_uiState.windowWidth = (int)cw;
             ui::g_uiState.windowHeight = (int)ch;
             if (!rt::g_sizingDrag) ui::SaveSettings();
+            if (rt::g_sizingDrag) {
+                rt::g_resizedDuringDrag = true;
+            } else {
+                g_frameTimeline.Marker(perf::timeline::MarkerKind::WindowResize, cw, ch);
+                g_sessionInfoDirty = true;
+            }
 
             // Fill mode means exactly that: keep the dimensions Windows assigned, including
             // a maximized client area, and let ComputePreviewRect cover every pixel.
@@ -1910,6 +1935,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 },
                 [](int cmd) { rt::HandleUiSettingsCommand(cmd); }
             )) {
+                g_frameTimeline.Marker(perf::timeline::MarkerKind::UiCommand, LOWORD(wParam), 0, "menu");
+                g_sessionInfoDirty = true;
                 rt::RefreshTitleNow(hWnd);
                 return 0;
             }
@@ -1933,6 +1960,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                     },
                     [](int cmd) { rt::HandleUiSettingsCommand(cmd); }
                 )) {
+                    g_frameTimeline.Marker(perf::timeline::MarkerKind::UiCommand, (int64_t)wParam, 1, "key");
+                    g_sessionInfoDirty = true;
                     rt::RefreshTitleNow(hWnd);
                     return 0;
                 }
@@ -3097,6 +3126,99 @@ static XrResult XRAPI_PTR xrEnumerateInstanceExtensionProperties_runtime(const c
 static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession session);
 static void resetD3D11PreviewReadbacks(rt::Session& session);
 
+#ifndef SIMXR_BUILD_ID
+#define SIMXR_BUILD_ID "unknown"
+#endif
+
+// The app's latest color swapchain, for the session info.
+static std::mutex g_appSwapchainMutex;
+static XrSwapchainCreateInfo g_appSwapchain{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+
+static std::string JsonText(const std::string& text) {
+    std::string out = "\"";
+    for (const char c : text) {
+        if (c == '"' || c == '\\') out += '\\';
+        if (static_cast<unsigned char>(c) >= 0x20) out += c;
+    }
+    return out + "\"";
+}
+
+// The adapter the simulator composites on - for D3D and OpenGL apps the app's
+// own - described once per device: enumerating adapters is not free.
+static std::string GpuJson(rt::Session& s) {
+    static const void* describedDevice = nullptr;
+    static std::string described = "null";
+    LUID luid{};
+    const void* device = nullptr;
+    if (s.d3d12Device) {
+        luid = s.d3d12Device->GetAdapterLuid();
+        device = s.d3d12Device.Get();
+    } else if (s.d3d11Device) {
+        ComPtr<IDXGIDevice> dxgiDevice;
+        ComPtr<IDXGIAdapter> adapter;
+        DXGI_ADAPTER_DESC desc{};
+        if (SUCCEEDED(s.d3d11Device.As(&dxgiDevice)) && SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) &&
+            SUCCEEDED(adapter->GetDesc(&desc))) {
+            luid = desc.AdapterLuid;
+            device = s.d3d11Device.Get();
+        }
+    }
+    if (!device) return "null";
+    if (device == describedDevice) return described;
+    describedDevice = device;
+    described = "null";
+    ComPtr<IDXGIFactory4> factory;
+    ComPtr<IDXGIAdapter1> adapter;
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))) || FAILED(adapter->GetDesc1(&desc))) {
+        return described;
+    }
+    char name[256]{};
+    WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+    char driver[48] = "unknown";
+    LARGE_INTEGER umd{};
+    if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd))) {
+        snprintf(driver, sizeof(driver), "%u.%u.%u.%u", HIWORD(umd.HighPart), LOWORD(umd.HighPart),
+                 HIWORD(umd.LowPart), LOWORD(umd.LowPart));
+    }
+    char json[512];
+    snprintf(json, sizeof(json), "{\"name\": %s, \"vendor_id\": %u, \"device_id\": %u, \"driver\": \"%s\", \"vram_mb\": %llu}",
+             JsonText(name).c_str(), desc.VendorId, desc.DeviceId, driver,
+             (unsigned long long)(desc.DedicatedVideoMemory >> 20));
+    described = json;
+    return described;
+}
+
+// What a frame-timing capture should say about the run it came from.
+static void PublishSessionInfo() {
+    rt::Session& s = rt::g_session;
+    const ui::UIState state = ui::g_uiState;
+    uint32_t renderW = 0, renderH = 0;
+    ui::GetRenderResolution(renderW, renderH);
+    XrSwapchainCreateInfo swapchain;
+    {
+        std::lock_guard<std::mutex> lock(g_appSwapchainMutex);
+        swapchain = g_appSwapchain;
+    }
+    const char* api = s.usesVulkan ? "Vulkan" : s.usesOpenGL ? "OpenGL" : s.usesD3D12 ? "D3D12" : "D3D11";
+    char mirror[32];
+    if (state.previewFps >= ui::kPreviewRateEveryFrame) snprintf(mirror, sizeof(mirror), "\"every frame\"");
+    else snprintf(mirror, sizeof(mirror), "%d", state.previewFps);
+    char json[2000];
+    snprintf(json, sizeof(json),
+             "{\"simulator\": {\"build\": %s, \"refresh_hz\": %g}, \"graphics_api\": \"%s\", \"gpu\": %s, "
+             "\"render\": {\"width_per_eye\": %u, \"height_per_eye\": %u, \"headset\": %s, \"ipd_mm\": %d}, "
+             "\"app_swapchain\": {\"width\": %u, \"height\": %u, \"format\": %lld, \"samples\": %u}, "
+             "\"preview\": {\"mirror_fps\": %s, \"client_width\": %u, \"client_height\": %u}}",
+             JsonText(SIMXR_BUILD_ID).c_str(), SimulatorRefreshHz(), api, GpuJson(s).c_str(), renderW, renderH,
+             JsonText(ui::HeadsetProfileName(state.headsetProfile)).c_str(), ui::GetIpdMillimeters(),
+             swapchain.width, swapchain.height, (long long)swapchain.format, swapchain.sampleCount, mirror,
+             state.windowWidth > 0 ? unsigned(state.windowWidth) : 0u,
+             state.windowHeight > 0 ? unsigned(state.windowHeight) : 0u);
+    g_frameTimeline.SetSessionInfo(json);
+}
+
 static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* createInfo, XrInstance* instance) {
     if (!createInfo || !instance || createInfo->type != XR_TYPE_INSTANCE_CREATE_INFO ||
         createInfo->createFlags != 0) {
@@ -3167,6 +3289,23 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
     rt::g_instance.d3d12RequirementsCalled = false;
     rt::g_instance.openglRequirementsCalled = false;
     rt::g_instance.vulkanRequirementsCalled = false;
+
+    static const bool frameTimelineWanted = []() {
+        const char* value = getenv("OPENXR_SIM_FRAME_TIMELINE");
+        return value == nullptr || atoi(value) != 0;
+    }();
+    if (frameTimelineWanted && !g_frameTimeline.Enabled()) {
+        if (g_frameTimeline.Open(SimulatorRefreshHz())) {
+            Logf("[SimXR] frame timeline: Local\\OpenXRSimulator.FrameTimeline.%lu",
+                 GetCurrentProcessId());
+        } else {
+            Logf("[SimXR] frame timeline unavailable (error %lu)", GetLastError());
+        }
+    }
+    g_frameTimeline.SetApplicationName(appName);
+    g_frameTimeline.Marker(perf::timeline::MarkerKind::Instance, 0, 0, appName);
+    g_sessionInfoDirty = true;
+
     rt::g_instance.handle = (XrInstance)1;
     *instance = rt::g_instance.handle;
     Log("[SimXR] xrCreateInstance: SUCCESS");
@@ -3784,6 +3923,17 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession session, const XrS
         }
     };
     if (!formatSupported()) return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+
+    char timelineDetail[80];
+    snprintf(timelineDetail, sizeof(timelineDetail), "format=%lld samples=%u array=%u",
+             (long long)ci->format, ci->sampleCount, ci->arraySize);
+    g_frameTimeline.Marker(perf::timeline::MarkerKind::SwapchainCreate, ci->width, ci->height, timelineDetail);
+    if (ci->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) {
+        std::lock_guard<std::mutex> lock(g_appSwapchainMutex);
+        g_appSwapchain = *ci;
+        g_appSwapchain.next = nullptr;
+        g_sessionInfoDirty = true;
+    }
 
     rt::Swapchain chain{};
 #if XR_PTR_SIZE == 8
@@ -4488,6 +4638,8 @@ namespace rt {
             case XR_SESSION_STATE_EXITING: stateName = "EXITING"; break;
         }
         Logf("[SimXR] PushState: Session %llu -> %s", (unsigned long long)s, stateName);
+        g_frameTimeline.Marker(perf::timeline::MarkerKind::SessionState, ns, 0, stateName);
+        g_sessionInfoDirty = true;
         
         XrEventDataSessionStateChanged e{XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED};
         e.session = s; e.state = ns; e.time = CurrentXrTime();
@@ -4647,6 +4799,10 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         if (XR_FAILED(result)) return result;
     }
     timing.Mark(0);
+    // From here on the call is the simulator's: the lifecycle wait above is the
+    // app's own frame ordering and counts as the app's time.
+    perf::timeline::WaitSample timelineWait;
+    g_frameTimeline.WaitEnter(timelineWait);
     if (!rt::g_session.hwnd) {
         ensurePreviewWithoutProjection(rt::g_session);
         if (rt::g_session.hwnd) {
@@ -5083,6 +5239,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
 #endif
     static HANDLE pacingTimer = CreateWaitableTimerExW(nullptr, nullptr,
         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    g_frameTimeline.WaitPace(timelineWait);
     for (;;) {
         LARGE_INTEGER now; QueryPerformanceCounter(&now);
         const double remainingSec = (nextTick - (double)now.QuadPart) / (double)freq.QuadPart;
@@ -5099,18 +5256,23 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
         // than risk oversleeping a whole timer interval.
         Sleep(remainingSec > 0.002 ? 1 : 0);
     }
+    const double pacedTick = nextTick;
     nextTick += periodSec * (double)freq.QuadPart;
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     // After a stall, re-base instead of letting the app run uncapped while
     // nextTick catches up one period per call.
+    bool pacingRebased = false;
     if ((double)now.QuadPart - nextTick > periodSec * (double)freq.QuadPart) {
         nextTick = (double)now.QuadPart;
+        pacingRebased = true;
     }
     timing.Mark(6);
     // Exact integer conversion - the same math xrConvertWin32PerformanceCounterToTimeKHR
     // performs, so predicted display times and converted times agree for one instant.
     const XrTime nowTime = QpcToNs(now.QuadPart, freq.QuadPart);
     s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
+    g_frameTimeline.WaitExit(timelineWait, (uint64_t)pacedTick, (uint64_t)now.QuadPart,
+                             s->predictedDisplayTime, periodNs, pacingRebased);
     return XR_SUCCESS;
 }
 static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession session, const XrFrameBeginInfo* info) {
@@ -5122,7 +5284,10 @@ static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession session, const XrFrameB
         if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
         result = rt::g_session.frameLifecycle.Begin();
     }
-    if (XR_SUCCEEDED(result)) rt::g_session.frameCondition.notify_all();
+    if (XR_SUCCEEDED(result)) {
+        g_frameTimeline.Begin();
+        rt::g_session.frameCondition.notify_all();
+    }
     return result;
 }
 
@@ -8330,9 +8495,16 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         if (count <= 5) {
             Logf("[SimXR] xrEndFrame: BLOCKED concurrent/reentrant call #%d", count);
         }
+        // Thinned so a reentry storm cannot push every other marker out of the ring.
+        if (count <= 64 || count % 1024 == 0) {
+            g_frameTimeline.Marker(perf::timeline::MarkerKind::EndFrameReentry, count);
+        }
         return XR_SUCCESS;
     }
 
+    // The app's submission moment, ahead of any wait for the control lock.
+    perf::timeline::FrameRecord timelineFrame{};
+    g_frameTimeline.EndEnter(timelineFrame, perf::timeline::Qpc());
     LARGE_INTEGER endFrameStart{};
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     QueryPerformanceCounter(&endFrameStart);
@@ -8380,6 +8552,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
                 if (bc.pose.hasRoll) rt::g_headRoll = bc.pose.roll;
             }
             mcp::BurstStart(bc.frames);
+            g_frameTimeline.Marker(perf::timeline::MarkerKind::BurstStart, bc.frames);
             mcp::WriteCommandAck("burst", true);
         }
     }
@@ -8392,6 +8565,10 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     // neither is allowed to inherit the user's Mirror Rate cap.
     g_previewDueThisFrame = ui::PreviewFrameDue() || mcp::g_screenshotRequested ||
                             mcp::g_burstActive || flicker::WantsPreviewReadback();
+    // Serving a screenshot clears its request and a burst can end within this frame,
+    // so latch both for the timeline now.
+    const bool screenshotThisFrame = mcp::g_screenshotRequested;
+    const bool burstThisFrame = mcp::g_burstActive;
 
     // Order the app's Vulkan queue against the compositor's D3D12 queue. Skipped when the
     // mirror is not due this frame: nothing reads the app's images then.
@@ -8539,7 +8716,9 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     if (mcp::g_commandsDue && mcp::CheckProjLogDumpRequest()) {
         mcp::DumpProjectionLog();
     }
-    // Every command file has been looked at for this change notification.
+    // Every command file has been looked at for this change notification. Any of
+    // them may have changed what the timeline's session info describes.
+    if (mcp::g_commandsDue) g_sessionInfoDirty = true;
     mcp::g_commandsDue = false;
     LARGE_INTEGER afterStatus{};
     QueryPerformanceCounter(&afterStatus);
@@ -8661,6 +8840,33 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
             timingFrames = 0;
             projectionMs = overlayMs = detectPaintMs = remainderMs = totalMs = 0.0;
         }
+    }
+
+    if (g_frameTimeline.Enabled()) {
+        namespace tl = perf::timeline;
+        if (g_sessionInfoDirty.exchange(false)) PublishSessionInfo();
+        timelineFrame.frameId = (uint64_t)frameCount;
+        // Layers composite in submission order, so projection and overlay work
+        // interleave; the record keeps the overlays' share as the stretch before
+        // the last layer finished.
+        timelineFrame.endProjectionQpc = (uint64_t)(afterLayers.QuadPart - overlayTicks);
+        timelineFrame.endOverlaysQpc = (uint64_t)afterLayers.QuadPart;
+        timelineFrame.endPaintQpc = (uint64_t)afterDetectionAndPaint.QuadPart;
+        timelineFrame.layerCount = info->layerCount;
+        timelineFrame.projectionLayers = (uint16_t)projectionCount;
+        timelineFrame.quadLayers = (uint16_t)quadCount;
+        timelineFrame.cylinderLayers = (uint16_t)cylinderCount;
+        timelineFrame.otherLayers = (uint16_t)otherCount;
+        uint32_t flags = 0;
+        if (hasStereoProjection) flags |= tl::kFrameStereoProjection;
+        if (projectionCount == 0) flags |= tl::kFrameNoProjection;
+        if (g_previewDueThisFrame) flags |= tl::kFrameMirrorDue;
+        if (screenshotThisFrame) flags |= tl::kFrameScreenshot;
+        if (burstThisFrame) flags |= tl::kFrameBurst;
+        if (rt::g_session.state == XR_SESSION_STATE_FOCUSED) flags |= tl::kFrameSessionFocused;
+        timelineFrame.flags = flags;
+        // A fresh stamp rather than endFrameFinish, so the avg300 log line's cost is counted too.
+        g_frameTimeline.EndExit(timelineFrame, info->displayTime, tl::Qpc());
     }
 
     XrResult result;
@@ -8787,6 +8993,7 @@ static bool GetCommonEntityRelativePose(XrSpace space, XrSpace baseSpace, XrPose
 }
 
 static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession session, const XrViewLocateInfo* li, XrViewState* vs, uint32_t cap, uint32_t* outCount, XrView* views) {
+    if (li && li->type == XR_TYPE_VIEW_LOCATE_INFO) g_frameTimeline.Locate(li->displayTime);
     std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
     if (!li || !vs || !outCount || li->type != XR_TYPE_VIEW_LOCATE_INFO ||
         vs->type != XR_TYPE_VIEW_STATE) return XR_ERROR_VALIDATION_FAILURE;
@@ -9830,6 +10037,7 @@ static XrResult XRAPI_PTR xrGetInputSourceLocalizedName_runtime(
 static XrResult XRAPI_PTR xrDestroySwapchain_runtime(XrSwapchain sc) {
     auto it = rt::g_swapchains.find(sc);
     if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
+    g_frameTimeline.Marker(perf::timeline::MarkerKind::SwapchainDestroy);
 
     // A D3D12 command list does not keep the resources it references alive, and the
     // preview no longer waits for its own submissions inside xrEndFrame - so a composite
