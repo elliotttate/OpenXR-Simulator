@@ -117,7 +117,7 @@ The built runtime will be in `bin/openxr_simulator.dll`.
 GitHub Actions builds and tests both x64 and x86 for every push and pull request,
 then assembles one ready-to-extract Windows ZIP containing both runtimes, portable
 manifests, activation helpers, documentation, and the MCP server. To publish a
-release, push a version tag such as `v1.6.0`; after validation passes, the workflow
+release, push a version tag such as `v1.7.0`; after validation passes, the workflow
 uploads the ZIP and its SHA-256 checksum to a GitHub release with generated notes.
 
 ## 🔌 MCP Server

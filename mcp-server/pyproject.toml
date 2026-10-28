@@ -1,6 +1,6 @@
 [project]
 name = "openxr-simulator-mcp"
-version = "1.6.0"
+version = "1.7.0"
 description = "MCP server for OpenXR Simulator - provides screenshot capture and diagnostics"
 readme = "README.md"
 requires-python = ">=3.10"
