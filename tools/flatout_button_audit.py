@@ -60,7 +60,8 @@ async def inspect(snapshot,query,fox_root):
         parent_path,name=path.rsplit('/',1)
         parent=nodes[node['parent_index']] if node.get('parent_index',-1)>=0 else by_path.get(parent_path)
         if not node.get('effective_visible',node.get('visible')) or not node.get('text') or not parent:continue
-        if name not in CAPTIONS and not (name=='OptionsText' and parent_path.rsplit('/',1)[-1] in OPTIONS_ACTIONS):continue
+        tracked='content_center' in node.get('presentation',{})
+        if not tracked and name not in CAPTIONS and not (name=='OptionsText' and parent_path.rsplit('/',1)[-1] in OPTIONS_ACTIONS):continue
         if 'presentation' in node:
             binding=node['presentation'];size=binding['local_size']
         else:

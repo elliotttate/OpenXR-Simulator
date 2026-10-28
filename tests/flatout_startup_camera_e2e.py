@@ -71,7 +71,7 @@ class StartupCamera(Frontend):
         assert not any(i.get('rendered_bounds', {}).get('visible') for i in menu.get('items', [])), 'White Main controls are visible behind Welcome'
         targets = await self.query('vr.targets')
         names = [t['name'] for t in targets['targets']]
-        assert len(names) == len(set(names)) and set(names) in ({'msgbox.validate'}, {'msgbox.recenter', 'msgbox.validate'}), ('Welcome exposes unexpected or duplicate actions', targets)
+        assert names == ['msgbox.validate'], ('Welcome must expose Continue only; recenter is the two-thumbstick gesture', targets)
         return {'menu': menu, 'message': message, 'nodes': nodes, 'targets': targets}
 
     async def wait_welcome(self):
@@ -162,20 +162,24 @@ class StartupCamera(Frontend):
         sticks=[]
         for name,uv in (('WelcomeThumbstickLeft',[.375,.25,.5,.375]),('WelcomeThumbstickRight',[0,.5,.125,.625])):
             stick=node(name);l,t,r,b=stick['rect']
-            assert r-l>=55 and b-t>=55 and r<=help[0]-23,stick
+            assert r-l>=111 and b-t>=111 and r<=help[0]-39,stick
             art=await self.query('hud.get_node',{'root':'msgbox','name':stick['path'].split('/',1)[1],'presentation':True})
             assert np.allclose(art['presentation']['uv'],uv),art
             assert 'INPUTS_QUEST' in art['presentation']['texture_resource'].upper(),art
             sticks.append(stick)
-        assert sticks[1]['rect'][0]-sticks[0]['rect'][2]>=23,sticks
+        assert sticks[1]['rect'][0]-sticks[0]['rect'][2]>=47,sticks
         targets=welcome['targets']['targets']
-        actions=[node(name)['rect'] for name in ('WelcomeRecenter','WelcomeContinue')]
-        instruction_bottom=max(help[3],max(s['rect'][3] for s in sticks))
-        # Layout uses visible artwork; AddNode deliberately expands hit boxes
-        # four pixels for ray forgiveness. Both must remain separated.
-        assert min(r[1] for r in actions)-instruction_bottom>=23,(actions,help,sticks)
-        assert frame[3]-max(r[3] for r in actions)>=31,(frame,actions)
-        assert min(t['rect'][1] for t in targets)-instruction_bottom>=19
+        action=node('WelcomeContinue')['rect']
+        assert not any(n['visible'] and n['path'].endswith('/WelcomeRecenter') for n in nodes)
+        assert 'choose' not in node('WelcomeRecenterHelp')['text'].lower()
+        assert 'both thumbstick buttons' in node('WelcomeRecenterHelp')['text'].lower()
+        # The enlarged passive gesture and its copy occupy the old left action
+        # area; Continue is separate on the right, including its 4px hit padding.
+        instruction_right=max(help[2],max(s['rect'][2] for s in sticks))
+        assert action[0]-instruction_right>=63,(action,help,sticks)
+        assert frame[3]-action[3]>=31,(frame,action)
+        assert min(s['rect'][1] for s in sticks)-rect[3]>=40
+        assert targets[0]['rect'][0]-instruction_right>=59
         capture=await self.screenshot('thumbstick-instructions-stereo')
         pixels=np.asarray(Image.open(self.last_image_path).convert('RGB'))
         visible=[]
@@ -190,12 +194,12 @@ class StartupCamera(Frontend):
                 bright=int(np.count_nonzero(np.min(patch,axis=2)>150))
                 assert bright>=12,('Thumbstick diagram is absent in composed pixels',eye,stick,bright)
                 visible.append({'name':stick['path'],'eye':eye,'bright_pixels':bright})
-        report['cases'].append({'case':'original-both-thumbsticks-diagram-with-separated-instruction-and-actions','passed':True,'sticks':sticks,'composed_visibility':visible})
+        report['cases'].append({'case':'large-passive-two-thumbsticks-instead-of-recenter-button','passed':True,'sticks':sticks,'composed_visibility':visible})
         hand_before = self.args.hand
         try:
             for hand in ('left','right'):
                 self.args.hand = hand
-                for name in ('msgbox.recenter','msgbox.validate'):
+                for name in ('msgbox.validate',):
                     before, hovered, _ = await self.hover(name)
                     assert hovered['clicks'] == before['clicks']
                     depth = assert_hover_lift(await self.screenshot('roadmap-depth-'+hand+'-'+name))
@@ -203,10 +207,6 @@ class StartupCamera(Frontend):
                     await self.session.call_tool('release_ui_pointer', {'capture_id':self.last_capture['capture_id'],'hand':hand})
                     await asyncio.sleep(.2)
             self.args.hand = hand_before
-            await self.click('msgbox.recenter')
-            await asyncio.sleep(.3)
-            await self.welcome()
-            report['cases'].append({'case':'recenter-one-click-and-retry-keeps-welcome-open','passed':True})
         finally:
             self.args.hand = hand_before
 
@@ -215,7 +215,9 @@ class StartupCamera(Frontend):
         carrier = max((s for s in source['geometry']['surfaces'] if s['visibility']==0),key=lambda s:np.prod(s['size']))
         targets = await self.query('vr.targets')
         validate = next(t['rect'] for t in targets['targets'] if t['name']=='msgbox.validate')
-        _, aim = await self.point_args('msgbox.recenter')
+        _, aim = await self.point_args('msgbox.validate')
+        x,y=quad_pixel(self.last_capture,(300,900,300,900))
+        aim.update(x=float(x),y=float(y))
         receipt = await self.tool('scroll_ui_at', {**aim,'hand':'left','stick':[0,1.],
             'dwell_frames':2,'hold_frames':8,'command_id':uuid.uuid4().hex}, 'welcome-stick-takeover')
         assert receipt['status']=='input_delivered', receipt
@@ -231,7 +233,7 @@ class StartupCamera(Frontend):
             'hand':'left','surface':{k:carrier[k] for k in ('pose','size')},'origin_mode':'hand','dwell_frames':45},'ray-restores-roadmap')
         assert receipt['status']=='input_delivered', receipt
         native = await self.welcome()
-        assert {t['name'] for t in native['targets']['targets']} == {'msgbox.validate','msgbox.recenter'}
+        assert [t['name'] for t in native['targets']['targets']] == ['msgbox.validate']
         assert native['targets']['clicks']==targets['clicks']
         assert any(n['visible'] and n['path'].endswith('/WelcomeRoadmap') for n in native['nodes'])
         report['cases'].append({'case':'fresh-ray-restores-roadmap-without-activation','passed':True})
@@ -307,7 +309,7 @@ if __name__ == '__main__':
     parser.add_argument('--build-label', required=True)
     parser.add_argument('--hand', choices=('left', 'right'), default='right')
     parser.add_argument('--takeover', action='store_true', help='Exercise actual XR-stick fallback and fresh-ray restoration while welcome remains open')
-    parser.add_argument('--roadmap', action='store_true', help='Require the native full-illustration roadmap, both-hand physical hover and recenter')
+    parser.add_argument('--roadmap', action='store_true', help='Require the original roadmap, enlarged passive thumbstick instructions and both-hand Continue hover')
     parser.add_argument('--focus-cycles', type=int, choices=range(4), default=1)
     parser.add_argument('--startup-timeout', type=float, default=60)
     asyncio.run(run(parser.parse_args()))

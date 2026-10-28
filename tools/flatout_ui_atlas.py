@@ -40,7 +40,7 @@ SHOWROOM_FLOWS={"garage":None,"cars":(0,"CARS"),"upgrade":(1,"UPGRADES"),
                 "customization":(2,"SKINS"),"livery":(3,"SKINS")}
 PROFILE_FLOWS=set(SHOWROOM_FLOWS)|{"career","class_selection","event_selection"}
 NETWORK_FLOWS={"online","filter","game_browser","lobby","friends_lobby"}
-NORMAL_FLOWS=set(ROOT_FLOWS)|set(SHOWROOM_FLOWS)|{"class_selection","event_selection","party_game","statistics","credits"}
+NORMAL_FLOWS=set(ROOT_FLOWS)|set(SHOWROOM_FLOWS)|{"class_selection","event_selection","party_game","statistics","credits","single_car"}
 
 
 class NativeTimeout(TimeoutError):
@@ -716,9 +716,11 @@ class Atlas:
         return snapshot
 
     async def capture(self, title, kind="base", variant=None, view=None):
-        if getattr(self.args,"ray_presentation",False) and not self.args.current and not view and self.active_case.get("expand")!="livery":
+        if kind!="hover" and getattr(self.args,"ray_presentation",False) and not self.args.current and not view and self.active_case.get("expand")!="livery":
             await self.prepare_ray_presentation()
         snapshot = await self.observe()
+        if kind=="hover" and snapshot["targets"].get("hovered")!=variant:
+            raise CaptureMismatch("Requested hover was lost before capture; no mislabeled screenshot accepted: "+str(variant))
         if view and not head_pose_matches(livery_tracking_state(snapshot["livery"]["vr"]["frame"]),view["head_pose"]):
             raise CaptureMismatch("Native livery frame no longer matches the acknowledged glance")
         ordinary_pose=self.neutral_head_pose if not self.args.current and not view and "livery" not in snapshot else None
@@ -773,16 +775,27 @@ class Atlas:
         """
         from flatout_livery_e2e import screenshot_pixel,ui_surface
         from flatout_ray_offset import native_pointer_offset
+        from flatout_frontend_e2e import RAY_OFFSET
         native=await self.query("vr.targets");frame=native.get("vr_frame")
-        if not frame:return
+        if not frame and (await self.query("menu.get_state")).get("is_3d"):return
         before=native["clicks"]
         cap,_=await self.tool("capture_screenshot",{"eye":"left","max_width":1280,"timeout":30})
         self.capture_cache=cap
+        carrier=None
+        if not frame:
+            # A compositor menu has no RTT frame. Accept only its full canvas,
+            # never a raised button or one of the livery's separate pillars.
+            from flatout_frontend_e2e import quad_pixel
+            planes=[s for s in cap.get("geometry",{}).get("surfaces",[]) if s.get("visibility")==0 and
+                    s["size"][0]>=2 and s["size"][1]>0 and abs(s["size"][0]/s["size"][1]-16/9)<.01]
+            if not planes:raise FixtureUnavailable("Ray presentation needs a verified full-canvas menu carrier; no pointer input sent")
+            carrier=max(planes,key=lambda s:s["size"][0]*s["size"][1])
         calibration=native_pointer_offset(await self.query("vr.get_state"),self.args.hand) or RAY_OFFSET
         for x,y in ((160,120),(1760,120)):
-            state={"vr":{"frame":frame}};px,py=screenshot_pixel(state,cap,x,y)
+            state={"vr":{"frame":frame}}
+            px,py=screenshot_pixel(state,cap,x,y) if frame else quad_pixel(cap,(x,y,x,y))
             args={"capture_id":cap["capture_id"],"hand":self.args.hand,"origin_mode":"hand",
-                  "surface":ui_surface(state,x,y),"x":float(px),"y":float(py),"ray_offset":calibration,
+                  "surface":ui_surface(state,x,y) if frame else carrier,"x":float(px),"y":float(py),"ray_offset":calibration,
                   "dwell_frames":90,"timeout":30}
             result,_=await self.tool("hover_ui_at",args)
             if result.get("status")!="input_delivered":raise RuntimeError(result)
@@ -991,6 +1004,28 @@ class Atlas:
             await self.select(index)
             await asyncio.sleep(self.args.settle)
             return await self.fixture_menu(title,mode,is_3d=True if alias=="career" else None,car=alias=="career")
+        if alias=="single_car":
+            await self.normal_flow("challenge")
+            menu=await self.query("menu.get_state")
+            event=next((item for item in menu.get("items",[]) if not item.get("locked",True) and
+                item.get("installed",True) and not item.get("coming_soon") and not blocked_wreck(item.get("title"))),None)
+            if event is None:raise FixtureUnavailable("No normally unlocked installed challenge can stage its fixed vehicle")
+            await self.select(event["index"]) # Owning callback initializes event, vehicle and skin. Never Start.
+            await self.fixture_menu("CARS","challenge",item_count=0,is_3d=False)
+            if not getattr(self.args,"ray_presentation",False):
+                self.active_case.setdefault("fixture_checks",[]).append({"fixed_event":event["title"],"event_index":event["index"],"vehicle_ready":"unverified in controller presentation"})
+                return await self.query("menu.get_state")
+            await self.prepare_ray_presentation()
+            deadline=time.monotonic()+getattr(self.args,"fixture_timeout",20)
+            while True:
+                if (await self.query("ui.get_message_box")).get("open"):
+                    raise FixtureUnavailable("Fixed vehicle opened a real modal; no further staging was sent")
+                targets=(await self.query("vr.targets"))["targets"]
+                if any(t["name"]=="helper.Validate.1" and t.get("enabled",False) for t in targets):
+                    self.active_case.setdefault("fixture_checks",[]).append({"fixed_event":event["title"],"event_index":event["index"],"vehicle_ready":True})
+                    return await self.query("menu.get_state")
+                if time.monotonic()>=deadline:raise FixtureUnavailable("Fixed event vehicle/material did not become ready; Start was never pressed")
+                await asyncio.sleep(.1)
         if alias in SHOWROOM_FLOWS:
             await self.normal_flow("career")
             await self.select(1) # Career Garage callback initializes selected car/material/driver.
@@ -1049,6 +1084,8 @@ class Atlas:
                 await self.query("livery.command", step["livery"])
             elif "party_drivers" in step:
                 await self.party_drivers(step["party_drivers"])
+            elif "party_stunts" in step:
+                await self.party_stunts(step["party_stunts"])
             else:
                 raise ValueError("Unknown route step: " + str(step))
             await asyncio.sleep(self.args.settle)
@@ -1060,8 +1097,8 @@ class Atlas:
             if actual not in case["expect"]:
                 raise RuntimeError(f"Expected {case['expect']}, reached {actual}")
 
-    async def party_drivers(self, players):
-        """Enter drivers once through a fresh Party playlist; never assume the picker starts on page one."""
+    async def party_stunts(self, players):
+        """Open the real count callback and its verified explicit continuation, without Start."""
         if self.args.current:raise ValueError("Read-only attachment cannot stage Party drivers")
         if not isinstance(players,int) or isinstance(players,bool) or not 2<=players<=8:
             raise ValueError("Party driver fixture needs 2–8 players")
@@ -1071,7 +1108,15 @@ class Atlas:
         initial=await self.query("party.get_state")
         if not initial.get("open") or initial.get("playlist"):
             raise FixtureUnavailable("Fresh Party menu did not expose an empty playlist; no Start was sent")
+        await self.prepare_ray_presentation()
         await self.ray("players."+str(players))
+        selected_count=await self.query("party.get_state")
+        if not selected_count.get("stunt_picker_open"):
+            targets=(await self.query("vr.targets"))["targets"]
+            continuation=next((t["name"]for t in targets if t["name"]=="helper.Validate.PartyContinue" and t.get("enabled",True)),None)
+            if not selected_count.get("open") or continuation is None:
+                raise FixtureUnavailable("Party count selection has no verified continuation; no extra action was sent")
+            await self.ray(continuation)
         deadline=time.monotonic()+getattr(self.args,"fixture_timeout",20)
         while True:
             party=await self.query("party.get_state")
@@ -1079,6 +1124,11 @@ class Atlas:
             if time.monotonic()>=deadline:
                 raise FixtureUnavailable("Party player selection did not open its stunt picker")
             await asyncio.sleep(max(.02,min(self.args.settle,.15)))
+        return party
+
+    async def party_drivers(self, players):
+        """Enter drivers once through a fresh Party playlist; never assume the picker starts on page one."""
+        party=await self.party_stunts(players)
         if party.get("playlist"):
             raise FixtureUnavailable("Fresh Party stunt picker has an unexpected playlist; no toggle or Start was sent")
         targets=(await self.query("vr.targets"))["targets"]
@@ -1395,9 +1445,14 @@ class Atlas:
                 if time.monotonic()>deadline:raise RuntimeError("Reward preview did not become ready")
                 await asyncio.sleep(.08)
             if reward["credits"]!=initial["credits"]:raise RuntimeError("Presentation fixture changed credits")
+            if kind=="money":await self.prepare_ray_presentation()
             await self.capture("Reward — "+kind)
             previous=reward["presentation"]
-            await self.ray("helper.Validate.0")
+            # Native ray reveal names its action; the controller fallback keeps helper.Validate.0.
+            targets=(await self.query("vr.targets"))["targets"]
+            action=next((t["name"] for t in targets if t["name"].startswith("helper.Validate") and t.get("enabled",True)),None)
+            if action is None:raise RuntimeError("Ready reward exposed no enabled Continue target")
+            await self.ray(action)
         deadline=time.monotonic()+20
         while (await self.query("ui.reward_state"))["open"]:
             if time.monotonic()>deadline:raise RuntimeError("Reward outro did not finish")

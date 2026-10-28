@@ -29,6 +29,17 @@ class ButtonAuditTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_icon_outside_safe_inset(self):
         result=await self.audit(icon_x=-51);self.assertFalse(result['passed'])
 
+    async def test_new_registered_caption_is_audited_without_name_allowlist(self):
+        nodes=[{'path':'ROOT','node_index':0,'parent_index':-1},
+            {'path':'ROOT/Button','node_index':1,'parent_index':0,'rect':[0,0,200,80],'visible':True},
+            {'path':'ROOT/Button/NewActionCaption','node_index':2,'parent_index':1,'rect':[113,12.5,135,75.5],'visible':True,'text':'A',
+             'presentation':{'local_size':[22.,63.],'font_resource':'DATA:/FONTS/FO_ALDO_THE_APACHE.FNT','font_scale':.5,'content_center':[.5,.5]}},
+            {'path':'ROOT/Button/ActionIcon','node_index':3,'parent_index':1,'rect':[66,24,98,56],'visible':True}]
+        async def query(*args):self.fail('Registered exact-node metadata should not need another lookup')
+        with patch('flatout_button_audit.font_glyphs',return_value=GLYPHS):
+            result=await inspect({'nodes':nodes,'message':{'open':False}},query,'.')
+        self.assertTrue(result['passed']);self.assertEqual(len(result['checks']),1)
+
     async def test_exact_bindings_disambiguate_repeated_paths_without_extra_queries(self):
         nodes=[{'path':'ROOT','node_index':0,'parent_index':-1}]
         binding={'local_size':[22.,63.],'font_resource':'DATA:/FONTS/FO_ALDO_THE_APACHE.FNT','font_scale':.5}
@@ -65,3 +76,4 @@ class LeaderboardSamplingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(atlas.UnknownModal):await test.pages('Leaderboard','page.down',3,sample_only=True)
 
 if __name__=='__main__':unittest.main()
+

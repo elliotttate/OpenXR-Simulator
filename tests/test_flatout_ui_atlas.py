@@ -356,7 +356,7 @@ class RetainedLeaderboardPage(unittest.IsolatedAsyncioTestCase):
 
 class PartyDriverRecipe(unittest.IsolatedAsyncioTestCase):
     """Offline navigation contracts; retained pages come from the saved native r18 report."""
-    def runner(self):
+    def runner(self,two_step=False):
         args=SimpleNamespace(pid=1,output=Path("unused"),native_timeout=.1,current=False,settle=0,fixture_timeout=.03)
         test=atlas.Atlas(args,None,{"cases":[],"states":[]});test.active_case={"id":"party-drivers"}
         data={"phase":"players","playlist":[],"clicks":[],"flows":[],"toggle_works":True,"start_works":True,"tiles":True}
@@ -367,18 +367,21 @@ class PartyDriverRecipe(unittest.IsolatedAsyncioTestCase):
                 return {"open":data["phase"]=="players","stunt_picker_open":data["phase"]=="stunts",
                         "players":8,"visible":[8,11],"playlist":[{"index":i} for i in data["playlist"]]}
             if method=="menu.get_state":return {"current_menu":"DRIVERS" if data["phase"]=="drivers" else "OFFLINE"}
+            if method=="vr.targets" and data["phase"]=="players" and two_step:return {"targets":[{"name":"helper.Validate.PartyContinue"}]}
             if method=="vr.targets":return {"targets":[{"name":"helper.Validate.0"},
                 {"name":"stunts.page.previous"}]+([{"name":"stunt.0","enabled":False},{"name":"stunt.8"},{"name":"stunt.9"}] if data["tiles"] else [])}
             raise AssertionError(method)
         async def ray(name,*args,**kwargs):
             data["clicks"].append(name)
-            if name=="players.8":data["phase"]="stunts"
+            if name=="players.8":data["phase"]="players" if two_step else "stunts"
+            elif name=="helper.Validate.PartyContinue":data["phase"]="stunts"
             elif name=="stunt.8":
                 if data["toggle_works"]:data["playlist"]=[8]
             elif name=="helper.Validate.0":
                 if data["start_works"]:data["phase"]="drivers"
             else:raise AssertionError("Unexpected invisible target: "+name)
-        test.normal_flow=normal_flow;test.query=query;test.ray=ray
+        async def prepare():data['prepared']=True
+        test.normal_flow=normal_flow;test.query=query;test.ray=ray;test.prepare_ray_presentation=prepare
         return test,data
 
     def test_default_manifest_uses_retained_page_aware_party_fixture(self):
@@ -391,6 +394,20 @@ class PartyDriverRecipe(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["flows"],["party_game"])
         self.assertEqual(data["clicks"],["players.8","stunt.8","helper.Validate.0"])
         self.assertEqual(test.active_case["fixture_checks"][0]["stunt_picker_visible"],[8,11])
+
+    async def test_explicit_count_continuation_is_sent_once_before_any_stunt_or_start(self):
+        test,data=self.runner(two_step=True);await test.party_drivers(8)
+        self.assertEqual(data['clicks'],['players.8','helper.Validate.PartyContinue','stunt.8','helper.Validate.0'])
+        self.assertTrue(data['prepared'])
+
+    async def test_stunt_survey_stops_before_selecting_a_stunt_or_starting(self):
+        test,data=self.runner(two_step=True);state=await test.party_stunts(8)
+        self.assertEqual(data['clicks'],['players.8','helper.Validate.PartyContinue'])
+        self.assertTrue(state['stunt_picker_open']);self.assertEqual(state['playlist'],[])
+
+    def test_stunt_manifest_uses_owning_party_recipe(self):
+        case=next(c for c in atlas.load_manifest(atlas.DEFAULT_MANIFEST)['cases']if c['id']=='party-stunts')
+        self.assertEqual(case['route'],[{'party_stunts':2}])
 
     async def test_dirty_initial_playlist_is_never_toggled_or_started(self):
         test,data=self.runner();data["playlist"]=[5]

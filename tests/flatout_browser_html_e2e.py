@@ -124,3 +124,4 @@ async def run(a):
  print(json.dumps({'passed':report['passed'],'cases':len(report['cases'])}))
 if __name__=='__main__':
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--pid',type=int,required=True);p.add_argument('--data-dir',type=Path,required=True);p.add_argument('--evidence',type=Path,required=True);p.add_argument('--hand',choices=('left','right'),default='right');p.add_argument('--layout-only',action='store_true');p.add_argument('--takeover-only',action='store_true');p.add_argument('--host-flow',action='store_true');asyncio.run(run(p.parse_args()))
+

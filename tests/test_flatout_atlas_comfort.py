@@ -85,6 +85,24 @@ class ComfortCapture(unittest.IsolatedAsyncioTestCase):
         runner.observe=observe;runner.tool=tool;runner.project_targets=lambda *args:[]
         return runner,calls,original
 
+    async def test_ray_presentation_capture_preserves_the_actual_hover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner,calls,_=self.runner(tmp);runner.args.current=False;runner.args.ray_presentation=True
+            async def prepare():raise AssertionError('Parking the ray would erase the requested hover')
+            async def observe():
+                s=snapshot();s['targets']['hovered']='back';return s
+            runner.prepare_ray_presentation=prepare;runner.observe=observe
+            await runner.capture('Back hover','hover','back')
+            saved=json.loads((Path(tmp)/runner.report['states'][0]['metadata']).read_text())
+            self.assertEqual(saved['targets']['hovered'],'back')
+            self.assertEqual(sum(name=='capture_screenshot' for name,_ in calls),1)
+
+    async def test_lost_hover_is_not_saved_as_a_successful_hover_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner,calls,_=self.runner(tmp)
+            with self.assertRaises(atlas.CaptureMismatch):await runner.capture('Lost hover','hover','back')
+            self.assertEqual(calls,[]);self.assertFalse(runner.report['states'])
+
     async def test_optional_analysis_saves_separate_guide_without_input_or_source_change(self):
         with tempfile.TemporaryDirectory() as tmp:
             runner,calls,original=self.runner(tmp)

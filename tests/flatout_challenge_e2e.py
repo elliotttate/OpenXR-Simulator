@@ -158,14 +158,22 @@ class Challenge(Frontend):
         assert not any(t["rect"][2] - t["rect"][0] > 1500 and t["rect"][3] - t["rect"][1] > 800
                        for t in targets["targets"]), "Aiming at the car/blank preview must not start a race"
         deadline = asyncio.get_running_loop().time() + 20
-        while not any(t["name"] == "helper.Validate.1" for t in targets["targets"]):
+        while not any(t["name"] == "helper.Validate.1" and t.get("enabled",True) for t in targets["targets"]):
             assert asyncio.get_running_loop().time() < deadline, ("Fixed event car did not become ready", targets)
             await asyncio.sleep(.1)
             targets = await self.query("vr.targets")
         await self.audit("challenge-fixed-vehicle-preview-actions")
         start = next(t for t in targets["targets"] if t["name"] == "helper.Validate.1")
         assert start["rect"][2] - start["rect"][0] >= 240 and start["rect"][3] - start["rect"][1] >= 80, start
-        assert start["rect"][1] >= 960, start
+        nodes=(await self.query('hud.rects',{'root':'menu','max_depth':48}))['nodes']
+        native_start=next((n for n in nodes if n.get('effective_visible',n['visible']) and n['path'].endswith('/SingleCarStart')),None)
+        if native_start:
+            l,t,r,b=native_start['rect']
+            assert all(abs(a-e)<=1.1 for a,e in zip(start['rect'],[l-4,t-4,r+4,b+4])),(start,native_start)
+            panel=next(n for n in nodes if n['path'].endswith('/SingleCarStats'))
+            assert t-panel['rect'][3]>=32 and b<=1080-48,(native_start,panel)
+        else:
+            assert start["rect"][1] >= 960, start
         before = targets["clicks"]
         cap = await self.capture("fixed-car-blank-source")
         from flatout_livery_e2e import screenshot_pixel, ui_surface

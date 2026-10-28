@@ -109,10 +109,7 @@
       "group": "Party",
       "route": [
         {
-          "goto": "party_game"
-        },
-        {
-          "ray": "players.2"
+          "party_stunts": 2
         }
       ],
       "expect": [
@@ -417,11 +414,11 @@
       "id": "single-car",
       "title": "Event car preview",
       "group": "Garage",
-      "status": "blocked",
-      "reason": "Requires an event-specific car configuration",
       "source_enums": [
         "E_SINGLE_CAR"
-      ]
+      ],
+      "route": [{"goto": "single_car"}],
+      "expect": ["CARS"]
     },
     {
       "id": "reward",
