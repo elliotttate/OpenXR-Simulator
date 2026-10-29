@@ -50,6 +50,14 @@ int main() {
           Near(indexLeft.orientation.y, -indexRight.orientation.y) &&
           Near(indexLeft.orientation.z, -indexRight.orientation.z), "Index grip rotations mirror across hands");
 
+    for (const char* metaTouch : {"/interaction_profiles/meta/touch_plus_controller",
+                                  "/interaction_profiles/meta/touch_controller_quest_2"}) {
+        const XrPosef meta = controller_poses::AimFromGrip(metaTouch, true);
+        const XrPosef touch = controller_poses::AimFromGrip(kTouch, true);
+        Check(Near(meta.position, touch.position) && Near(AngleDegrees(meta.orientation), 60.0f, 0.05f),
+              "OpenXR 1.1 Touch profiles keep the Touch grip offset");
+    }
+
     const XrPosef simple = controller_poses::AimFromGrip("/interaction_profiles/khr/simple_controller", true);
     Check(Near(simple.position, {0.0f, 0.0f, 0.0f}) && Near(simple.orientation.w, 1.0f),
           "profiles without vendor poses keep grip at the aim pose");

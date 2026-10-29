@@ -168,6 +168,9 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 ### Supported Features
 
 - ✅ Core OpenXR 1.0 specification
+- ✅ OpenXR 1.1 instances: `xrLocateSpaces`, the `LOCAL_FLOOR` reference space, the
+  `grip_surface` pose (reported at the grip pose) and the Meta Touch 1.1 profiles.
+  A loader limited to 1.0 negotiates 1.0. The other vendor profiles 1.1 added are not emulated.
 - ✅ D3D11 graphics binding (`XR_KHR_D3D11_enable`)
 - ✅ D3D12 graphics binding (`XR_KHR_D3D12_enable`)
 - ✅ Vulkan graphics binding (`XR_KHR_vulkan_enable` and `XR_KHR_vulkan_enable2`)
@@ -177,7 +180,7 @@ The simulator implements the OpenXR runtime interface, intercepting all OpenXR c
 - ✅ Multiple swapchain formats (sRGB, UNORM, HDR, typeless, depth)
 - ✅ Mutable format swapchains (typeless backing for sRGB/non-sRGB views)
 - ✅ Stereo rendering with configurable FOV
-- ✅ Reference space tracking (LOCAL, STAGE, VIEW)
+- ✅ Reference space tracking (LOCAL, STAGE, VIEW, and LOCAL_FLOOR on 1.1)
 - ✅ Basic action system for input
 - ✅ Screenshot capture (D3D11, D3D12, and OpenGL)
 

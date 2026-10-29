@@ -125,6 +125,15 @@ int main() {
     Check(!interaction_query::ProfileSupportsTopLevel(
               "/interaction_profiles/oculus/touch_controller", "/user/gamepad"),
           "a hand profile is not reported for the gamepad");
+    Check(interaction_query::IsOpenXR1_1TouchProfile("/interaction_profiles/meta/touch_plus_controller") &&
+              interaction_query::ProfileSupportsTopLevel("/interaction_profiles/meta/touch_plus_controller",
+                                                         "/user/hand/left"),
+          "OpenXR 1.1 Touch Plus is a hand profile");
+    Check(!interaction_query::IsOpenXR1_1TouchProfile("/interaction_profiles/meta/touch_controller_plus"),
+          "the XR_META_touch_controller_plus path is not the 1.1 core profile");
+    Check(interaction_query::InteractionProfileName("/interaction_profiles/meta/touch_controller_quest_2") ==
+              "Meta Touch Controller (Quest 2)",
+          "OpenXR 1.1 Touch profiles have localized names");
     const XrInputSourceLocalizedNameFlags allNameParts =
         XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT |
         XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT |

@@ -21,6 +21,20 @@ int main() {
     Check(api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 1, 0), supported) ==
               XR_ERROR_API_VERSION_UNSUPPORTED,
           "a newer minor version is rejected");
+    Check(api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 1, 0), XR_API_VERSION_1_1) == XR_SUCCESS &&
+              api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 0, 0), XR_API_VERSION_1_1) == XR_SUCCESS,
+          "a 1.1 runtime accepts 1.1 and 1.0 instances");
+    Check(api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 2, 0), XR_API_VERSION_1_1) ==
+              XR_ERROR_API_VERSION_UNSUPPORTED,
+          "a 1.1 runtime rejects 1.2");
+    Check(api_validation::NegotiateApiVersion(XR_MAKE_VERSION(1, 0, 0), XR_MAKE_VERSION(1, 0x3ff, 0xfff)) ==
+              XR_API_VERSION_1_1,
+          "a loader open to any 1.x negotiates 1.1");
+    Check(api_validation::NegotiateApiVersion(XR_MAKE_VERSION(1, 0, 0), XR_MAKE_VERSION(1, 0, 34)) ==
+              XR_API_VERSION_1_0,
+          "a loader that stops at 1.0 negotiates 1.0");
+    Check(api_validation::NegotiateApiVersion(XR_MAKE_VERSION(1, 2, 0), XR_MAKE_VERSION(1, 3, 0)) == 0,
+          "a loader range above 1.1 negotiates nothing");
     Check(api_validation::IsWellFormedPath("/user/hand/left"),
           "a normal semantic path is well formed");
     Check(!api_validation::IsWellFormedPath("user/hand/left"),

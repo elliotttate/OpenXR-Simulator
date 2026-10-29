@@ -327,6 +327,11 @@ if(SIMXR_TREE_CHANGES)
     string(APPEND SIMXR_BUILD_ID "-dirty")
 endif()
 target_compile_definitions(openxr_simulator PRIVATE SIMXR_BUILD_ID="${SIMXR_BUILD_ID}")
+# xrGetInstanceProperties reports the release named in project() above.
+target_compile_definitions(openxr_simulator PRIVATE
+    SIMXR_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    SIMXR_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    SIMXR_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 
 # Generate OpenXR runtime manifest
 set(RUNTIME_MANIFEST_CONTENT "{

@@ -379,6 +379,9 @@ static std::atomic<UINT> g_sourceHeight{0};
 
 struct Instance {
     XrInstance handle{XR_NULL_HANDLE};
+    // applicationInfo.apiVersion: OpenXR 1.1 commands, spaces and paths exist only
+    // on an instance created for 1.1.
+    XrVersion apiVersion{0};
     std::vector<std::string> enabledExtensions;
     // Per spec (each graphics-binding extension chapter), xrCreateSession must return
     // XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING unless the matching requirements
@@ -2995,10 +2998,17 @@ static void GpuTimingCollect() {
 
 // ----------------- OpenXR runtime exports -----------------
 
-static constexpr XrVersion kRuntimeApiVersion = XR_MAKE_VERSION(1, 0, 34);
+// The API version xrCreateInstance accepts: 1.1, unless the loader negotiated 1.0.
+// The default covers a host that loads the runtime without the loader.
+static XrVersion g_negotiatedApiVersion = XR_API_VERSION_1_1;
 
 static bool IsValidInstance(XrInstance instance) {
     return instance != XR_NULL_HANDLE && instance == rt::g_instance.handle;
+}
+
+static bool InstanceUsesApi1_1() {
+    return rt::g_instance.handle != XR_NULL_HANDLE &&
+           XR_VERSION_MINOR(rt::g_instance.apiVersion) >= 1;
 }
 
 static bool IsValidSystem(XrSystemId systemId) {
@@ -3025,23 +3035,11 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInt
             loaderInfo->maxInterfaceVersion < XR_CURRENT_LOADER_RUNTIME_VERSION) {
             return XR_ERROR_INITIALIZATION_FAILED;
         }
-        const uint32_t runtimeMajor = XR_VERSION_MAJOR(kRuntimeApiVersion);
-        const uint32_t runtimeMinor = XR_VERSION_MINOR(kRuntimeApiVersion);
-        const auto beforeRuntime = [&](XrVersion version) {
-            return XR_VERSION_MAJOR(version) < runtimeMajor ||
-                   (XR_VERSION_MAJOR(version) == runtimeMajor &&
-                    XR_VERSION_MINOR(version) <= runtimeMinor);
-        };
-        const auto afterRuntime = [&](XrVersion version) {
-            return XR_VERSION_MAJOR(version) > runtimeMajor ||
-                   (XR_VERSION_MAJOR(version) == runtimeMajor &&
-                    XR_VERSION_MINOR(version) >= runtimeMinor);
-        };
-        if (!beforeRuntime(loaderInfo->minApiVersion) ||
-            !afterRuntime(loaderInfo->maxApiVersion)) {
-            return XR_ERROR_INITIALIZATION_FAILED;
-        }
-        
+        const XrVersion negotiated =
+            api_validation::NegotiateApiVersion(loaderInfo->minApiVersion, loaderInfo->maxApiVersion);
+        if (negotiated == 0) return XR_ERROR_INITIALIZATION_FAILED;
+        g_negotiatedApiVersion = negotiated;
+
         // The loader FreeLibrary's the runtime after xrDestroyInstance. That drops the last
         // reference this process may hold on d3d12/dxgi/opengl32, and unloading those out
         // from under a live Vulkan driver - the same driver, in a Vulkan session - hangs the
@@ -3061,7 +3059,7 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInt
         
         runtimeRequest->runtimeInterfaceVersion = XR_CURRENT_LOADER_RUNTIME_VERSION;
         runtimeRequest->getInstanceProcAddr = xrGetInstanceProcAddr_runtime;
-        runtimeRequest->runtimeApiVersion = kRuntimeApiVersion;
+        runtimeRequest->runtimeApiVersion = negotiated;
         
         Logf("[SimXR] xrNegotiateLoaderRuntimeInterface: SUCCESS - runtimeApiVersion=0x%llX",
              (unsigned long long)runtimeRequest->runtimeApiVersion);
@@ -3587,7 +3585,7 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
     }
     if (rt::g_instance.handle != XR_NULL_HANDLE) return XR_ERROR_LIMIT_REACHED;
     const XrResult versionValidation = api_validation::ValidateApiVersion(
-        createInfo->applicationInfo.apiVersion, kRuntimeApiVersion);
+        createInfo->applicationInfo.apiVersion, g_negotiatedApiVersion);
     if (XR_FAILED(versionValidation)) return versionValidation;
     if ((createInfo->enabledApiLayerCount && !createInfo->enabledApiLayerNames) ||
         (createInfo->enabledExtensionCount && !createInfo->enabledExtensionNames)) {
@@ -3597,9 +3595,12 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
 
     char appName[XR_MAX_APPLICATION_NAME_SIZE + 1] = {0};
     memcpy(appName, createInfo->applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE);
-    Logf("[SimXR] xrCreateInstance: app=%s version=%u", 
+    Logf("[SimXR] xrCreateInstance: app=%s version=%u api=%u.%u.%u",
          appName,
-         createInfo->applicationInfo.applicationVersion);
+         createInfo->applicationInfo.applicationVersion,
+         XR_VERSION_MAJOR(createInfo->applicationInfo.apiVersion),
+         XR_VERSION_MINOR(createInfo->applicationInfo.apiVersion),
+         XR_VERSION_PATCH(createInfo->applicationInfo.apiVersion));
 
     // Restore the saved UI settings here rather than at window creation: apps ask
     // for view configurations, whose panel resolution and FOV both come from the
@@ -3645,6 +3646,7 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
         Logf("[SimXR]   enabledExt[%u]=%s", i, requested);
     }
     rt::g_instance.enabledExtensions = std::move(enabledExtensions);
+    rt::g_instance.apiVersion = createInfo->applicationInfo.apiVersion;
     // A new instance starts with no requirements calls on record.
     rt::g_instance.d3d11RequirementsCalled = false;
     rt::g_instance.d3d12RequirementsCalled = false;
@@ -3744,10 +3746,12 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
 static XrResult XRAPI_PTR xrGetInstanceProperties_runtime(XrInstance instance, XrInstanceProperties* props) {
     if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     if (!props || props->type != XR_TYPE_INSTANCE_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
-    props->runtimeVersion = XR_MAKE_VERSION(1, 6, 0);
+    // The release in CMakeLists.txt's project(), so the version cannot drift from it.
+    props->runtimeVersion = XR_MAKE_VERSION(SIMXR_VERSION_MAJOR, SIMXR_VERSION_MINOR, SIMXR_VERSION_PATCH);
     strncpy(props->runtimeName, "OpenXR Simulator Runtime", XR_MAX_RUNTIME_NAME_SIZE - 1);
     props->runtimeName[XR_MAX_RUNTIME_NAME_SIZE - 1] = '\0';
-    Log("[SimXR] xrGetInstanceProperties: returning OpenXR Simulator Runtime");
+    Logf("[SimXR] xrGetInstanceProperties: returning OpenXR Simulator Runtime %d.%d.%d",
+         SIMXR_VERSION_MAJOR, SIMXR_VERSION_MINOR, SIMXR_VERSION_PATCH);
     return XR_SUCCESS;
 }
 
@@ -9354,8 +9358,10 @@ static bool GetSpaceWorldState(XrSpace space, SpaceWorldState& state) {
     }
     state.pose = pose_math::Compose(naturalOrigin, referenceIt->second.poseInRef);
     state.tracked = true;
-    // LOCAL and STAGE are static in the simulator's world frame. VIEW motion is
-    // not sampled with enough history to advertise a trustworthy velocity.
+    // LOCAL, LOCAL_FLOOR and STAGE are static in the simulator's world frame, and
+    // coincide: LOCAL's origin is already on the floor, with the head starting
+    // g_headPos.y above it. VIEW motion is not sampled with enough history to
+    // advertise a trustworthy velocity.
     state.velocityValid = referenceIt->second.type != XR_REFERENCE_SPACE_TYPE_VIEW;
     return true;
 }
@@ -9430,6 +9436,14 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession session, const XrViewL
     return XR_SUCCESS;
 }
 
+// VIEW, LOCAL and STAGE always; LOCAL_FLOOR, which OpenXR 1.1 makes mandatory, on a
+// 1.1 instance.
+static bool IsSupportedReferenceSpace(XrReferenceSpaceType type) {
+    return type == XR_REFERENCE_SPACE_TYPE_VIEW || type == XR_REFERENCE_SPACE_TYPE_LOCAL ||
+           type == XR_REFERENCE_SPACE_TYPE_STAGE ||
+           (type == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR && InstanceUsesApi1_1());
+}
+
 // Add missing space/action functions for compatibility
 static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(
     XrSession session, const XrReferenceSpaceCreateInfo* info, XrSpace* space) {
@@ -9438,9 +9452,7 @@ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(
     if (!info || info->type != XR_TYPE_REFERENCE_SPACE_CREATE_INFO || !space) {
         return XR_ERROR_VALIDATION_FAILURE;
     }
-    if (info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW &&
-        info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL &&
-        info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE) {
+    if (!IsSupportedReferenceSpace(info->referenceSpaceType)) {
         return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
     if (!pose_math::IsNormalized(info->poseInReferenceSpace.orientation)) {
@@ -9529,13 +9541,46 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
     return XR_SUCCESS;
 }
 
+// OpenXR 1.1 (promoted from XR_KHR_locate_spaces): xrLocateSpace for each space against
+// one base space at one time, with optional XrSpaceVelocities chained on the output.
+static XrResult XRAPI_PTR xrLocateSpaces_runtime(XrSession session, const XrSpacesLocateInfo* info,
+                                                 XrSpaceLocations* spaceLocations) {
+    std::lock_guard<std::recursive_mutex> controlLock(ui_auto::g_mutex);
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_SPACES_LOCATE_INFO || info->spaceCount == 0 || !info->spaces ||
+        !spaceLocations || spaceLocations->type != XR_TYPE_SPACE_LOCATIONS ||
+        spaceLocations->locationCount != info->spaceCount || !spaceLocations->locations) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    XrSpaceVelocities* velocities = nullptr;
+    for (auto* next = static_cast<XrBaseOutStructure*>(spaceLocations->next); next; next = next->next) {
+        if (next->type == XR_TYPE_SPACE_VELOCITIES) velocities = reinterpret_cast<XrSpaceVelocities*>(next);
+    }
+    if (velocities && (velocities->velocityCount != info->spaceCount || !velocities->velocities)) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    for (uint32_t i = 0; i < info->spaceCount; ++i) {
+        XrSpaceVelocity velocity{XR_TYPE_SPACE_VELOCITY};
+        XrSpaceLocation location{XR_TYPE_SPACE_LOCATION, velocities ? &velocity : nullptr};
+        const XrResult result = xrLocateSpace_runtime(info->spaces[i], info->baseSpace, info->time, &location);
+        if (XR_FAILED(result)) return result;
+        spaceLocations->locations[i] = {location.locationFlags, location.pose};
+        if (velocities) {
+            velocities->velocities[i] = {velocity.velocityFlags, velocity.linearVelocity, velocity.angularVelocity};
+        }
+    }
+    return XR_SUCCESS;
+}
+
 static XrResult XRAPI_PTR xrEnumerateReferenceSpaces_runtime(XrSession session, uint32_t capacity, uint32_t* count, XrReferenceSpaceType* spaces) {
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
-    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, spaces, 3);
+    const uint32_t spaceCount = InstanceUsesApi1_1() ? 4 : 3;
+    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, spaces, spaceCount);
     if (XR_FAILED(validation) || capacity == 0) return validation;
     spaces[0] = XR_REFERENCE_SPACE_TYPE_VIEW;
     spaces[1] = XR_REFERENCE_SPACE_TYPE_LOCAL;
     spaces[2] = XR_REFERENCE_SPACE_TYPE_STAGE;
+    if (spaceCount == 4) spaces[3] = XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR;
     return XR_SUCCESS;
 }
 
@@ -9622,7 +9667,8 @@ static rt::ActionInput InputForBindingPath(XrActionType type, const std::string&
 
     std::string component;
     if (type == XR_ACTION_TYPE_POSE_INPUT) {
-        if ((componentFor("grip", component) || componentFor("aim", component)) && component == "pose") {
+        if ((componentFor("grip", component) || componentFor("grip_surface", component) ||
+             componentFor("aim", component)) && component == "pose") {
             return rt::ActionInput::Pose;
         }
         return rt::ActionInput::Unknown;
@@ -9685,7 +9731,8 @@ static bool IsSupportedInteractionProfilePath(const std::string& path) {
         "/interaction_profiles/oculus/touch_controller",
         "/interaction_profiles/valve/index_controller",
     };
-    return StringIn(path, profiles);
+    return StringIn(path, profiles) ||
+           (InstanceUsesApi1_1() && interaction_query::IsOpenXR1_1TouchProfile(path));
 }
 
 static bool SplitBindingPath(const std::string& path, std::string& topLevel, std::string& suffix) {
@@ -9758,8 +9805,29 @@ static bool IsAllowedBindingPath(const std::string& profile, const std::string& 
         "input/thumbstick/click", "input/thumbstick/touch", "input/trackpad/x", "input/trackpad/y",
         "input/trackpad/force", "input/trackpad/touch", "input/grip/pose", "input/aim/pose", "output/haptic",
     };
+    // OpenXR 1.1 additions: every Touch-family profile, Touch itself included, senses
+    // the finger near the trigger and the thumb near its resting surfaces.
+    static const char* const touchProximity[] = {
+        "input/trigger/proximity", "input/thumb_resting_surfaces/proximity",
+    };
+    static const char* const touchPlus[] = {
+        "input/trigger/force", "input/trigger_curl/value", "input/trigger_slide/value",
+    };
+    static const char* const touchPro[] = {
+        "input/trigger_curl/value", "input/trigger_slide/value", "input/thumbrest/force",
+        "input/stylus/force", "output/haptic_trigger", "output/haptic_thumb",
+    };
 
     const bool hand = topLevel == "/user/hand/left" || topLevel == "/user/hand/right";
+    const bool api1_1 = InstanceUsesApi1_1();
+    // OpenXR 1.1 gives every hand profile the palm pose.
+    if (api1_1 && suffix == "input/grip_surface/pose") {
+        return interaction_query::ProfileSupportsTopLevel(profile, topLevel);
+    }
+    const bool touchBase = hand && (input::BindingPathAllowed(suffix, touchCommon) ||
+        (topLevel == "/user/hand/left" && input::BindingPathAllowed(suffix, touchLeft)) ||
+        (topLevel == "/user/hand/right" && input::BindingPathAllowed(suffix, touchRight)));
+    const bool touchSensing = hand && api1_1 && input::BindingPathAllowed(suffix, touchProximity);
     if (profile == "/interaction_profiles/khr/simple_controller") return hand && input::BindingPathAllowed(suffix, simple);
     if (profile == "/interaction_profiles/google/daydream_controller") return hand && input::BindingPathAllowed(suffix, daydream);
     if (profile == "/interaction_profiles/htc/vive_controller") return hand && input::BindingPathAllowed(suffix, vive);
@@ -9769,10 +9837,20 @@ static bool IsAllowedBindingPath(const std::string& profile, const std::string& 
         return topLevel == "/user/gamepad" && input::BindingPathAllowed(suffix, xbox);
     }
     if (profile == "/interaction_profiles/oculus/go_controller") return hand && input::BindingPathAllowed(suffix, go);
-    if (profile == "/interaction_profiles/oculus/touch_controller") {
-        return hand && (input::BindingPathAllowed(suffix, touchCommon) ||
-            (topLevel == "/user/hand/left" && input::BindingPathAllowed(suffix, touchLeft)) ||
-            (topLevel == "/user/hand/right" && input::BindingPathAllowed(suffix, touchRight)));
+    if (profile == "/interaction_profiles/oculus/touch_controller" ||
+        profile == "/interaction_profiles/meta/touch_controller_rift_cv1" ||
+        profile == "/interaction_profiles/meta/touch_controller_quest_2") {
+        return touchBase || touchSensing;
+    }
+    if (profile == "/interaction_profiles/meta/touch_controller_quest_1_rift_s") {
+        // The one Touch controller without a thumbrest.
+        return suffix != "input/thumbrest/touch" && (touchBase || touchSensing);
+    }
+    if (profile == "/interaction_profiles/meta/touch_plus_controller") {
+        return touchBase || touchSensing || (hand && input::BindingPathAllowed(suffix, touchPlus));
+    }
+    if (profile == "/interaction_profiles/meta/touch_pro_controller") {
+        return touchBase || touchSensing || (hand && input::BindingPathAllowed(suffix, touchPro));
     }
     if (profile == "/interaction_profiles/valve/index_controller") return hand && input::BindingPathAllowed(suffix, index);
     return false;
@@ -9968,8 +10046,11 @@ static XrResult XRAPI_PTR xrSuggestInteractionProfileBindings_runtime(XrInstance
         const int sourceMask = SourceMaskForBindingPath(pathIt->second);
         const rt::ActionInput inputKind = InputForBindingPath(actionIt->second.type, pathIt->second);
         if (sourceMask && inputKind != rt::ActionInput::Unknown) {
+            // The simulator has no palm offset of its own, so grip_surface (OpenXR 1.1's
+            // palm pose) reports the grip pose; only aim stays at the tracked pose.
             const bool gripPose = inputKind == rt::ActionInput::Pose &&
-                pathIt->second.find("/input/grip/pose") != std::string::npos;
+                (pathIt->second.find("/input/grip/pose") != std::string::npos ||
+                 pathIt->second.find("/input/grip_surface/pose") != std::string::npos);
             pending.push_back({suggested.action,
                                {bindings->interactionProfile, suggested.binding,
                                 input::BindingCollisionKey(pathIt->second), sourceMask, inputKind,
@@ -10490,10 +10571,7 @@ static XrResult XRAPI_PTR xrGetReferenceSpaceBoundsRect_runtime(
     XrSession session, XrReferenceSpaceType type, XrExtent2Df* bounds) {
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (!bounds) return XR_ERROR_VALIDATION_FAILURE;
-    if (type != XR_REFERENCE_SPACE_TYPE_VIEW && type != XR_REFERENCE_SPACE_TYPE_LOCAL &&
-        type != XR_REFERENCE_SPACE_TYPE_STAGE) {
-        return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
-    }
+    if (!IsSupportedReferenceSpace(type)) return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     if (type != XR_REFERENCE_SPACE_TYPE_STAGE) {
         *bounds = {0.0f, 0.0f};
         return XR_SPACE_BOUNDS_UNAVAILABLE;
@@ -10654,6 +10732,7 @@ static const NameFn kFnTable[] = {
     {"xrCreateReferenceSpace", (PFN_xrVoidFunction)xrCreateReferenceSpace_runtime},
     {"xrDestroySpace", (PFN_xrVoidFunction)xrDestroySpace_runtime},
     {"xrLocateSpace", (PFN_xrVoidFunction)xrLocateSpace_runtime},
+    {"xrLocateSpaces", (PFN_xrVoidFunction)xrLocateSpaces_runtime},
     {"xrEnumerateReferenceSpaces", (PFN_xrVoidFunction)xrEnumerateReferenceSpaces_runtime},
     {"xrCreateActionSpace", (PFN_xrVoidFunction)xrCreateActionSpace_runtime},
     // Action functions
@@ -10694,6 +10773,11 @@ static bool IsGlobalCommand(const char* name) {
            strcmp(name, "xrCreateInstance") == 0;
 }
 
+// Core commands OpenXR 1.1 added, which a 1.0 instance must not expose.
+static bool IsOpenXR1_1Command(const char* name) {
+    return strcmp(name, "xrLocateSpaces") == 0;
+}
+
 static const char* RequiredExtensionForCommand(const char* name) {
     if (strcmp(name, "xrGetD3D11GraphicsRequirementsKHR") == 0)
         return XR_KHR_D3D11_ENABLE_EXTENSION_NAME;
@@ -10732,6 +10816,9 @@ static XrResult XRAPI_PTR xrGetInstanceProcAddr_runtime(XrInstance instance, con
         if (instance == XR_NULL_HANDLE || !IsExtensionEnabled(extension)) {
             return XR_ERROR_FUNCTION_UNSUPPORTED;
         }
+    }
+    if (IsOpenXR1_1Command(name) && (instance == XR_NULL_HANDLE || !InstanceUsesApi1_1())) {
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
     }
     
     // Reduce logging verbosity for xrGetInstanceProcAddr

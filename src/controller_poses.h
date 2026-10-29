@@ -1,5 +1,6 @@
 #pragma once
 
+#include "interaction_query.h"
 #include "pose_math.h"
 
 #include <string>
@@ -14,7 +15,8 @@ namespace controller_poses {
 
 // grip = Compose(aim, AimFromGrip(profile, leftHand)).
 inline XrPosef AimFromGrip(const std::string& profile, bool leftHand) {
-    if (profile == "/interaction_profiles/oculus/touch_controller") {
+    if (profile == "/interaction_profiles/oculus/touch_controller" ||
+        interaction_query::IsOpenXR1_1TouchProfile(profile)) {
         return {{0.5f, 0.0f, 0.0f, 0.8660254f}, {0.0f, -0.0299991f, 0.0950003f}};
     }
     if (profile == "/interaction_profiles/valve/index_controller") {

@@ -17,6 +17,23 @@ inline XrResult ValidateApiVersion(XrVersion requested, XrVersion supported) {
     return XR_SUCCESS;
 }
 
+// The newest API version the runtime implements that the loader's range admits:
+// 1.1, or 1.0 for a loader whose range stops short of 1.1; 0 when neither fits.
+// Like ValidateApiVersion, this compares major/minor and ignores patch.
+inline XrVersion NegotiateApiVersion(XrVersion loaderMin, XrVersion loaderMax) {
+    const auto majorMinor = [](XrVersion version) {
+        return (static_cast<uint64_t>(XR_VERSION_MAJOR(version)) << 16) | XR_VERSION_MINOR(version);
+    };
+    static const XrVersion candidates[] = {XR_API_VERSION_1_1, XR_API_VERSION_1_0};
+    for (const XrVersion candidate : candidates) {
+        if (majorMinor(loaderMin) <= majorMinor(candidate) &&
+            majorMinor(candidate) <= majorMinor(loaderMax)) {
+            return candidate;
+        }
+    }
+    return 0;
+}
+
 inline bool IsWellFormedPath(const char* path) {
     if (!path) return false;
     const size_t length = strnlen(path, XR_MAX_PATH_LENGTH);

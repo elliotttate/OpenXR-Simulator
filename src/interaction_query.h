@@ -56,6 +56,16 @@ inline std::string TopLevelForSourcePath(const std::string& path) {
     return {};
 }
 
+// The Touch-family profiles OpenXR 1.1 added; the simulator drives them like Touch.
+// Only an instance created for 1.1 accepts them.
+inline bool IsOpenXR1_1TouchProfile(const std::string& profile) {
+    return profile == "/interaction_profiles/meta/touch_pro_controller" ||
+           profile == "/interaction_profiles/meta/touch_plus_controller" ||
+           profile == "/interaction_profiles/meta/touch_controller_rift_cv1" ||
+           profile == "/interaction_profiles/meta/touch_controller_quest_1_rift_s" ||
+           profile == "/interaction_profiles/meta/touch_controller_quest_2";
+}
+
 inline bool ProfileSupportsTopLevel(const std::string& profile,
                                     const std::string& topLevel) {
     if (profile == "/interaction_profiles/htc/vive_pro") {
@@ -71,7 +81,8 @@ inline bool ProfileSupportsTopLevel(const std::string& profile,
         profile == "/interaction_profiles/microsoft/motion_controller" ||
         profile == "/interaction_profiles/oculus/go_controller" ||
         profile == "/interaction_profiles/oculus/touch_controller" ||
-        profile == "/interaction_profiles/valve/index_controller";
+        profile == "/interaction_profiles/valve/index_controller" ||
+        IsOpenXR1_1TouchProfile(profile);
     return handProfile &&
            (topLevel == "/user/hand/left" || topLevel == "/user/hand/right");
 }
@@ -95,6 +106,13 @@ inline std::string InteractionProfileName(const std::string& profile) {
     if (profile == "/interaction_profiles/oculus/go_controller") return "Oculus Go Controller";
     if (profile == "/interaction_profiles/oculus/touch_controller") return "Oculus Touch Controller";
     if (profile == "/interaction_profiles/valve/index_controller") return "Valve Index Controller";
+    if (profile == "/interaction_profiles/meta/touch_pro_controller") return "Meta Touch Pro Controller";
+    if (profile == "/interaction_profiles/meta/touch_plus_controller") return "Meta Touch Plus Controller";
+    if (profile == "/interaction_profiles/meta/touch_controller_rift_cv1") return "Meta Touch Controller (Rift CV1)";
+    if (profile == "/interaction_profiles/meta/touch_controller_quest_1_rift_s") {
+        return "Meta Touch Controller (Rift S / Quest 1)";
+    }
+    if (profile == "/interaction_profiles/meta/touch_controller_quest_2") return "Meta Touch Controller (Quest 2)";
     return {};
 }
 
