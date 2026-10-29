@@ -7,6 +7,15 @@
 
 namespace api_validation {
 
+// D3D11/12 require feature level 11.0, whose Texture2D limit is 16384. Any other
+// enabled graphics binding keeps the conservative 4096 cap.
+inline uint32_t MaxSwapchainDimension(bool direct3D, bool otherGraphics) {
+    return direct3D && !otherGraphics ? 16384u : 4096u;
+}
+inline bool SwapchainExtentValid(uint32_t width, uint32_t height, uint32_t limit) {
+    return width > 0 && height > 0 && width <= limit && height <= limit;
+}
+
 inline XrResult ValidateApiVersion(XrVersion requested, XrVersion supported) {
     // Patch revisions are fully compatible in OpenXR. Compare the interface-bearing
     // major/minor pair and deliberately ignore patch.

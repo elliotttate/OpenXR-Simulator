@@ -13,6 +13,17 @@ void Check(bool condition, const char* message) {
 } // namespace
 
 int main() {
+    const uint32_t cap = api_validation::MaxSwapchainDimension(true, false);
+    Check(cap == 16384, "D3D11 texture limit");
+    Check(api_validation::MaxSwapchainDimension(false, true) == 4096, "other graphics unchanged");
+    Check(api_validation::MaxSwapchainDimension(true, true) == 4096, "mixed graphics conservative");
+    Check(api_validation::SwapchainExtentValid(4968, 2794, cap), "FlatOut HUD accepted");
+    Check(api_validation::SwapchainExtentValid(4506, 2534, cap), "FlatOut HUD at HudScale 1.5 on a 3004-pixel eye accepted");
+    Check(api_validation::SwapchainExtentValid(cap, 1, cap), "maximum width accepted");
+    Check(!api_validation::SwapchainExtentValid(cap + 1, 1, cap), "oversized width rejected");
+    Check(!api_validation::SwapchainExtentValid(1, cap + 1, cap), "oversized height rejected");
+    Check(!api_validation::SwapchainExtentValid(0, 1, cap), "zero width rejected");
+
     const XrVersion supported = XR_MAKE_VERSION(1, 0, 34);
     Check(api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 0, 34), supported) == XR_SUCCESS,
           "the advertised API version is accepted");

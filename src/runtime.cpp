@@ -3768,6 +3768,17 @@ static XrResult XRAPI_PTR xrGetSystem_runtime(XrInstance instance, const XrSyste
     return XR_SUCCESS;
 }
 
+// The swapchain size limit this instance's graphics binding supports, advertised in
+// the system and view properties and enforced by xrCreateSwapchain alike.
+static uint32_t MaxSwapchainDimension() {
+    bool direct3D = false, otherGraphics = false;
+    for (const auto& name : rt::g_instance.enabledExtensions) {
+        if (name == XR_KHR_D3D11_ENABLE_EXTENSION_NAME || name == XR_KHR_D3D12_ENABLE_EXTENSION_NAME) direct3D = true;
+        if (name == XR_KHR_OPENGL_ENABLE_EXTENSION_NAME || name == XR_KHR_VULKAN_ENABLE_EXTENSION_NAME || name == XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) otherGraphics = true;
+    }
+    return api_validation::MaxSwapchainDimension(direct3D, otherGraphics);
+}
+
 static XrResult XRAPI_PTR xrGetSystemProperties_runtime(XrInstance instance, XrSystemId systemId, XrSystemProperties* props) {
     if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
@@ -3776,8 +3787,8 @@ static XrResult XRAPI_PTR xrGetSystemProperties_runtime(XrInstance instance, XrS
     props->systemName[XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
     props->systemId = 1;
     props->vendorId = 0;  // 0 = unknown vendor (more standard than 0xFFFF)
-    props->graphicsProperties.maxSwapchainImageWidth = 4096;
-    props->graphicsProperties.maxSwapchainImageHeight = 4096;
+    props->graphicsProperties.maxSwapchainImageWidth = MaxSwapchainDimension();
+    props->graphicsProperties.maxSwapchainImageHeight = MaxSwapchainDimension();
     props->graphicsProperties.maxLayerCount = 16;
     props->trackingProperties.positionTracking = XR_TRUE;
     props->trackingProperties.orientationTracking = XR_TRUE;
@@ -3814,8 +3825,8 @@ static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance i
         views[i].recommendedImageRectWidth = renderW;
         views[i].recommendedImageRectHeight = renderH;
         views[i].recommendedSwapchainSampleCount = 1;
-        views[i].maxImageRectWidth = 4096;
-        views[i].maxImageRectHeight = 4096;
+        views[i].maxImageRectWidth = MaxSwapchainDimension();
+        views[i].maxImageRectHeight = MaxSwapchainDimension();
         views[i].maxSwapchainSampleCount = 1;
     }
     Logf("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (%ux%u recommended; headset geometry %s)",
@@ -4240,7 +4251,7 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession session, const XrS
         }
         return XR_ERROR_VALIDATION_FAILURE;
     }
-    if (ci->width > 4096 || ci->height > 4096) return XR_ERROR_VALIDATION_FAILURE;
+    if (!api_validation::SwapchainExtentValid(ci->width, ci->height, MaxSwapchainDimension())) return XR_ERROR_VALIDATION_FAILURE;
     constexpr XrSwapchainCreateFlags supportedCreateFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
     if (ci->createFlags & ~supportedCreateFlags) return XR_ERROR_FEATURE_UNSUPPORTED;
 
