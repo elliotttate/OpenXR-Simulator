@@ -1586,6 +1586,32 @@ static void ResetD3D12PreviewSurfaces(rt::Session& s) {
     s.previewReadbackPitch = 0;
 }
 
+// Every D3D11 object the preview creates on the session's device. Each one holds a reference to that
+// device, so any left behind keeps the application's device alive after the app's own final Release, hands
+// the next session another device's shaders and states, and is finally released by the static Session's
+// destructor at DLL unload: at process exit that destroys the device under the loader lock after the driver's
+// threads are gone (FlatOut VR: access violation in nvwgf2umx from LdrShutdownProcess).
+static void ResetD3D11DeviceResources(rt::Session& s) {
+    s.blitVS.Reset();
+    s.blitPS.Reset();
+    s.quadVS.Reset();
+    s.quadCB.Reset();
+    s.samplerState.Reset();
+    s.noCullRS.Reset();
+    s.anaglyphRedBS.Reset();
+    s.anaglyphCyanBS.Reset();
+    s.layerBlendStates.clear();
+    for (auto& entry : s.blitTempCache) entry = rt::Session::TempTexEntry{};
+    for (auto& entry : s.quadTempCache) entry = rt::Session::TempTexEntry{};
+    s.blitTempNext = s.quadTempNext = 0;
+    for (int eye = 0; eye < 2; ++eye) {
+        s.glEyeTex[eye].Reset();
+        s.glEyeSrv[eye].Reset();
+        s.glEyeSrvFormat[eye] = DXGI_FORMAT_UNKNOWN;
+    }
+    s.glEyeTexW = s.glEyeTexH = 0;
+}
+
 static void ResetD3D12PreviewResources(rt::Session& s) {
     // Same reason xrDestroySwapchain waits: nothing the preview queue has submitted keeps
     // the resources it reads alive, and it is no longer drained by the frame that queued it.
@@ -4112,9 +4138,15 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     // Reset session but don't destroy the window
     rt::g_session.handle = XR_NULL_HANDLE;
     rt::g_session.state = XR_SESSION_STATE_IDLE;
-    resetD3D11PreviewReadbacks(rt::g_session);
-    rt::g_session.d3d11Device.Reset();
-    rt::g_session.d3d11Context.Reset();
+    {
+        // Same lock as the frame path's preview work (taken alone here, so no ordering against g_windowMutex).
+        std::lock_guard<std::mutex> previewLock(rt::g_session.previewMutex);
+        resetD3D11PreviewReadbacks(rt::g_session);
+        rt::ResetD3D11DeviceResources(rt::g_session);
+        rt::g_session.previewSwapchain.Reset();  // g_persistentSwapchain keeps it for the next session
+        rt::g_session.d3d11Device.Reset();
+        rt::g_session.d3d11Context.Reset();
+    }
     rt::g_session.usesD3D12 = false;
     rt::ResetD3D12PreviewResources(rt::g_session);
     rt::g_session.d3d12Device.Reset();
@@ -6163,6 +6195,21 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
     // to create a second swapchain for the same window (which DXGI forbids).
     if (!s.usesD3D12 && !s.previewSwapchain) {
         std::lock_guard<std::mutex> lock(rt::g_windowMutex);
+        ComPtr<ID3D11Device> owner;
+        if (rt::g_persistentSwapchain &&
+            (FAILED(rt::g_persistentSwapchain->GetDevice(IID_PPV_ARGS(owner.GetAddressOf()))) ||
+             owner.Get() != s.d3d11Device.Get())) {
+            // Made on an earlier session's device: this session can't present through it, and keeping it holds
+            // that device alive. Let it go (flushing its device so DXGI destroys it now) and create a new one.
+            if (owner) {
+                ComPtr<ID3D11DeviceContext> ownerContext;
+                owner->GetImmediateContext(ownerContext.GetAddressOf());
+                rt::g_persistentSwapchain.Reset();
+                if (ownerContext) ownerContext->Flush();
+            }
+            rt::g_persistentSwapchain.Reset();
+            Log("[SimXR] ensurePreviewSized: persistent swapchain belongs to another device, recreating");
+        }
         if (rt::g_persistentSwapchain) {
             s.previewSwapchain = rt::g_persistentSwapchain;
             DXGI_SWAP_CHAIN_DESC1 d{};
@@ -6377,24 +6424,8 @@ static bool EnsureGLPreviewDevice(rt::Session& s) {
     }
     Log("[SimXR] Created D3D11 device for OpenGL preview");
 
-    // Force shader recompilation by resetting blit resources
-    s.blitVS.Reset();
-    s.blitPS.Reset();
-    s.quadVS.Reset();
-    s.quadCB.Reset();
-    s.samplerState.Reset();
-    s.noCullRS.Reset();
-    s.anaglyphRedBS.Reset();
-    s.anaglyphCyanBS.Reset();
-    s.layerBlendStates.clear();
-    // Cached staging textures belong to the old device too.
-    for (auto& entry : s.blitTempCache) entry = rt::Session::TempTexEntry{};
-    for (auto& entry : s.quadTempCache) entry = rt::Session::TempTexEntry{};
-    for (int eye = 0; eye < 2; ++eye) {
-        s.glEyeTex[eye].Reset();
-        s.glEyeSrv[eye].Reset();
-    }
-    s.glEyeTexW = s.glEyeTexH = 0;
+    // Force shader recompilation: blit resources and cached textures belong to the old device.
+    rt::ResetD3D11DeviceResources(s);
     Log("[SimXR] Reset blit resources for fresh shader compilation");
     return true;
 }
